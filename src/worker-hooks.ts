@@ -9,7 +9,13 @@ export const INTERNAL_WORKER_MARKER = "orchestration-internal";
 
 export function isInternalWorkerSession(metadata: Record<string, unknown> | undefined): boolean {
   if (!metadata) return false;
-  return metadata["jev-role"] === INTERNAL_WORKER_ROLE && metadata["jev-router"] === INTERNAL_WORKER_MARKER;
+  if (metadata["jev-role"] !== INTERNAL_WORKER_ROLE) return false;
+  // Aceita dois formatos validos de marker:
+  // - prompt metadata do dispatcher (jev-router=orchestration-internal), e
+  // - session metadata do dispatcher (jev-orchestration=true).
+  // Ambos sao escritos apenas pelo dispatcher ao criar o worker; sessoes
+  // normais nunca os carregam.
+  return metadata["jev-router"] === INTERNAL_WORKER_MARKER || metadata["jev-orchestration"] === true;
 }
 
 export function hasInternalPromptMarker(promptMetadata: Record<string, unknown> | undefined): boolean {

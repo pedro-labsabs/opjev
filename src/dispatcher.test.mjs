@@ -14,6 +14,7 @@ import {
 import {
   buildWorkerPrompt,
   extractFinalAssistantText,
+  runOrchestrationOnce,
 } from "./orchestration/dispatcher.ts";
 import {
   isInternalWorkerSession,
@@ -22,6 +23,8 @@ import {
   buildDefaultContextInstruction,
 } from "./worker-hooks.ts";
 import { isFreeModel } from "./config.ts";
+import pluginDefault from "../index.ts";
+import { makeCtx, makeStorage, stubFetch, okJev, routeAnswers } from "./harness.mjs";
 
 // ─────────────────────────── helpers ───────────────────────────
 
@@ -690,5 +693,318 @@ describe("dispatcher core: judgement flow", () => {
     assert.equal(jState.executor.agent, "build");
     assert.equal(jState.executor.model, "opencode/big-pickle");
     assert.equal(jState.round, 1);
+  });
+});
+
+// ─────────────────────────── O. runOrchestrationOnce happy path ───────────────────────────
+
+const ACCEPT_ANSWERS = {
+  done: { type: "noul", noul: 0.95 },
+  failure_class: { type: "choice", choice: "none" },
+  same_executor_can_repair: { type: "noul", noul: 0.1 },
+  next_action: { type: "choice", choice: "accept", confidence: 0.95 },
+};
+
+const REPAIR_ANSWERS = {
+  done: { type: "noul", noul: 0.1 },
+  failure_class: { type: "choice", choice: "implementation" },
+  same_executor_can_repair: { type: "noul", noul: 0.9 },
+  next_action: { type: "choice", choice: "repair-same" },
+};
+
+function fakeRuntime(over = {}) {
+  const calls = [];
+  const runtime = {
+    createWorker: async (input) => {
+      calls.push({ op: "create", input });
+      return { sessionID: "worker-1" };
+    },
+    prompt: async (input) => {
+      calls.push({ op: "prompt", input });
+    },
+    wait: async (input) => {
+      calls.push({ op: "wait", input });
+    },
+    get: async (input) => {
+      calls.push({ op: "get", input });
+      return { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" };
+    },
+    context: async (input) => {
+      calls.push({ op: "context", input });
+      return [{ type: "assistant", content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }] }];
+    },
+    interrupt: async (input) => {
+      calls.push({ op: "interrupt", input });
+    },
+    ...over,
+  };
+  return { runtime, calls };
+}
+
+function fakeDecisions(over = {}) {
+  const calls = { select: 0, judge: 0 };
+  const order = [];
+  return {
+    calls,
+    order,
+    decisions: {
+      selectExecutor: async () => {
+        calls.select++;
+        order.push("select");
+        return { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 };
+      },
+      judgeRound: async () => {
+        calls.judge++;
+        order.push("judge");
+        return structuredClone(ACCEPT_ANSWERS);
+      },
+      ...over,
+    },
+  };
+}
+
+describe("runOrchestrationOnce: happy path (A)", () => {
+  it("A-happy: fake runtime + fake Jev -> completed round 1, 1 worker, 1 judge", async () => {
+    const { runtime } = fakeRuntime();
+    const f = fakeDecisions();
+    const c = contract({ maxRounds: 1 });
+    const res = await runOrchestrationOnce(c, { runtime, decisions: f.decisions });
+    assert.equal(res.phase, "completed");
+    assert.equal(res.round, 1);
+    assert.equal(f.calls.select, 1);
+    assert.equal(f.calls.judge, 1);
+    assert.equal(res.worker.sessionID, "worker-1");
+    assert.equal(res.verdict.nextAction, "accept");
+    assert.deepEqual(res.pendingCommands, []);
+  });
+});
+
+describe("runOrchestrationOnce: order of effects (B)", () => {
+  it("B-order: select -> create -> prompt -> wait -> get -> context -> judge", async () => {
+    const seq = [];
+    const { runtime } = fakeRuntime({
+      createWorker: async (input) => { seq.push("create"); return { sessionID: "worker-1" }; },
+      prompt: async () => { seq.push("prompt"); },
+      wait: async () => { seq.push("wait"); },
+      get: async () => { seq.push("get"); return { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" }; },
+      context: async () => { seq.push("context"); return [{ type: "assistant", content: [{ type: "text", text: "ok" }] }]; },
+    });
+    const f = fakeDecisions();
+    const origSelect = f.decisions.selectExecutor;
+    const origJudge = f.decisions.judgeRound;
+    f.decisions.selectExecutor = async (...a) => { seq.push("select"); return origSelect(...a); };
+    f.decisions.judgeRound = async (...a) => { seq.push("judge"); return origJudge(...a); };
+    await runOrchestrationOnce(contract({ maxRounds: 1 }), { runtime, decisions: f.decisions });
+    assert.deepEqual(seq, ["select", "create", "prompt", "wait", "get", "context", "judge"]);
+  });
+});
+
+describe("runOrchestrationOnce: executor initial (C)", () => {
+  it("C-exec: worker criado com agent/model escolhidos + location correta", async () => {
+    let created;
+    const { runtime } = fakeRuntime({
+      createWorker: async (input) => { created = input; return { sessionID: "worker-1" }; },
+    });
+    const f = fakeDecisions();
+    await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime,
+      decisions: f.decisions,
+      location: { directory: "/tmp/work" },
+    });
+    assert.equal(created.agent, "build");
+    assert.deepEqual(created.model, { providerID: "opencode", id: "big-pickle" });
+    assert.deepEqual(created.location, { directory: "/tmp/work" });
+    assert.equal(created.metadata["jev-role"], "worker");
+  });
+});
+
+describe("runOrchestrationOnce: evidence usa executor real (D)", () => {
+  it("D-real: selection M1 mas get retorna M2 -> evidence contem M2", async () => {
+    const { runtime } = fakeRuntime({
+      get: async () => ({ agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" }),
+    });
+    const f = fakeDecisions();
+    const res = await runOrchestrationOnce(contract({ maxRounds: 1 }), { runtime, decisions: f.decisions });
+    assert.equal(res.evidence.executor.model, "opencode/mimo-v2.5-free");
+    assert.notEqual(res.evidence.executor.model, "opencode/big-pickle");
+    assert.equal(res.worker.model, "opencode/mimo-v2.5-free");
+  });
+});
+
+describe("runOrchestrationOnce: failed worker (F)", () => {
+  it("F-fail: outcome failed -> check fail, evidence ainda entregue ao Jev sem decisao local", async () => {
+    const { runtime } = fakeRuntime({
+      get: async () => ({ agent: "build", model: "opencode/big-pickle", outcome: "failed" }),
+      context: async () => [{ type: "assistant", content: [{ type: "text", text: "partial" }] }],
+    });
+    let judged = false;
+    const f = fakeDecisions({
+      judgeRound: async () => { judged = true; return structuredClone(ACCEPT_ANSWERS); },
+    });
+    const res = await runOrchestrationOnce(contract({ maxRounds: 1 }), { runtime, decisions: f.decisions });
+    const check = res.evidence.deterministicChecks.find((c) => c.name === "worker-session-outcome");
+    assert.equal(check.status, "fail");
+    assert.equal(judged, true);
+  });
+});
+
+describe("runOrchestrationOnce: non-accept verdict (G)", () => {
+  it("G-repair: repair-same -> repairing + pendingCommands, sem segunda worker", async () => {
+    let creates = 0;
+    const { runtime } = fakeRuntime({
+      createWorker: async () => { creates++; return { sessionID: "worker-1" }; },
+    });
+    const f = fakeDecisions({
+      judgeRound: async () => structuredClone(REPAIR_ANSWERS),
+    });
+    const res = await runOrchestrationOnce(contract({ maxRounds: 2 }), { runtime, decisions: f.decisions });
+    assert.equal(res.phase, "repairing");
+    assert.deepEqual(res.pendingCommands, ["repair-same"]);
+    assert.equal(creates, 1);
+  });
+});
+
+describe("runOrchestrationOnce: timeout (H)", () => {
+  it("H-timeout: wait bloqueado -> interrupt chamado, sem loop, nao completed", async () => {
+    let interrupted = false;
+    const { runtime, calls } = fakeRuntime({
+      wait: async () => new Promise(() => {}),
+      interrupt: async () => { interrupted = true; },
+    });
+    const f = fakeDecisions();
+    const res = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime,
+      decisions: f.decisions,
+      workerTimeoutMs: 50,
+    });
+    assert.equal(interrupted, true);
+    assert.notEqual(res.phase, "completed");
+    assert.ok(res.error);
+    assert.equal(f.calls.judge, 0);
+  });
+});
+
+// ─────────────────────────── I. schema da tool orchestrate_once ───────────────────────────
+
+const ALL_MODELS = [
+  "opencode/big-pickle",
+  "opencode/mimo-v2.5-free",
+  "opencode/ling-3.0-flash-fin-free",
+  "opencode/nemotron-3-ultra-free",
+  "opencode/nemotron-3.5-lightning-free",
+  "opencode/muse-spark-1.3-contributor-free",
+];
+
+const PLUGIN_OPTS = {
+  enableAutoRoute: true,
+  jevTimeoutMs: 500,
+  confidenceThreshold: 0.55,
+  jevEndpoint: "https://opencode.ai/zen/v1/systemone",
+  jevModel: "jev-1.13-free",
+  apiKeyEnv: "OPENCODE_API_KEY",
+};
+
+async function bootCtx(over = {}) {
+  const m = makeCtx(over);
+  await pluginDefault.setup(m.ctx);
+  return m;
+}
+
+describe("tool orchestrate_once: schema e registro (I)", () => {
+  it("I1: orchestrate_once aparece em tools.jev (namespace jev, sem global)", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    const tool = m.tools.orchestrate_once;
+    assert.ok(tool, "tool orchestrate_once deve existir");
+    assert.equal(tool.options?.namespace, "jev");
+    assert.equal(tool.options?.codemode, true);
+    assert.ok(!m.tools.jev_orchestrate_once, "nao deve criar tool global jev_orchestrate_once");
+  });
+
+  it("I2: schema estrutural do contract (runID/objective/scope/constraints/acceptanceCriteria/requiredEvidence/maxRounds)", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    const tool = m.tools.orchestrate_once;
+    assert.ok(tool.input, "input schema obrigatorio");
+    assert.equal(tool.input.type, "object");
+    const props = tool.input.properties?.contract?.properties ?? tool.input.properties;
+    for (const k of ["runID", "objective", "scope", "constraints", "acceptanceCriteria", "requiredEvidence", "maxRounds"]) {
+      assert.ok(props?.[k], `schema deve declarar ${k}`);
+    }
+  });
+
+  it("I3: contrato invalido rejeitado localmente (sem criar worker)", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    // instrumenta session.create caso exista; se nao existir, a tool deve falhar antes
+    let created = 0;
+    m.ctx.session.create = async () => { created++; return { id: "w" }; };
+    const tool = m.tools.orchestrate_once;
+    const res = await tool.execute({ contract: { runID: "", objective: "", maxRounds: 0 } });
+    const parsed = typeof res.content === "string" ? JSON.parse(res.content) : res.content;
+    assert.ok(parsed.error, "deve retornar erro para contrato invalido");
+    assert.equal(created, 0, "contrato invalido nao deve criar worker");
+  });
+
+  it("I4: Code Mode preservado", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    assert.equal(m.tools.orchestrate_once.options?.codemode, true);
+    assert.equal(m.tools.orchestrate_once.options?.namespace, "jev");
+  });
+});
+
+// ─────────────────────────── J. internal worker bypass (prompt hook) ───────────────────────────
+
+describe("prompt hook: internal worker bypass (J)", () => {
+  it("J-bypass: worker interno nao chama decideRoute/switchModel/switchAgent", async () => {
+    const storage = makeStorage({ "orchestration/worker/worker-internal-1": { runID: "r1", round: 1, at: Date.now() } });
+    const m = await bootCtx({ models: ALL_MODELS, storage, options: PLUGIN_OPTS });
+    const stub = stubFetch(async () => okJev(routeAnswers({})));
+    try {
+      const ev = {
+        sessionID: "worker-internal-1",
+        prompt: { text: "OBJECTIVE: do X" },
+        metadata: { "jev-router": "orchestration-internal", "jev-role": "worker" },
+      };
+      await m.hooks.session.prompt(ev);
+      assert.equal(stub.calls.length, 0, "decideRoute (Jev) nao deve ser chamado para worker interno");
+      assert.equal(m.calls.switchModel.length, 0, "switchModel nao deve ser chamado");
+      assert.equal(m.calls.switchAgent.length, 0, "switchAgent nao deve ser chamado");
+      assert.equal(ev.metadata["jev-router"], "orchestration-internal");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("J-normal: sessao normal continua com auto-route", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    const stub = stubFetch(async () => okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" })));
+    try {
+      const ev = { sessionID: "s-normal", prompt: { text: "adicionar um botao" }, metadata: {} };
+      await m.hooks.session.prompt(ev);
+      assert.ok(stub.calls.length >= 1, "sessao normal deve consultar o Jev");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+// ─────────────────────────── K. worker context instruction ───────────────────────────
+
+describe("context hook: worker instruction (K)", () => {
+  it("K-worker: worker interno recebe instrucao de worker, sem decision boundaries", async () => {
+    const storage = makeStorage({ "orchestration/worker/worker-internal-1": { runID: "r1", round: 1, at: Date.now() } });
+    const m = await bootCtx({ models: ALL_MODELS, storage, options: PLUGIN_OPTS });
+    const ev = { sessionID: "worker-internal-1", system: [] };
+    await m.hooks.session.context(ev);
+    assert.ok(ev.system.length >= 1);
+    const text = ev.system.map((s) => s.text).join("\n");
+    assert.ok(text.includes("ExecutionContract") || text.includes("orchestrated"), "deve instruir a executar o contrato");
+    assert.ok(!text.includes("decision boundaries"), "nao deve incentivar Jev em decision boundaries");
+  });
+
+  it("K-normal: sessao normal mantem instrucao atual", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, storage: makeStorage({}), options: PLUGIN_OPTS });
+    const ev = { sessionID: "s-normal", system: [] };
+    await m.hooks.session.context(ev);
+    const text = ev.system.map((s) => s.text).join("\n");
+    assert.ok(text.includes("decision boundaries"), "sessao normal mantem instrucao do Jev");
   });
 });
