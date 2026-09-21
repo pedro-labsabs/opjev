@@ -586,10 +586,11 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
       // switch-agent, sem escolha alternativa — inelegivel => erro bounded.
       const attempted: unknown = (d as { attemptedAgent?: unknown }).attemptedAgent;
       if (typeof attempted === "string" && attempted.trim()) {
-        const hit = catalog.entries.find((e) => e.id.toLowerCase() === attempted.trim().toLowerCase());
-        if (hit && !hit.primaryEligible) {
-          resolvePrimaryAgent(catalog, hit.id);
-        }
+        // Caso A — escolha EXPLICITA do Jev rejeitada pelo router: valida A
+        // TENTATIVA contra o catalogo (unknown ou inelegivel => erro bounded).
+        // Nunca mascara com o lane-default que a substituiu. Sem attemptedAgent
+        // (Caso B — heuristic apos Jev indisponivel), valida-se o final abaixo.
+        resolvePrimaryAgent(catalog, attempted);
       }
       const entry = resolvePrimaryAgent(catalog, d.agent);
       return {

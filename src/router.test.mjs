@@ -239,6 +239,28 @@ describe("guardrails free-only (modelo)", () => {
     }
   });
 
+  it("4b. escolha explicita invalida de agent registra attemptedAgent sem apagar o fallback", async () => {
+    const stub = stubFetch(async () => okJev(routeAnswers({ route: "fast-coding", agent: "ghost-agent", model: "opencode/big-pickle", confidence: 0.9 })));
+    try {
+      const d = await decideRoute({
+        prompt: "implementar feature",
+        agent: "build",
+        validAgents: ["build"],
+        freeCandidates: [...FREE_POOL],
+        route: "unknown",
+        jevModel: "jev-1.13-free",
+        jevEndpoint: "https://x",
+        apiKey: undefined,
+        confidenceThreshold: 0.55,
+      });
+      assert.equal(d.attemptedAgent, "ghost-agent", "tentativa invalida auditavel");
+      assert.equal(d.agent, "build", "fallback operacional da lane mantido");
+      assert.equal(d.overridden, true, "substituicao marcada");
+    } finally {
+      stub.restore();
+    }
+  });
+
   it("4. modelo removido do catalogo nao e selecionado", async () => {
     const removed = "opencode/muse-spark-1.3-contributor-free";
     const d = await decideRoute({

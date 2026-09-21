@@ -3037,6 +3037,51 @@ describe("tool orchestrate_once: agent catalog eligibility (ARC4-ARC11)", () => 
     }
   });
 });
+// ─────────────────────────── ARC15. unknown explicit Jev agent ───────────────────────────
+
+describe("tool orchestrate_once: explicit unknown Jev agent is rejected (ARC15)", () => {
+  it("ARC15: Jev ghost-agent com catalogo build primary -> failed, zero worker, zero critic, sem fallback build", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "build", name: "Build", mode: "primary", hidden: false, description: "The default agent." },
+        { id: "explore", name: "Explore", mode: "subagent", hidden: false, description: "Search specialist." },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "ghost-agent", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc15-unknown-agent",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "escolha explicita invalida rejeitada bounded");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
+      assert.equal(workerCreates.length, 0, "build NAO executou como substituto silencioso");
+      assert.equal(criticCreates.length, 0, "critic nunca criado");
+      assert.ok(out.error && out.error.includes("ghost-agent"), "erro menciona o ID rejeitado");
+      assert.ok(out.error.includes("catalogo"), "erro menciona o catalogo");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 // ─────────────────────────── E2E agent catalog (A/B/C) ───────────────────────────
 
 describe("tool orchestrate_once: E2E agent catalog (primary valido / subagent malicioso / custom)", () => {
