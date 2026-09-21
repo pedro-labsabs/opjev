@@ -461,6 +461,25 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
         confidenceThreshold: opts.confidenceThreshold,
         timeoutMs: opts.jevTimeoutMs,
       });
+      // Guardrail pos-fallback (Blocker B): a saida FINAL do decideRoute e
+      // revalidada contra o catalogo runtime REAL. decideRoute() continua sendo
+      // a decision boundary; o adapter apenas aplica guardrails. Se o Jev
+      // falhou, heuristicRoute() pode ter escolhido modelo/agente fora do
+      // catalogo — nunca se deixa isso chegar ao createWorker. Nenhuma escolha
+      // alternativa e inventada aqui: selecao nao elegivel => erro bounded, o
+      // kernel falha a rodada antes de criar qualquer worker.
+      if (!isFreeModel(d.model) || !candidates.includes(d.model)) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `modelo selecionado nao elegivel no catalogo runtime: ${d.model}`,
+        );
+      }
+      if (agents.length > 0 && !agents.some((a) => a.toLowerCase() === d.agent.toLowerCase())) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `agente selecionado nao existe no catalogo runtime: ${d.agent}`,
+        );
+      }
       return {
         agent: d.agent,
         model: d.model,

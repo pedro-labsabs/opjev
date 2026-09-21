@@ -649,6 +649,67 @@ describe("dispatcher core: guards deterministicos", () => {
   });
 });
 
+// ─────────────────────────── MA. gate deterministico de evidencia (Blocker A) ───────────────────────────
+
+describe("dispatcher core: gate deterministico (hard failure nunca vira completed via accept)", () => {
+  function toEvaluatingWith(failChecks) {
+    let state = transitionRun(createRunState(contract({ maxRounds: 1 })), { type: "CONTRACT_READY" }).state;
+    state = transitionRun(state, { type: "EXECUTION_STARTED", executor: EXECUTOR }).state;
+    state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: failChecks ? "failed" : "succeeded" }).state;
+    const ev = {
+      round: 1,
+      executor: EXECUTOR,
+      outcome: failChecks ? "failed" : "succeeded",
+      deterministicChecks: failChecks
+        ? [
+            { name: "worker-session-outcome", status: "fail" },
+            { name: "worker-final-response", status: "fail" },
+          ]
+        : [
+            { name: "worker-session-outcome", status: "pass" },
+            { name: "worker-final-response", status: "pass" },
+          ],
+      criticFindings: [],
+      resultSummary: failChecks ? "worker sem resposta" : "OK",
+    };
+    return transitionRun(state, { type: "EVIDENCE_READY", evidence: ev }).state;
+  }
+
+  it("MA1: accept com hard failure (checks fail) -> rejeitado (verdict-rejected)", () => {
+    const state = toEvaluatingWith(true);
+    assert.throws(() => transitionRun(state, { type: "VERDICT_RECEIVED", verdict: ACCEPT_VERDICT }), (err) => {
+      assert.equal(err.code, "verdict-rejected");
+      assert.ok(err.message.includes("hard failure"));
+      return true;
+    });
+    assert.equal(state.phase, "evaluating", "estado de origem nao muda (rejeicao sem mutacao)");
+  });
+
+  it("MA2: accept com evidence verde -> completed (gate nao bloqueia happy path)", () => {
+    const state = toEvaluatingWith(false);
+    const r = transitionRun(state, { type: "VERDICT_RECEIVED", verdict: ACCEPT_VERDICT });
+    assert.equal(r.state.phase, "completed");
+    assert.deepEqual(r.commands, [{ type: "complete" }]);
+  });
+
+  it("MA3: status unknown NAO conta como hard failure (accept permitido)", () => {
+    let state = transitionRun(createRunState(contract({ maxRounds: 1 })), { type: "CONTRACT_READY" }).state;
+    state = transitionRun(state, { type: "EXECUTION_STARTED", executor: EXECUTOR }).state;
+    state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "succeeded" }).state;
+    const ev = {
+      round: 1,
+      executor: EXECUTOR,
+      outcome: "succeeded",
+      deterministicChecks: [{ name: "worker-final-response", status: "unknown" }],
+      criticFindings: [],
+      resultSummary: "sem texto final verificado",
+    };
+    state = transitionRun(state, { type: "EVIDENCE_READY", evidence: ev }).state;
+    const r = transitionRun(state, { type: "VERDICT_RECEIVED", verdict: ACCEPT_VERDICT });
+    assert.equal(r.state.phase, "completed");
+  });
+});
+
 // ─────────────────────────── N. judgement flow ───────────────────────────
 
 describe("dispatcher core: judgement flow", () => {
@@ -895,8 +956,12 @@ describe("runOrchestrationOnce: failed worker / verdicts nao-accept / timeout / 
     assert.equal(result.evidence.deterministicChecks[1].name, "worker-final-response");
     assert.equal(result.evidence.deterministicChecks[1].status, "fail");
     assert.ok(judgeSeen !== null, "evidence entregue ao Jev (nenhuma rejeicao local)");
-    // Aprovacao/rejeicao e do Jev: com accept fake, a rodada fecha em completed.
-    assert.equal(result.phase, "completed");
+    // Gate deterministico (Blocker A): hard deterministic failure NUNCA e
+    // aprovado por veredito accept. O Jev recebeu a evidencia e classificou,
+    // mas o kernel rejeita a combinacao accept + deterministicChecks fail.
+    assert.notEqual(result.phase, "completed");
+    assert.equal(result.phase, "failed");
+    assert.ok(result.error && result.error.includes("hard failure"), "erro bounded do gate deterministico");
   });
 
   it("P2: verdict repair-same -> phase repairing, pendingCommands=[repair-same], SEM segunda worker", async () => {
@@ -961,6 +1026,53 @@ describe("runOrchestrationOnce: failed worker / verdicts nao-accept / timeout / 
     assert.equal(result.phase, "failed");
     assert.ok(result.error.includes("invalido") || result.error.includes("contract"));
     assert.equal(t.effects.length, 0);
+  });
+});
+
+// ─────────────────────────── MR. gate deterministico no runtime (Blocker A) ───────────────────────────
+
+describe("runOrchestrationOnce: gate deterministico de evidencia (Blocker A)", () => {
+  it("MR1: worker failed + Jev accept -> NUNCA completed; evidence entregue ao Jev; erro bounded", async () => {
+    let judgeSeen = null;
+    const t = fakeDeps({
+      view: { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+      messages: [{ type: "assistant", content: [{ type: "reasoning", text: "pensou" }] }],
+      decisions: {
+        judgeRound: async (input) => {
+          judgeSeen = input.state;
+          return acceptAnswers();
+        },
+      },
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, decisions: t.decisions });
+    assert.ok(judgeSeen !== null, "evidence negativa ainda chega ao Jev (nenhuma rejeicao local antes do julgamento)");
+    assert.equal(result.evidence.outcome, "failed");
+    assert.equal(result.evidence.deterministicChecks[0].status, "fail");
+    assert.notEqual(result.phase, "completed", "hard failure + accept NAO pode fechar em completed");
+    assert.equal(result.phase, "failed");
+    assert.ok(result.error && result.error.includes("hard failure"), "erro bounded descritivo");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "uma unica session (sem loop)");
+  });
+
+  it("MR2: resposta final vazia + Jev accept -> NUNCA completed", async () => {
+    const t = fakeDeps({
+      messages: [{ type: "assistant", content: [{ type: "reasoning", text: "so raciocinio, sem texto final" }] }],
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, decisions: t.decisions });
+    assert.equal(result.worker.finalText, "", "resposta final vazia");
+    const finalCheck = result.evidence.deterministicChecks.find((ck) => ck.name === "worker-final-response");
+    assert.equal(finalCheck.status, "fail");
+    assert.notEqual(result.phase, "completed");
+    assert.equal(result.phase, "failed");
+  });
+
+  it("MR3: evidence verde + Jev accept -> completed (happy path preservado)", async () => {
+    const t = fakeDeps();
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, decisions: t.decisions });
+    assert.equal(result.evidence.deterministicChecks[0].status, "pass");
+    assert.equal(result.evidence.deterministicChecks[1].status, "pass");
+    assert.equal(result.phase, "completed");
+    assert.deepEqual(result.pendingCommands, []);
   });
 });
 
@@ -1105,6 +1217,111 @@ describe("tool orchestrate_once (schema, Code Mode, execucao real)", () => {
       assert.ok(info, "sessao worker registrada no runtime");
       assert.equal(info.agent, "build");
       assert.equal(info.model.id, "big-pickle");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+// ─────────────────────────── QB. guardrail pos-fallback (Blocker B) ───────────────────────────
+
+describe("tool orchestrate_once: selecao pos-fallback nunca escapa do catalogo runtime (Blocker B)", () => {
+  it("QB1: catalogo restrito + Jev indisponivel -> NENHUM worker com modelo fora do catalogo", async () => {
+    const m = await bootCtx({
+      models: ["opencode/nemotron-3.5-lightning-free"],
+      agents: ["build", "plan"],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async () => {
+      throw new Error("network down");
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "blocker-qb1",
+          objective: "Refatorar a arquitetura do sistema de autenticacao",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome", "worker-final-response"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(m.workerCalls.create.length, 0, "worker NUNCA criado com modelo fora do catalogo runtime");
+      assert.equal(out.phase, "failed");
+      assert.equal(out.worker, undefined, "sem worker no output");
+      assert.ok(out.error && out.error.includes("elegivel"), "selecao rejeitada bounded antes do createWorker");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("QB2: agents reais sem build/plan + Jev indisponivel -> NENHUM worker com build/plan", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: ["general"],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async () => {
+      throw new Error("network down");
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "blocker-qb2",
+          objective: "Implementar o modulo de autenticacao",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome", "worker-final-response"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(m.workerCalls.create.length, 0, "worker NUNCA criado com agente inexistente no catalogo");
+      assert.equal(out.phase, "failed");
+      assert.ok(
+        out.error && out.error.includes("agente selecionado") && out.error.includes("catalogo runtime"),
+        "rejeicao bounded do agente antes do createWorker",
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("QB3: catalogo restrito + via=jev com modelo/agente elegiveis -> completed (guard nao over-block)", async () => {
+    const m = await bootCtx({
+      models: ["opencode/nemotron-3.5-lightning-free"],
+      agents: ["build", "plan"],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/nemotron-3.5-lightning-free", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "blocker-qb3",
+          objective: "Implementar o modulo de autenticacao",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome", "worker-final-response"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.selection.model, "opencode/nemotron-3.5-lightning-free");
+      assert.equal(m.workerCalls.create.length, 1);
+      assert.deepEqual(m.workerCalls.create[0].model, { providerID: "opencode", id: "nemotron-3.5-lightning-free" });
     } finally {
       stub.restore();
     }
