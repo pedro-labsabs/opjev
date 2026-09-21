@@ -290,6 +290,9 @@ function beginNextRound(
 function recordRound(state: RunState, verdict: RunState["lastVerdict"]): RoundHistoryEntry[] {
   const entry: RoundHistoryEntry = {
     round: state.round,
+    // Attempt history (#10): identidade do executor executado (agent/model).
+    // Sem sessionID (inutil para candidate filtering) e sem scoring.
+    ...(state.executor ? { executor: { agent: state.executor.agent, model: state.executor.model } } : {}),
     verdict,
     ...(state.evidence ? { outcome: state.evidence.outcome, resultSummary: state.evidence.resultSummary } : {}),
   };

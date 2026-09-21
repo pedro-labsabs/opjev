@@ -339,6 +339,8 @@ export type RunPhase =
 /** Registro estruturado e bounded de uma rodada fechada (nunca conversa completa). */
 export interface RoundHistoryEntry {
   round: number;
+  /** Executor que REALMENTE executou a rodada (agent/model, sem sessionID). */
+  executor?: { agent: string; model: string };
   verdict?: JevVerdict;
   outcome?: EvidencePacket["outcome"];
   resultSummary?: string;

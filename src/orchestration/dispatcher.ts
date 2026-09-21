@@ -93,9 +93,30 @@ export interface ExecutorSelection {
 export interface DispatcherDecisions {
   selectExecutor(input: { contract: ExecutionContract; round: number }): Promise<ExecutorSelection>;
   judgeRound(input: { state: unknown; questions: Record<string, unknown> }): Promise<unknown>;
+  /**
+   * Switch-material selection (#10): o Jev escolhe UM novo executor entre
+   * candidatos validos, com contexto bounded (current + failure + attempts).
+   * Sem heuristic local: Jev indisponivel/resposta invalida => o adapter lanca
+   * e o scheduler falha bounded. Nunca escolhe destino localmente.
+   */
+  selectModel(input: SwitchSelectInput): Promise<{ model: string }>;
+  selectAgent(input: SwitchSelectInput): Promise<{ agent: string }>;
 }
 
-export type RoundAction = "initial" | "repair-same" | "fresh-same";
+/** Input bounded para selectModel/selectAgent: contexto suficiente, sem raw. */
+export interface SwitchSelectInput {
+  contract: ExecutionContract;
+  round: number;
+  current: { agent: string; model: string };
+  failureClass: string;
+  resultSummary: string;
+  failedChecks: Array<{ name: string; status: string; summary?: string }>;
+  criticFindings: Array<{ severity: string; summary: string }>;
+  /** Pares agent/model ja executados neste run (attempt history bounded). */
+  attempts: Array<{ agent: string; model: string }>;
+}
+
+export type RoundAction = "initial" | "repair-same" | "fresh-same" | "switch-model" | "switch-agent";
 
 /** Projecao bounded de UMA rodada executada (auditoria minima do resultado). */
 export interface RoundProjection {
@@ -144,7 +165,7 @@ export interface OrchestrationRunResult {
   /** Projecao bounded de TODAS as rodadas executadas (source of truth fechada: RunState.history). */
   rounds?: RoundProjection[];
   /** Projecao bounded do RunState.history final (kernel e canonico). */
-  history?: Array<{ round: number; verdict?: JevVerdict; outcome?: EvidencePacket["outcome"]; resultSummary?: string }>;
+  history?: Array<{ round: number; executor?: { agent: string; model: string }; verdict?: JevVerdict; outcome?: EvidencePacket["outcome"]; resultSummary?: string }>;
 }
 
 // ───────────────────────── helpers puros ─────────────────────────
@@ -247,6 +268,61 @@ export function requireRecoveryExecutor(state: RunState): { agent: string; model
   return { agent: exec.agent, model: exec.model, sessionID: exec.sessionID };
 }
 
+/**
+ * Chave deterministica de combinacao agent/model para loop prevention (#10):
+ * lowercase(agent) + NUL + model. A combinacao (nao o model/agent isolado)
+ * e a unidade de tentativa.
+ */
+export function attemptKey(agent: string, model: string): string {
+  return `${String(agent ?? "").trim().toLowerCase()}\0${String(model ?? "")}`;
+}
+
+/**
+ * Attempt history bounded a partir da history canonica do kernel (que carrega
+ * o executor executado por rodada, item SW0). Deduplicada, em ordem, sem
+ * sessionID (inutil para candidate filtering) e sem scoring (item #15).
+ */
+export function executorAttempts(
+  history: Array<{ executor?: { agent: string; model: string } } | undefined | null> | undefined | null,
+): Array<{ agent: string; model: string }> {
+  const out: Array<{ agent: string; model: string }> = [];
+  const seen = new Set<string>();
+  for (const h of history ?? []) {
+    const e = h?.executor;
+    if (!e || typeof e.agent !== "string" || typeof e.model !== "string") continue;
+    if (!e.agent.trim() || !e.model.trim()) continue;
+    const k = attemptKey(e.agent, e.model);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ agent: e.agent, model: e.model });
+  }
+  return out;
+}
+
+/**
+ * Classificacao pura de throttle global a partir de evidencia OBSERVAVEL e
+ * bounded (resultSummary + summaries de checks/findings). Vocabulario concreto
+ * espelha o guard G2 do roteamento (429/529/rate limit/overload/too many
+ * requests) — failureClass=environment SOZINHA nunca e throttle (item #16).
+ */
+const THROTTLE_SIGNALS: readonly RegExp[] = [/429/, /529/, /rate.?limit/i, /too many requests/i, /overload/i];
+
+export function isGlobalThrottleEvidence(input: {
+  resultSummary?: string;
+  checks?: Array<{ summary?: string } | undefined | null> | undefined | null;
+  findings?: Array<{ summary?: string } | undefined | null> | undefined | null;
+}): boolean {
+  const texts: string[] = [];
+  if (typeof input.resultSummary === "string" && input.resultSummary) texts.push(input.resultSummary);
+  for (const ck of input.checks ?? []) {
+    if (ck && typeof ck.summary === "string" && ck.summary) texts.push(ck.summary);
+  }
+  for (const f of input.findings ?? []) {
+    if (f && typeof f.summary === "string" && f.summary) texts.push(f.summary);
+  }
+  return texts.some((t) => THROTTLE_SIGNALS.some((re) => re.test(t)));
+}
+
 function validateSelection(sel: ExecutorSelection): void {
   if (typeof sel.agent !== "string" || !sel.agent.trim()) {
     throw new OrchestrationError("invalid-selection", "executor selection: agent vazio");
@@ -297,6 +373,7 @@ async function persist(
 function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["history"]> {
   return state.history.map((h) => ({
     round: h.round,
+    ...(h.executor ? { executor: h.executor } : {}),
     ...(h.verdict ? { verdict: h.verdict } : {}),
     ...(h.outcome ? { outcome: h.outcome } : {}),
     ...(h.resultSummary ? { resultSummary: h.resultSummary } : {}),
@@ -343,12 +420,14 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
 
   // Executa a rodada atual. mode=initial cria a primeira sessao; repair-same
   // reutiliza EXATAMENTE a sessionID preservada pelo kernel; fresh-same cria
-  // sessao realmente nova. Retorna `abort` com um OrchestrationRunResult pronto
-  // para retornar quando a rodada falha bounded; caso contrario, retorna o
-  // fechamento da rodada (state, evidence, verdict, transicao, projecoes).
+  // sessao realmente nova; switch-model/switch-agent criam sessao nova com o
+  // executor escolhido pelo Jev (prev.switchTo, validado pelo scheduler).
+  // Retorna `abort` com um OrchestrationRunResult pronto para retornar quando
+  // a rodada falha bounded; caso contrario, retorna o fechamento da rodada
+  // (state, evidence, verdict, transicao, projecoes).
   async function runRoundOnce(
     mode: RoundAction,
-    prev?: { verdict: JevVerdict; evidence: EvidencePacket },
+    prev?: { verdict: JevVerdict; evidence: EvidencePacket; switchTo?: { agent: string; model: string } },
   ): Promise<
     | { abort: true; result: OrchestrationRunResult }
     | {
@@ -365,11 +444,12 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     // initial usa selection (validada em validateSelection); repair/fresh usam
     // EXCLUSIVAMENTE state.executor via requireRecoveryExecutor. Ausente,
     // incompleto ou out-of-pool => bounded failure. NENHUM fallback para
-    // selection nas recovery rounds (validation != routing).
+    // selection nas recovery rounds (validation != routing). Switch rounds nao
+    // passam aqui: identidade vem de prev.switchTo (Jev, validado no scheduler).
     let recoveryAgent = "";
     let recoveryModel = "";
     let recoverySessionID: string | undefined;
-    if (mode !== "initial") {
+    if (mode === "repair-same" || mode === "fresh-same") {
       try {
         const rec = requireRecoveryExecutor(state);
         recoveryAgent = rec.agent;
@@ -383,21 +463,36 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       }
     }
 
+    // 2c. identidade da rodada para STARTED/fallbacks/projection:
+    // initial <- selection; repair/fresh <- canonico validado em 2b;
+    // switch-model/switch-agent <- prev.switchTo (Jev via scheduler).
+    let roundAgent: string;
+    let roundModel: string;
+    if (mode === "initial") {
+      roundAgent = selection.agent;
+      roundModel = selection.model;
+    } else if (mode === "repair-same" || mode === "fresh-same") {
+      roundAgent = recoveryAgent;
+      roundModel = recoveryModel;
+    } else {
+      const target = prev?.switchTo;
+      if (!target || typeof target.agent !== "string" || !target.agent.trim() || typeof target.model !== "string" || !target.model.trim()) {
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("switch-no-selection", `round ${mode} sem executor selecionado pelo Jev`)) };
+      }
+      roundAgent = target.agent;
+      roundModel = target.model;
+    }
+
     // 3. sessao worker da rodada (criacao OU reutilizacao)
     let workerSessionID: string;
     if (mode === "repair-same") {
       // sessionID presente (garantido em 2b); mesma sessao, sem createWorker.
       workerSessionID = recoverySessionID as string;
     } else {
-      // initial: selection; fresh-same: executor canonico validado (nunca selection).
-      const isInitial = mode === "initial";
-      const workerAgent = isInitial ? selection.agent : recoveryAgent;
-      let workerModel: { providerID: string; id: string };
-      if (isInitial) {
-        workerModel = splitModelRef(selection.model);
-      } else {
-        workerModel = splitModelRef(recoveryModel);
-      }
+      // initial / fresh-same / switch-*: cria NOVA worker session (switch nunca
+      // reutiliza a antiga e nunca usa ctx.session.switchModel/switchAgent).
+      const workerAgent = roundAgent;
+      const workerModel = splitModelRef(roundModel);
       try {
         const created = await deps.runtime.createWorker({
           agent: workerAgent,
@@ -416,15 +511,16 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       } catch (err) {
         return { abort: true, result: await failRun(state, contract.runID, err) };
       }
-      if (mode === "fresh-same" && usedWorkerSessions.has(workerSessionID)) {
-        // fresh-same que nao e realmente fresh: erro de integracao bounded,
-        // nunca executa a rodada fingindo ser uma sessao nova.
+      if (mode !== "initial" && usedWorkerSessions.has(workerSessionID)) {
+        // fresh-same / switch-*: sessao precisa ser realmente nova. Erro de
+        // integracao bounded — nunca executa a rodada fingindo ser nova.
+        const code = mode === "fresh-same" ? "fresh-not-fresh" : "switch-not-fresh";
         return {
           abort: true,
           result: await failRun(
             state,
             contract.runID,
-            new OrchestrationError("fresh-not-fresh", `createWorker retornou sessionID ja utilizada (${workerSessionID}): fresh-same exige sessao realmente nova`),
+            new OrchestrationError(code, `createWorker retornou sessionID ja utilizada (${workerSessionID}): ${mode} exige sessao realmente nova`),
           ),
         };
       }
@@ -438,13 +534,10 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     try {
       state = transitionRun(state, {
         type: "EXECUTION_STARTED",
-        // Identidade do executor: initial usa selection; repair/fresh usam
-        // os locais validados em 2b (executor canonico). Para repair-same,
-        // workerSessionID == recoverySessionID (reuso). Para fresh-same,
-        // workerSessionID e a nova sessao criada com agent/model canonicos.
-        executor: mode === "initial"
-          ? { agent: selection.agent, model: selection.model, sessionID: workerSessionID }
-          : { agent: recoveryAgent, model: recoveryModel, sessionID: workerSessionID },
+        // Identidade da rodada (2c): initial <- selection; repair/fresh <-
+        // canonico validado; switch-* <- Jev via scheduler. Para repair-same,
+        // workerSessionID == recoverySessionID (reuso); demais, sessao nova.
+        executor: { agent: roundAgent, model: roundModel, sessionID: workerSessionID },
       }).state;
       const promptMeta = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-round": state.round };
       let promptText: string;
@@ -484,7 +577,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           round: state.round,
           pendingCommands: [],
           error: bounded(err),
-          worker: { sessionID: workerSessionID, agent: mode === "initial" ? selection.agent : recoveryAgent, model: mode === "initial" ? selection.model : recoveryModel, outcome: "interrupted", finalText: "" },
+          worker: { sessionID: workerSessionID, agent: roundAgent, model: roundModel, outcome: "interrupted", finalText: "" },
           rounds,
         },
       };
@@ -494,10 +587,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     const finalText = extractFinalAssistantText(messages);
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
-    const expectedAgent = mode === "initial" ? selection.agent : recoveryAgent;
-    const expectedModel = mode === "initial" ? selection.model : recoveryModel;
-    const agent = view.agent?.trim() || expectedAgent;
-    const model = view.model?.trim() || expectedModel;
+    const agent = view.agent?.trim() || roundAgent;
+    const model = view.model?.trim() || roundModel;
 
     // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
     // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
@@ -712,7 +803,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
   }
 
   // ───────────────────────── scheduler loop ─────────────────────────
-  let prev: { verdict: JevVerdict; evidence: EvidencePacket } | undefined;
+  let prev: { verdict: JevVerdict; evidence: EvidencePacket; switchTo?: { agent: string; model: string } } | undefined;
   let mode: RoundAction = "initial";
   let last: Awaited<ReturnType<typeof runRoundOnce>> & { abort: false } | undefined;
   let pendingCommands: string[] = [];
@@ -739,8 +830,91 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     const firstCommand = out.transition.commands[0]?.type;
     if (firstCommand === "repair-same") { mode = "repair-same"; continue; }
     if (firstCommand === "fresh-same") { mode = "fresh-same"; continue; }
-    // Terminal / boundary: accept => completed; stop => stopped; switch-model/
-    // switch-agent/replan/human => pending command mapeado pelo kernel.
+    if (firstCommand === "select-model" || firstCommand === "select-agent") {
+      // Switch-material (#10): kernel incrementou round e limpou o executor.
+      // maxRounds barrado pelo kernel => awaiting-human (sem select aqui).
+      if (out.state.phase !== "ready") {
+        pendingCommands = out.transition.commands.map((cmd) => cmd.type);
+        break;
+      }
+      const isModelSwitch = firstCommand === "select-model";
+      // Throttle global observavel => sem storm: falha bounded especifica, sem
+      // nova worker, sem select, sem penalidade de capability (item #16).
+      if (
+        isGlobalThrottleEvidence({
+          resultSummary: out.evidence.resultSummary,
+          checks: out.evidence.deterministicChecks,
+          findings: out.evidence.criticFindings,
+        })
+      ) {
+        return await failRun(
+          out.state,
+          contract.runID,
+          new OrchestrationError(
+            "switch-throttled",
+            `verdict ${firstCommand} sob throttle global observavel — nenhuma nova worker, sem storm (evidencia: ${out.evidence.resultSummary.slice(0, 160)})`,
+          ),
+          { worker: last.worker, critic: last.critic, evidence: out.evidence, verdict: out.verdict, rounds },
+        );
+      }
+      // Attempt history canonica (item #8/#10): a rodada que falhou ja entrou
+      // no history via VERDICT_RECEIVED — o par atual nunca volta.
+      const attempts = executorAttempts(out.state.history);
+      const current = { agent: out.evidence.executor.agent, model: out.evidence.executor.model };
+      const switchInput = {
+        contract,
+        round: out.state.round,
+        current,
+        failureClass: out.verdict.failureClass,
+        resultSummary: out.evidence.resultSummary,
+        failedChecks: out.evidence.deterministicChecks
+          .filter((ck) => ck.status !== "pass")
+          .map((ck) => ({ name: ck.name, status: ck.status as string, ...(ck.summary ? { summary: ck.summary } : {}) })),
+        criticFindings: out.evidence.criticFindings.map((f) => ({ severity: f.severity, summary: f.summary })),
+        attempts,
+      };
+      try {
+        if (isModelSwitch) {
+          const sel = await deps.decisions.selectModel(switchInput);
+          const model = typeof sel?.model === "string" ? sel.model.trim() : "";
+          if (!model) {
+            throw new OrchestrationError("invalid-selection", "switch-model sem model valido na resposta do Jev");
+          }
+          if (!isFreeModel(model)) {
+            throw new OrchestrationError("invalid-selection", `switch-model fora do FREE_POOL: ${model}`);
+          }
+          if (attempts.some((a) => attemptKey(a.agent, a.model) === attemptKey(current.agent, model))) {
+            throw new OrchestrationError("invalid-selection", `switch-model repetido neste run: ${current.agent}/${model} ja tentado`);
+          }
+          mode = "switch-model";
+          prev = { verdict: out.verdict, evidence: out.evidence, switchTo: { agent: current.agent, model } };
+          continue;
+        }
+        const sel = await deps.decisions.selectAgent(switchInput);
+        const agent = typeof sel?.agent === "string" ? sel.agent.trim() : "";
+        if (!agent) {
+          throw new OrchestrationError("invalid-selection", "switch-agent sem agent valido na resposta do Jev");
+        }
+        // Catalog membership e autoridade do adapter (resolvePrimaryAgent); o
+        // dispatcher impoe forma + novidade do par (defesa em profundidade).
+        if (attempts.some((a) => attemptKey(a.agent, a.model) === attemptKey(agent, current.model))) {
+          throw new OrchestrationError("invalid-selection", `switch-agent repetido neste run: ${agent}/${current.model} ja tentado`);
+        }
+        mode = "switch-agent";
+        prev = { verdict: out.verdict, evidence: out.evidence, switchTo: { agent, model: current.model } };
+        continue;
+      } catch (err) {
+        return await failRun(out.state, contract.runID, err, {
+          worker: last.worker,
+          critic: last.critic,
+          evidence: out.evidence,
+          verdict: out.verdict,
+          rounds,
+        });
+      }
+    }
+    // Terminal / boundary: accept => completed; stop => stopped; replan/human
+    // => pending command mapeado pelo kernel.
     pendingCommands = out.state.phase === "completed" ? [] : out.transition.commands.map((c) => c.type);
     break;
   }

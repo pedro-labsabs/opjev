@@ -1,4 +1,4 @@
-// Correction prompt de recovery (repair-same / fresh-same).
+// Correction prompt de recovery (repair-same / fresh-same / switch-model / switch-agent).
 //
 // Puro e testavel: nao importa ctx. Gera o prompt bounded de correcao para a
 // proxima rodada APOS um JevVerdict repair-same/fresh-same. Contem SOMENTE a
@@ -10,7 +10,7 @@
 import { CONTRACT_LIMITS, EVIDENCE_LIMITS, truncate, type ExecutionContract, type FailureClass } from "./types.ts";
 
 export interface RecoveryPromptInput {
-  action: "repair-same" | "fresh-same";
+  action: "repair-same" | "fresh-same" | "switch-model" | "switch-agent";
   contract: ExecutionContract;
   round: number;
   maxRounds: number;
@@ -55,6 +55,10 @@ export function buildRecoveryPrompt(input: RecoveryPromptInput): string {
     }
   }
 
-  lines.push("RULE: Correct the observed failure only. Do not declare the work approved. The external judge decides acceptance.");
+  if (input.action === "switch-model" || input.action === "switch-agent") {
+    lines.push("RULE: Correct the observed failure under the newly selected executor. Do not declare the work approved. The external judge decides acceptance.");
+  } else {
+    lines.push("RULE: Correct the observed failure only. Do not declare the work approved. The external judge decides acceptance.");
+  }
   return lines.join("\n");
 }
