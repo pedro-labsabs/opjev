@@ -1261,6 +1261,89 @@ describe("critic integrado ao pipeline: sessao distinta, ordem, findings, timeou
     assert.equal(result.phase, "completed");
     assert.deepEqual(result.pendingCommands, []);
   });
+
+  it("C13: runtime outcome=failed + JSON valido -> critic-session-outcome=fail (JSON NAO esconde falha de sessao)", async () => {
+    let judgeCalls = 0;
+    const t = fakeDeps({
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+      criticMessages: [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] }],
+      decisions: {
+        judgeRound: async (input) => { judgeCalls += 1; return acceptAnswers(); },
+      },
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions });
+    const cc = result.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(cc.status, "fail", "JSON valido nao pode esconder falha runtime da sessao");
+    assert.equal(result.critic.outcome, "failed");
+    assert.equal(result.critic.findingsCount, 0);
+    assert.equal(result.evidence.criticFindings.length, 0);
+    assert.equal(judgeCalls, 1, "Jev ainda recebe a evidence final");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "nenhuma segunda critic session");
+    assert.notEqual(result.phase, "completed", "gate deterministico: fail + accept nunca completa");
+    assert.equal(result.phase, "failed");
+  });
+
+  it("C14: runtime outcome=interrupted + JSON valido -> critic-session-outcome=fail, sem findings", async () => {
+    let judgeCalls = 0;
+    const t = fakeDeps({
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "interrupted" },
+      criticMessages: [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] }],
+      decisions: {
+        judgeRound: async (input) => { judgeCalls += 1; return acceptAnswers(); },
+      },
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions });
+    const cc = result.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(cc.status, "fail", "interrupted -> failure explicito mesmo com JSON residual valido");
+    assert.equal(result.critic.outcome, "failed");
+    assert.equal(result.evidence.criticFindings.length, 0);
+    assert.equal(judgeCalls, 1, "Jev ainda recebe a evidence final");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "nenhuma segunda critic session");
+    assert.notEqual(result.phase, "completed");
+    assert.equal(result.phase, "failed");
+  });
+
+  it("C15: runtime outcome=failed descarta findings residuais validos (nunca entram no EvidencePacket)", async () => {
+    const t = fakeDeps({
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+      criticMessages: [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [{ severity: "critical", summary: "achado de sessao falha" }] }) }] }],
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions });
+    const cc = result.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(cc.status, "fail");
+    assert.equal(result.evidence.criticFindings.length, 0, "findings de sessao falha sao descartados");
+    assert.equal(result.critic.findingsCount, 0);
+    assert.notEqual(result.phase, "completed");
+  });
+
+  it("C16: runtime outcome=succeeded + JSON valido -> critic-session-outcome=pass (preservado)", async () => {
+    const t = fakeDeps({
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" },
+    });
+    const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions });
+    const cc = result.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(cc.status, "pass");
+    assert.equal(result.critic.outcome, "succeeded");
+    assert.equal(result.phase, "completed");
+  });
+
+  it("C17: runtime sem outcome (undefined) -> parser decide (JSON valido => pass; invalido => fail)", async () => {
+    const okRun = fakeDeps({ criticView: { agent: "build", model: "opencode/big-pickle" } });
+    const okResult = await runOrchestrationOnce(contract(), { runtime: okRun.runtime, critic: okRun.critic, decisions: okRun.decisions });
+    const okCc = okResult.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(okCc.status, "pass", "undefined NAO vira falha automatica");
+    assert.equal(okResult.phase, "completed");
+
+    const badRun = fakeDeps({
+      criticView: { agent: "build", model: "opencode/big-pickle" },
+      criticMessages: [{ type: "assistant", content: [{ type: "text", text: "not json" }] }],
+    });
+    const badResult = await runOrchestrationOnce(contract(), { runtime: badRun.runtime, critic: badRun.critic, decisions: badRun.decisions });
+    const badCc = badResult.evidence.deterministicChecks.find((ck) => ck.name === "critic-session-outcome");
+    assert.equal(badCc.status, "fail", "parser decide quando runtime nao projeta outcome");
+    assert.equal(badResult.critic.outcome, "failed");
+    assert.notEqual(badResult.phase, "completed");
+  });
 });
 
 // ─────────────────────────── C8/C9/C10/C11. critic tool-level ───────────────────────────

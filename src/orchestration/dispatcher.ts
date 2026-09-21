@@ -400,20 +400,41 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     );
     const cView = await deps.critic.get({ sessionID: createdSessionID });
     const cMessages = await deps.critic.context({ sessionID: createdSessionID });
+    const ownOutcome = cView.outcome;
+    const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
     const raw = extractFinalAssistantText(cMessages);
     const parsed = parseCriticOutput(raw);
-    criticProj = {
-      sessionID: criticSessionID,
-      agent: cView.agent?.trim() || selection.agent,
-      model: cView.model?.trim() || selection.model,
-      outcome: parsed.ok ? "succeeded" : "failed",
-      findingsCount: parsed.ok ? parsed.findings.length : 0,
-    };
-    if (parsed.ok) {
-      criticFindings = parsed.findings;
-      criticCheck = { name: "critic-session-outcome", status: "pass" };
+    if (ownFailed) {
+      // Runtime declarou a sessao do critic como falha ou interrompida: isso
+      // NUNCA vira aprovacao silenciosa, mesmo com JSON residual valido no
+      // output. Findings de sessao falha sao descartados; a falha pertence ao
+      // deterministicCheck critic-session-outcome (fail). O Jev ainda recebe a
+      // evidence final negativa e o gate deterministico impede fail+accept.
+      criticProj = {
+        sessionID: criticSessionID,
+        agent: cView.agent?.trim() || selection.agent,
+        model: cView.model?.trim() || selection.model,
+        outcome: "failed",
+        findingsCount: 0,
+      };
+      criticFindings = [];
+      criticCheck = criticOutcomeCheck("fail", `critic session outcome: ${ownOutcome}`);
     } else {
-      criticCheck = criticOutcomeCheck("fail", parsed.summary); // classe bounded da falha
+      // outcome=succeeded OU ausente: o parser continua determinando a validade
+      // do output (compatibilidade com runtimes que nao projetam outcome).
+      criticProj = {
+        sessionID: criticSessionID,
+        agent: cView.agent?.trim() || selection.agent,
+        model: cView.model?.trim() || selection.model,
+        outcome: parsed.ok ? "succeeded" : "failed",
+        findingsCount: parsed.ok ? parsed.findings.length : 0,
+      };
+      if (parsed.ok) {
+        criticFindings = parsed.findings;
+        criticCheck = { name: "critic-session-outcome", status: "pass" };
+      } else {
+        criticCheck = criticOutcomeCheck("fail", parsed.summary); // classe bounded da falha
+      }
     }
   } catch (err) {
     criticProj = {
