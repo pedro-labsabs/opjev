@@ -33,7 +33,9 @@ export function makeStorage(seed = {}) {
  * `agents`: lista de agentes disponiveis (strings ou {id}).
  * `session`: estado inicial da sessao: { agent, model: {providerID, id} }.
  * `switchBehavior`: { switchModelError?, switchAgentError? } para injetar falhas.
- * `sessionGetState`: forc a forma retornada por session.get (default espelha session).
+ * `location`: diretorio do ctx.location (contorno do dispatcher).
+ * `workerBehavior`: { outcome?, messages?, waitBlocks? } para o fake runtime de
+ *   worker sessions (usado pelo dispatcher via ctx.session.create/prompt/wait/...).
  */
 export function makeCtx({
   models = [],
@@ -43,16 +45,55 @@ export function makeCtx({
   options = {},
   switchBehavior = {},
   integrationList = [],
+  location = "/fake/project",
+  workerBehavior = {},
 } = {}) {
   const hooks = { session: {}, tool: {} };
   const tools = {};
   let state = session ? { ...session, model: session.model ? { ...session.model } : session.model } : null;
   const calls = { switchModel: [], switchAgent: [], jevBodies: [] };
   const errorCounts = {};
+  const loc = typeof location === "string" ? { directory: location } : location ?? { directory: "/fake/project" };
+
+  // Worker sessions (runtime falso do dispatcher): separadas da sessao principal
+  // (que representa o usuario). Toda criacao via ctx.session.create ganha um id
+  // novo; os efeitos ficam observaveis em `workerCalls` / `workerSessions`.
+  const workerSessions = new Map();
+  const workerCalls = { create: [], prompt: [], wait: [], get: [], context: [], interrupt: [] };
+  let workerSeq = 0;
+  const defaultWorkerMessages = [
+    {
+      id: "wmsg-1",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }],
+      time: { created: 1, completed: 2 },
+      finish: "stop",
+    },
+  ];
+
+  function workerInfo(input = {}) {
+    workerSeq += 1;
+    const id = `worker-${workerSeq}`;
+    return {
+      id,
+      projectID: "fake",
+      agent: input.agent,
+      model: { ...(input.model ?? { providerID: "opencode", id: "big-pickle" }) },
+      outcome: workerBehavior.outcome ?? "succeeded",
+      metadata: input.metadata,
+      location: input.location ?? { directory: loc.directory },
+      time: { created: Date.now(), updated: Date.now() },
+      messages: null, // preenchido no create abaixo
+      prompts: [],
+    };
+  }
 
   const ctx = {
     options,
     storage,
+    location: loc,
     agent: {
       list: async () =>
         agents.map((a) => (typeof a === "string" ? { id: a, name: a } : a)),
@@ -69,14 +110,60 @@ export function makeCtx({
         ),
     },
     session: {
-      get: async () => {
+      get: async (idOrOpts) => {
         if (switchBehavior.getError) throw switchBehavior.getError;
+        const sessionID = typeof idOrOpts === "string" ? idOrOpts : idOrOpts?.sessionID;
+        if (sessionID && workerSessions.has(sessionID)) {
+          const w = workerSessions.get(sessionID);
+          return {
+            id: w.id,
+            agent: w.agent,
+            model: w.model,
+            outcome: w.outcome,
+            metadata: w.metadata,
+            location: w.location,
+          };
+        }
         return state
           ? {
+              id: "main",
               agent: { id: state.agent },
               model: { providerID: state.model.providerID, id: state.model.id },
             }
           : undefined;
+      },
+      create: async (input = {}) => {
+        workerCalls.create.push(input);
+        const info = workerInfo(input);
+        info.messages = workerBehavior.messages ?? defaultWorkerMessages;
+        workerSessions.set(info.id, info);
+        return { ...info };
+      },
+      prompt: async ({ sessionID, text, metadata } = {}) => {
+        workerCalls.prompt.push({ sessionID, text, metadata });
+        const w = workerSessions.get(sessionID);
+        if (w) w.prompts.push({ text, metadata });
+      },
+      wait: async ({ sessionID } = {}) => {
+        workerCalls.wait.push({ sessionID });
+        const w = workerSessions.get(sessionID);
+        const blocked =
+          workerBehavior.waitBlocks &&
+          (!Array.isArray(workerBehavior.blockedSessions) ||
+            workerBehavior.blockedSessions.includes(sessionID));
+        if (blocked) {
+          return await new Promise(() => {}); // wait bloqueado (timeout testavel)
+        }
+      },
+      context: async ({ sessionID } = {}) => {
+        workerCalls.context.push({ sessionID });
+        const w = workerSessions.get(sessionID);
+        return w?.messages ?? [];
+      },
+      interrupt: async ({ sessionID } = {}) => {
+        workerCalls.interrupt.push({ sessionID });
+        const w = workerSessions.get(sessionID);
+        if (w) w.interrupted = true;
       },
       switchModel: async ({ sessionID, model }) => {
         calls.switchModel.push({ sessionID, model });
@@ -122,7 +209,7 @@ export function makeCtx({
       list: async () => integrationList,
     },
   };
-  return { ctx, hooks, tools, calls, storage, getState: () => state, errorCounts };
+  return { ctx, hooks, tools, calls, storage, getState: () => state, errorCounts, workerSessions, workerCalls };
 }
 
 // —— Stub do Jev (global fetch) ——
