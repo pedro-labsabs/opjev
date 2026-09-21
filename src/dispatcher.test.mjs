@@ -1452,7 +1452,11 @@ describe("critic tool-level: read-only runtime, anti-rerouting, role instruction
       const workerCreate = m.workerCalls.create.find((c) => c.metadata?.["jev-role"] === "worker");
       const criticCreate = m.workerCalls.create.find((c) => c.metadata?.["jev-role"] === "critic");
       assert.ok(workerCreate && criticCreate, "worker e critic ambos criados");
-      assert.equal(workerCreate.permissions, undefined, "worker nao herda restricoes");
+      assert.deepEqual(
+        workerCreate.permissions,
+        [{ action: "subagent", resource: "*", effect: "deny" }],
+        "worker nao herda read-only do critic: boundary propria de implementer (so nega subagent)",
+      );
       assert.ok(Array.isArray(criticCreate.permissions) && criticCreate.permissions.length > 0, "critic com permission rules");
       const actions = criticCreate.permissions.map((r) => `${r.action}:${r.effect}`);
       for (const a of ["edit:deny", "shell:deny", "subagent:deny", "skill:deny", "question:deny", "webfetch:deny", "websearch:deny", "external_directory:deny", "execute:deny"]) {
@@ -1722,7 +1726,11 @@ describe("tool orchestrate_once (schema, Code Mode, execucao real)", () => {
         Array.isArray(cCreated.permissions) && cCreated.permissions.length > 0,
         "critic session.create recebe permission rules",
       );
-      assert.equal(created.permissions, undefined, "worker NAO herda restricoes do critic");
+      assert.deepEqual(
+        created.permissions,
+        [{ action: "subagent", resource: "*", effect: "deny" }],
+        "worker NAO herda read-only do critic: boundary propria de implementer",
+      );
       const cActions = cCreated.permissions.map((r) => `${r.action}:${r.effect}`);
       for (const a of ["edit:deny", "shell:deny", "subagent:deny", "question:deny", "external_directory:deny", "execute:deny"]) {
         assert.ok(cActions.includes(a), `critic policy nega ${a}`);
@@ -2710,6 +2718,274 @@ describe("tool orchestrate_once: E2E recovery repair-same / fresh-same (entrypoi
     }
   });
 
+// ─────────────────────────── ARC. agent role catalog + bounded delegation ───────────────────────────
+
+describe("tool orchestrate_once: agent catalog eligibility (ARC4-ARC11)", () => {
+  const catalogAgents = () => ([
+    { id: "build", name: "Build", mode: "primary", hidden: false, description: "The default agent." },
+    { id: "explore", name: "Explore", mode: "subagent", hidden: false, description: "Search specialist." },
+  ]);
+
+  it("ARC5: custom primary real — Jev escolhe my-specialist, worker criada com logicalRole implementer", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "my-specialist", name: "Specialist", mode: "primary", hidden: false, description: "Custom primary." },
+        { id: "build", name: "Build", mode: "primary", hidden: false },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "my-specialist", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc5-custom-primary",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 1);
+      assert.equal(workerCreates[0].agent, "my-specialist", "worker criada com o custom primary");
+      assert.equal(workerCreates[0].metadata?.["jev-agent-role"], "implementer", "logicalRole implementer na worker");
+      assert.equal(out.rounds[0].agent, "my-specialist");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC7: catalogo vazio — Jev disposto nao importa, nenhum worker inventado", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc7-empty-catalog",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "catalogo vazio nunca executa");
+      assert.equal(m.workerCalls.create.length, 0, "nenhum worker inventado");
+      assert.ok(out.error && out.error.includes("catalogo"), "erro bounded menciona catalogo");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC8a: discovery indisponivel — fallback build/plan executa", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agentListError: new Error("discovery down"),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc8a-fallback",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed", "fallback seguro preservado");
+      assert.equal(out.worker.agent, "build");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC8b: discovery indisponivel — subagent-only continua rejeitado no fallback", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agentListError: new Error("discovery down"),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "explore", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc8b-fallback-strict",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      // Fallback heuristico (plan, elegivel no fallback) pode assumir — o
+      // invariante e que explore NUNCA vira primary, em nenhum caminho.
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.ok(workerCreates.every((c) => c.agent !== "explore"), "fallback nao deixa explore virar primary");
+      assert.notEqual(out.worker?.agent, "explore", "executor final nunca e explore");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC9: metadata separa jev-role (session kind) de logical role", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: catalogAgents(),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc9-metadata",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
+      assert.equal(workerCreates.length, 1);
+      assert.equal(criticCreates.length, 1);
+      assert.equal(workerCreates[0].metadata?.["jev-router"], "orchestration-internal", "jev-router preservado");
+      assert.equal(workerCreates[0].metadata?.["jev-agent-role"], "implementer", "worker = logical implementer");
+      assert.equal(criticCreates[0].metadata?.["jev-agent-role"], "critic", "critic = logical critic");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC10: implementer permission payload nega subagent spawn", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: catalogAgents(),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc10-impl-perms",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.deepEqual(
+        workerCreates[0].permissions,
+        [{ action: "subagent", resource: "*", effect: "deny" }],
+        "worker nega exatamente subagent spawn, sem tocar no resto",
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("ARC11: critic permission payload nega subagent spawn (read-only preservado)", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: catalogAgents(),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "arc11-critic-perms",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
+      const perms = criticCreates[0].permissions ?? [];
+      assert.ok(
+        perms.some((p) => p.action === "subagent" && p.effect === "deny"),
+        "critic nega subagent spawn",
+      );
+      assert.ok(perms.some((p) => p.action === "read" && p.effect === "allow"), "critic continua read-only");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
   it("E2E-safety-out-of-pool: route big-pickle, runtime paid-model -> failed, sem critic/judge/round2", async () => {
     const m = await bootCtx({
       models: ALL_MODELS,
@@ -2756,6 +3032,129 @@ describe("tool orchestrate_once: E2E recovery repair-same / fresh-same (entrypoi
       const judges = stub.calls.filter((c) => c.body?.questions?.done);
       assert.equal(judges.length, 0, "Jev NUNCA chamado sob model invalido");
       assert.ok((out.rounds ?? []).length <= 1, "round2 ausente");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+// ─────────────────────────── E2E agent catalog (A/B/C) ───────────────────────────
+
+describe("tool orchestrate_once: E2E agent catalog (primary valido / subagent malicioso / custom)", () => {
+  const e2eCatalogAgents = () => ([
+    { id: "build", name: "Build", mode: "primary", hidden: false, description: "The default agent." },
+    { id: "explore", name: "Explore", mode: "subagent", hidden: false, description: "Search specialist." },
+  ]);
+
+  it("E2E-A: catalog build primary + explore subagent, Jev build -> worker build implementer + critic + completed", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: e2eCatalogAgents(),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-catalog-a",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 1);
+      assert.equal(workerCreates[0].agent, "build", "worker primary criada");
+      assert.equal(workerCreates[0].metadata?.["jev-agent-role"], "implementer", "logicalRole implementer");
+      assert.equal(out.selection.agent, "build");
+      assert.ok(out.critic, "critic criado");
+      assert.equal(out.rounds[0].agent, "build");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-B: catalog com explore subagent, Jev malicioso tenta explore -> nenhuma primary com explore", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: e2eCatalogAgents(),
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "research-docs", agent: "explore", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-catalog-b",
+          objective: "Pesquisar docs de uma lib desconhecida",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "subagent-only rejeitado bounded");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 0, "nenhuma worker primary com explore");
+      assert.ok(out.error && out.error.includes("explore"), "erro menciona o ID rejeitado");
+      assert.ok(out.error.includes("primary"), "erro menciona elegibilidade primary");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-C: catalog com specialist primary, Jev specialist -> worker specialist auditada como implementer", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "specialist", name: "Specialist", mode: "primary", hidden: false, description: "Domain specialist." },
+        { id: "build", name: "Build", mode: "primary", hidden: false },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "specialist", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-catalog-c",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates[0].agent, "specialist", "worker specialist criada");
+      assert.equal(workerCreates[0].metadata?.["jev-agent-role"], "implementer", "auditada como logical implementer");
+      assert.equal(out.selection.agent, "specialist");
+      assert.equal(out.rounds[0].agent, "specialist");
     } finally {
       stub.restore();
     }
