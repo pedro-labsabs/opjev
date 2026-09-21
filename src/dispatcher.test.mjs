@@ -17,6 +17,7 @@ import {
   extractFinalAssistantText,
   runOrchestrationOnce,
 } from "./orchestration/dispatcher.ts";
+import * as dispatcherMod from "./orchestration/dispatcher.ts";
 import {
   isInternalWorkerSession,
   hasInternalPromptMarker,
@@ -2166,6 +2167,103 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
   });
 
+  it("RCV21: runtime out-of-pool — selection FREE, view P -> bounded failure antes de critic/judge", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "build", model: "openai/gpt-paid-test", outcome: "succeeded" },
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "out-of-pool falha bounded");
+    assert.ok(result.error && result.error.includes("FREE_POOL"), "erro bounded menciona FREE_POOL");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 0, "critic NUNCA criado sob model invalido");
+    assert.equal(t.effects.filter((e) => e === "judge").length, 0, "Jev NUNCA chamado sob model invalido");
+    assert.equal(t.effects.filter((e) => e === "prompt").length, 1, "so a round1 executou prompt");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "so a worker inicial criada");
+  });
+
+  it("RCV22: out-of-pool nunca repair — nenhum segundo prompt, nenhuma round2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "build", model: "openai/gpt-paid-test", outcome: "succeeded" },
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(t.effects.filter((e) => e === "prompt").length, 1, "nenhum segundo prompt na mesma worker");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhuma worker nova");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 0, "nenhum critic de round2");
+    assert.ok((result.rounds ?? []).length <= 1, "rounds executadas <= 1");
+    assert.equal(t.effects.filter((e) => e === "judge").length, 0, "hard guard preempta o judgement (sem verdict fabricado)");
+  });
+
+  it("RCV23: out-of-pool nunca fresh — createWorker total = 1, P nunca alcanca recovery", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "build", model: "openai/gpt-paid-test", outcome: "succeeded" },
+    });
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(createdInputs.length, 1, "nenhum createWorker de round2");
+    assert.ok(!JSON.stringify(createdInputs).includes("gpt-paid-test"), "P nunca alcancou createWorker");
+  });
+
+  it("RCV24: requireRecoveryExecutor — ausente/invalido/out-of-pool falha, canonico valido passa", async () => {
+    const req = dispatcherMod.requireRecoveryExecutor;
+    assert.equal(typeof req, "function", "helper requireRecoveryExecutor exportado (RED: nao existe)");
+    // OrchestrationError.code e propriedade separada da mensagem: valida via funcao.
+    const isRecoveryNoExecutor = (err) => err && err.code === "recovery-no-executor";
+    assert.throws(() => req({}), isRecoveryNoExecutor, "sem executor");
+    assert.throws(() => req({ executor: undefined }), isRecoveryNoExecutor, "executor undefined");
+    assert.throws(() => req({ executor: { agent: "", model: "opencode/big-pickle" } }), isRecoveryNoExecutor, "agent vazio");
+    assert.throws(() => req({ executor: { agent: "build", model: "" } }), isRecoveryNoExecutor, "model vazio");
+    assert.throws(
+      () => req({ executor: { agent: "build", model: "openai/gpt-paid-test", sessionID: "w1" } }),
+      isRecoveryNoExecutor,
+      "out-of-pool rejeitado mesmo com sessionID",
+    );
+    assert.deepEqual(
+      req({ executor: { agent: "general", model: "opencode/mimo-v2.5-free", sessionID: "w1" } }),
+      { agent: "general", model: "opencode/mimo-v2.5-free", sessionID: "w1" },
+      "executor canonico valido passa intacto",
+    );
+  });
+
+  it("RCV25: fresh valid drift com view vazia na round2 — fallback usa canonico M2, nao M1", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      viewsByRound: [
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+        { outcome: "succeeded" },
+      ],
+      criticSessionIDs: ["c1", "c2"],
+    });
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.deepEqual(createdInputs[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "fresh create usa M2 canonico");
+    assert.equal(result.rounds[1].model, "opencode/mimo-v2.5-free", "round2 model = M2 (fallback canonico, nao M1)");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "fresh: sessions diferentes");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+  });
+
   it("RCV6: fresh com sessionID reutilizada -> bounded failure, nunca executa fingindo ser fresh", async () => {
     const t = fakeDeps({
       judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
@@ -2607,6 +2705,57 @@ describe("tool orchestrate_once: E2E recovery repair-same / fresh-same (entrypoi
       assert.equal(out.selection.agent, "build", "selection = auditoria da escolha inicial");
       const routes = stub.calls.filter((c) => c.body?.questions?.route);
       assert.equal(routes.length, 1, "selectExecutor (route) chamado 1 vez");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-safety-out-of-pool: route big-pickle, runtime paid-model -> failed, sem critic/judge/round2", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "WORK_DONE" }] }],
+        ],
+        agentByRound: ["build"],
+        modelByRound: ["openai/paid-test-model"],
+      },
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.done) {
+        return okJev(acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-safety-pool",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "out-of-pool falha bounded no entrypoint real");
+      assert.ok(out.error && out.error.includes("FREE_POOL"), "erro bounded menciona FREE_POOL");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 1, "1 worker criada (inicial)");
+      assert.ok(!JSON.stringify(workerCreates).includes("paid-test-model"), "nenhum createWorker usou o paid model");
+      const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
+      assert.equal(criticCreates.length, 0, "critic NUNCA criado sob model invalido");
+      const judges = stub.calls.filter((c) => c.body?.questions?.done);
+      assert.equal(judges.length, 0, "Jev NUNCA chamado sob model invalido");
+      assert.ok((out.rounds ?? []).length <= 1, "round2 ausente");
     } finally {
       stub.restore();
     }

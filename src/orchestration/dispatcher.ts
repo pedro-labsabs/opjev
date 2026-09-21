@@ -228,6 +228,25 @@ function bounded(msg: unknown): string {
   return s.length > 400 ? `${s.slice(0, 400)}…[truncado pelo dispatcher]` : s;
 }
 
+/**
+ * Executor canonico de recovery (repair-same / fresh-same): validacao unica e
+ * estrita. O executor observado pelo runtime so governa recovery se continuar
+ * elegivel — agent/model presentes e model ∈ FREE_POOL. Ausente, incompleto
+ * ou out-of-pool => OrchestrationError bounded (`recovery-no-executor`).
+ * Sem fallback para selection (validation != routing: o dispatcher rejeita,
+ * nunca escolhe modelo alternativo).
+ */
+export function requireRecoveryExecutor(state: RunState): { agent: string; model: string; sessionID?: string } {
+  const exec = state.executor;
+  if (!exec || typeof exec.agent !== "string" || !exec.agent.trim() || typeof exec.model !== "string" || !exec.model.trim()) {
+    throw new OrchestrationError("recovery-no-executor", "recovery exige state.executor canonico valido (ausente ou incompleto)");
+  }
+  if (!isFreeModel(exec.model)) {
+    throw new OrchestrationError("recovery-no-executor", `recovery exige model no FREE_POOL: ${exec.model}`);
+  }
+  return { agent: exec.agent, model: exec.model, sessionID: exec.sessionID };
+}
+
 function validateSelection(sel: ExecutorSelection): void {
   if (typeof sel.agent !== "string" || !sel.agent.trim()) {
     throw new OrchestrationError("invalid-selection", "executor selection: agent vazio");
@@ -342,28 +361,42 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         transition: { commands: ReturnType<typeof transitionRun>["commands"] };
       }
   > {
+    // 2b. executor canonico de recovery — validado UMA vez por rodada.
+    // initial usa selection (validada em validateSelection); repair/fresh usam
+    // EXCLUSIVAMENTE state.executor via requireRecoveryExecutor. Ausente,
+    // incompleto ou out-of-pool => bounded failure. NENHUM fallback para
+    // selection nas recovery rounds (validation != routing).
+    let recoveryAgent = "";
+    let recoveryModel = "";
+    let recoverySessionID: string | undefined;
+    if (mode !== "initial") {
+      try {
+        const rec = requireRecoveryExecutor(state);
+        recoveryAgent = rec.agent;
+        recoveryModel = rec.model;
+        recoverySessionID = rec.sessionID;
+      } catch (err) {
+        return { abort: true, result: await failRun(state, contract.runID, err) };
+      }
+      if (mode === "repair-same" && !recoverySessionID) {
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado")) };
+      }
+    }
+
     // 3. sessao worker da rodada (criacao OU reutilizacao)
     let workerSessionID: string;
     if (mode === "repair-same") {
-      const reused = state.executor?.sessionID;
-      if (!reused) {
-        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado")) };
-      }
-      workerSessionID = reused;
+      // sessionID presente (garantido em 2b); mesma sessao, sem createWorker.
+      workerSessionID = recoverySessionID as string;
     } else {
-      // initial / fresh-same: cria nova worker session (fresh exige id realmente nova)
-      // A identidade do executor depende do modo:
-      //   - initial: usa selection (a escolha inicial do Jev)
-      //   - fresh-same: usa state.executor (o executor canônico preservado pelo kernel)
-      //             NUNCA volta para selection inicial.
+      // initial: selection; fresh-same: executor canonico validado (nunca selection).
       const isInitial = mode === "initial";
-      const workerAgent = isInitial ? selection.agent : (state.executor?.agent ?? selection.agent);
-      // Determina o model do worker: inicial usa selection, fresh usa state.executor
+      const workerAgent = isInitial ? selection.agent : recoveryAgent;
       let workerModel: { providerID: string; id: string };
       if (isInitial) {
         workerModel = splitModelRef(selection.model);
       } else {
-        workerModel = splitModelRef(state.executor?.model ?? selection.model);
+        workerModel = splitModelRef(recoveryModel);
       }
       try {
         const created = await deps.runtime.createWorker({
@@ -406,12 +439,12 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       state = transitionRun(state, {
         type: "EXECUTION_STARTED",
         // Identidade do executor: initial usa selection; repair/fresh usam
-        // o executor canonico preservado pelo kernel (state.executor).
-        // Para repair-same, workerSessionID == state.executor.sessionID (reuso).
-        // Para fresh-same, workerSessionID e a nova sessao criada com agent/model canonicos.
+        // os locais validados em 2b (executor canonico). Para repair-same,
+        // workerSessionID == recoverySessionID (reuso). Para fresh-same,
+        // workerSessionID e a nova sessao criada com agent/model canonicos.
         executor: mode === "initial"
           ? { agent: selection.agent, model: selection.model, sessionID: workerSessionID }
-          : { agent: state.executor?.agent ?? selection.agent, model: state.executor?.model ?? selection.model, sessionID: workerSessionID },
+          : { agent: recoveryAgent, model: recoveryModel, sessionID: workerSessionID },
       }).state;
       const promptMeta = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-round": state.round };
       let promptText: string;
@@ -451,7 +484,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           round: state.round,
           pendingCommands: [],
           error: bounded(err),
-          worker: { sessionID: workerSessionID, agent: mode === "initial" ? selection.agent : (state.executor?.agent ?? selection.agent), model: mode === "initial" ? selection.model : (state.executor?.model ?? selection.model), outcome: "interrupted", finalText: "" },
+          worker: { sessionID: workerSessionID, agent: mode === "initial" ? selection.agent : recoveryAgent, model: mode === "initial" ? selection.model : recoveryModel, outcome: "interrupted", finalText: "" },
           rounds,
         },
       };
@@ -461,10 +494,27 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     const finalText = extractFinalAssistantText(messages);
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
-    const expectedAgent = mode === "initial" ? selection.agent : (state.executor?.agent ?? selection.agent);
-    const expectedModel = mode === "initial" ? selection.model : (state.executor?.model ?? selection.model);
+    const expectedAgent = mode === "initial" ? selection.agent : recoveryAgent;
+    const expectedModel = mode === "initial" ? selection.model : recoveryModel;
     const agent = view.agent?.trim() || expectedAgent;
     const model = view.model?.trim() || expectedModel;
+
+    // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
+    // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
+    // critic, judge e recovery — sem fallback para selection, sem routing
+    // alternativo (validation != routing).
+    if (!isFreeModel(model)) {
+      try {
+        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
+      } catch { /* kernel barrier */ }
+      return {
+        abort: true,
+        result: await failRun(state, contract.runID, new OrchestrationError("executor-not-free", `modelo observado fora do FREE_POOL: ${model}`), {
+          worker: { sessionID: workerSessionID, agent, model, outcome: "failed", finalText },
+          rounds,
+        }),
+      };
+    }
 
     state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome }).state;
 
