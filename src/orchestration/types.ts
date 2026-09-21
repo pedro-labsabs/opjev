@@ -336,11 +336,21 @@ export type RunPhase =
   | "stopped"
   | "failed";
 
+/** Revisao de contrato auditavel e bounded (from/to enxutos + campos alterados). */
+export interface ContractRevision {
+  from: { objective: string; maxRounds: number };
+  to: { objective: string; maxRounds: number };
+  /** Subconjunto de: objective, scope, constraints, acceptanceCriteria, requiredEvidence, maxRounds. */
+  changedFields: string[];
+}
+
 /** Registro estruturado e bounded de uma rodada fechada (nunca conversa completa). */
 export interface RoundHistoryEntry {
   round: number;
   /** Executor que REALMENTE executou a rodada (agent/model, sem sessionID). */
   executor?: { agent: string; model: string };
+  /** Revisao instalada via CONTRACT_READY, associada ao entry do verdict replan. */
+  contractRevision?: ContractRevision;
   verdict?: JevVerdict;
   outcome?: EvidencePacket["outcome"];
   resultSummary?: string;
@@ -389,7 +399,7 @@ export type OrchestrationEvent =
  * select-agent (proximo slice consulta o Jev com candidatos validos).
  */
 export type OrchestrationCommand =
-  | { type: "dispatch"; mode: "initial" }
+  | { type: "dispatch"; mode: "initial" | "replan" }
   | { type: "evaluate" }
   | { type: "repair-same" }
   | { type: "fresh-same" }

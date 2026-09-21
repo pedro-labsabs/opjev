@@ -95,7 +95,18 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
             `contrato revisado nao pode reduzir maxRounds abaixo da rodada atual (current round ${state.round}, revised maxRounds ${event.contract.maxRounds})`,
           );
         }
-        return next({ contract: event.contract, phase: "ready" }, [{ type: "dispatch", mode: "initial" }]);
+        const changedFields = diffContractFields(state.contract, event.contract);
+        const revision = {
+          from: { objective: state.contract.objective, maxRounds: state.contract.maxRounds },
+          to: { objective: event.contract.objective, maxRounds: event.contract.maxRounds },
+          changedFields,
+        };
+        // Audita a revisao no ultimo entry (o do verdict replan); cap preservado
+        // (associacao, nao crescimento).
+        const history = state.history.length > 0
+          ? [...state.history.slice(0, -1), { ...state.history[state.history.length - 1], contractRevision: revision }]
+          : state.history;
+        return next({ contract: event.contract, phase: "ready", history }, [{ type: "dispatch", mode: "replan" }]);
       }
       return next({ phase: "ready" }, [{ type: "dispatch", mode: "initial" }]);
     }
@@ -239,7 +250,21 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
             verdict,
             history,
             (round) =>
-              next({ phase: "planning", round, lastVerdict: verdict, history, evidence: undefined }, [{ type: "replan" }]),
+              next(
+                {
+                  phase: "planning",
+                  round,
+                  lastVerdict: verdict,
+                  history,
+                  evidence: undefined,
+                  // #11: identidade canonica preservada (agent/model), sessionID
+                  // descartada — a proxima worker pos-replan sera realmente fresh.
+                  executor: state.executor
+                    ? { agent: state.executor.agent, model: state.executor.model }
+                    : undefined,
+                },
+                [{ type: "replan" }],
+              ),
           );
         case "human":
           return next({ phase: "awaiting-human", lastVerdict: verdict, history }, [{ type: "request-human" }]);
@@ -254,7 +279,7 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
     }
 
     case "COMMAND_FAILED": {
-      const allowed: RunPhase[] = ["ready", "evaluating", "repairing", "awaiting-human"];
+      const allowed: RunPhase[] = ["ready", "evaluating", "repairing", "awaiting-human", "planning"];
       if (!allowed.includes(src)) invalid(`COMMAND_FAILED nao permitido na fase ${src}`);
       const raw = event.error ?? `comando falhou: ${String(event.command ?? "desconhecido")}`;
       const lastError = raw.length > 400 ? `${raw.slice(0, 400)}…[truncado pelo kernel]` : raw;
@@ -287,6 +312,22 @@ function beginNextRound(
 }
 
 // Registra o fechamento da rodada na history (bounded FIFO).
+/**
+ * Campos alterados entre contratos (nomes conhecidos apenas). Comparacao
+ * deterministica por valor serializado; conservadora (ordem de array conta
+ * como mudanca) — direcao audit-safe.
+ */
+function diffContractFields(a: ExecutionContract, b: ExecutionContract): string[] {
+  const out: string[] = [];
+  if (a.objective !== b.objective) out.push("objective");
+  if (JSON.stringify(a.scope) !== JSON.stringify(b.scope)) out.push("scope");
+  if (JSON.stringify(a.constraints) !== JSON.stringify(b.constraints)) out.push("constraints");
+  if (JSON.stringify(a.acceptanceCriteria) !== JSON.stringify(b.acceptanceCriteria)) out.push("acceptanceCriteria");
+  if (JSON.stringify(a.requiredEvidence) !== JSON.stringify(b.requiredEvidence)) out.push("requiredEvidence");
+  if (a.maxRounds !== b.maxRounds) out.push("maxRounds");
+  return out;
+}
+
 function recordRound(state: RunState, verdict: RunState["lastVerdict"]): RoundHistoryEntry[] {
   const entry: RoundHistoryEntry = {
     round: state.round,

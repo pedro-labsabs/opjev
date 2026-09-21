@@ -10,7 +10,7 @@
 import { CONTRACT_LIMITS, EVIDENCE_LIMITS, truncate, type ExecutionContract, type FailureClass } from "./types.ts";
 
 export interface RecoveryPromptInput {
-  action: "repair-same" | "fresh-same" | "switch-model" | "switch-agent";
+  action: "repair-same" | "fresh-same" | "switch-model" | "switch-agent" | "replan";
   contract: ExecutionContract;
   round: number;
   maxRounds: number;
@@ -35,7 +35,17 @@ export function buildRecoveryPrompt(input: RecoveryPromptInput): string {
   push("RECOVERY_ACTION", input.action);
   push("ROUND", `${input.round}/${input.maxRounds}`);
   push("OBJECTIVE", truncate(c.objective, CONTRACT_LIMITS.objective));
+  if (input.action === "replan") {
+    // Round pos-replan executa o REVISED contract como ativo: escopo,
+    // restricoes e evidencia revisados fazem parte do prompt (#11).
+    pushList("SCOPE_INCLUDE", c.scope?.include);
+    pushList("SCOPE_EXCLUDE", c.scope?.exclude);
+    pushList("CONSTRAINTS", c.constraints);
+  }
   pushList("ACCEPTANCE_CRITERIA", c.acceptanceCriteria);
+  if (input.action === "replan") {
+    pushList("REQUIRED_EVIDENCE", c.requiredEvidence);
+  }
   push("PREVIOUS_FAILURE_CLASS", input.failureClass);
   push("PREVIOUS_RESULT_SUMMARY", truncate(input.previousResultSummary || "[sem summary]", EVIDENCE_LIMITS.resultSummary));
 
@@ -55,7 +65,9 @@ export function buildRecoveryPrompt(input: RecoveryPromptInput): string {
     }
   }
 
-  if (input.action === "switch-model" || input.action === "switch-agent") {
+  if (input.action === "replan") {
+    lines.push("RULE: Execute the REVISED ExecutionContract. Do not revert to the previous contract. Do not declare the work approved. The external judge decides acceptance.");
+  } else if (input.action === "switch-model" || input.action === "switch-agent") {
     lines.push("RULE: Correct the observed failure under the newly selected executor. Do not declare the work approved. The external judge decides acceptance.");
   } else {
     lines.push("RULE: Correct the observed failure only. Do not declare the work approved. The external judge decides acceptance.");

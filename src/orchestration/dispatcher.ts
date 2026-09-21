@@ -27,6 +27,7 @@ import { createRunState, transitionRun } from "./state-machine.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
+import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
 
 export const WORKER_TIMEOUT_MS = 60_000;
@@ -50,6 +51,32 @@ export interface WorkerRuntime {
 }
 
 export interface WorkerSessionView {
+  agent?: string;
+  model?: string;
+  outcome?: ExecutionOutcome;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Runtime do orchestrator (#11): sessao dedicada de logical role orchestrator
+ * (planejamento read-only). Interface separada do WorkerRuntime de proposito:
+ * papel orchestrator nunca executa ExecutionContract como worker.
+ */
+export interface OrchestratorRuntime {
+  createOrchestrator(input: {
+    agent: string;
+    model: { providerID: string; id: string };
+    location?: { directory?: string };
+    metadata: Record<string, unknown>;
+  }): Promise<{ sessionID: string }>;
+  prompt(input: { sessionID: string; text: string; metadata?: Record<string, unknown> }): Promise<void>;
+  wait(input: { sessionID: string }): Promise<void>;
+  get(input: { sessionID: string }): Promise<OrchestratorSessionView>;
+  context(input: { sessionID: string }): Promise<unknown[]>;
+  interrupt?(input: { sessionID: string }): Promise<void>;
+}
+
+export interface OrchestratorSessionView {
   agent?: string;
   model?: string;
   outcome?: ExecutionOutcome;
@@ -119,7 +146,7 @@ export interface SwitchSelectInput {
   attempts: Array<{ agent: string; model: string }>;
 }
 
-export type RoundAction = "initial" | "repair-same" | "fresh-same" | "switch-model" | "switch-agent";
+export type RoundAction = "initial" | "repair-same" | "fresh-same" | "switch-model" | "switch-agent" | "replan";
 
 /** Projecao bounded de UMA rodada executada (auditoria minima do resultado). */
 export interface RoundProjection {
@@ -138,15 +165,18 @@ export interface RoundProjection {
 export interface DispatcherDeps {
   runtime: WorkerRuntime;
   critic: CriticRuntime;
+  orchestrator: OrchestratorRuntime;
   decisions: DispatcherDecisions;
   workerTimeoutMs?: number;
   criticTimeoutMs?: number;
+  orchestratorTimeoutMs?: number;
   location?: { directory?: string };
   persist?(input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied";
+    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
+    orchestratorSessionID?: string;
     state: RunState;
     at: number;
   }): Promise<void>;
@@ -357,10 +387,11 @@ async function failRun(
 async function persist(
   deps: DispatcherDeps,
   input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied";
+    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
+    orchestratorSessionID?: string;
     state: RunState;
     at: number;
   },
@@ -380,6 +411,7 @@ function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["hi
     ...(h.verdict ? { verdict: h.verdict } : {}),
     ...(h.outcome ? { outcome: h.outcome } : {}),
     ...(h.resultSummary ? { resultSummary: h.resultSummary } : {}),
+    ...(h.contractRevision ? { contractRevision: h.contractRevision } : {}),
   }));
 }
 
@@ -393,14 +425,16 @@ function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["hi
  *   - switch-model / switch-agent: Jev seleciona o novo executor (selectModel/
  *     selectAgent, sem heuristic local) e a proxima rodada e EXECUTADA em nova
  *     worker session, com pipeline integral e critic novo;
- *   - demais acoes (replan/human): param no boundary e voltam como
- *     pendingCommands (accept/stop sao terminais).
+ *   - replan: orchestrator propoe revised contract e a proxima rodada e
+ *     EXECUTADA com o executor canonico vigente em sessao nova;
+ *   - human: permanece boundary/pending (accept/stop sao terminais).
  * Toda rodada roda pipeline integral: worker -> evidence -> critic novo -> Jev.
  * Nunca ha recovery automatica sem um JevVerdict valido.
  */
 export async function runOrchestrationOnce(contract: ExecutionContract, deps: DispatcherDeps): Promise<OrchestrationRunResult> {
   const timeoutMs = deps.workerTimeoutMs ?? WORKER_TIMEOUT_MS;
   const criticTimeoutMs = deps.criticTimeoutMs ?? CRITIC_TIMEOUT_MS;
+  const orchestratorTimeoutMs = deps.orchestratorTimeoutMs ?? WORKER_TIMEOUT_MS;
   const now = deps.now ?? Date.now;
 
   // 1. kernel aceita o contrato
@@ -450,8 +484,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     // initial usa selection (validada em validateSelection); repair/fresh usam
     // EXCLUSIVAMENTE state.executor via requireRecoveryExecutor. Ausente,
     // incompleto ou out-of-pool => bounded failure. NENHUM fallback para
-    // selection nas recovery rounds (validation != routing). Switch rounds nao
-    // passam aqui: identidade vem de prev.switchTo (Jev, validado no scheduler).
+    // selection nas recovery rounds (validation != routing). Switch/replan
+    // rounds nao passam aqui (identidade via scheduler: switchTo / canonico).
     let recoveryAgent = "";
     let recoveryModel = "";
     let recoverySessionID: string | undefined;
@@ -480,6 +514,17 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } else if (mode === "repair-same" || mode === "fresh-same") {
       roundAgent = recoveryAgent;
       roundModel = recoveryModel;
+    } else if (mode === "replan") {
+      // Round pos-replan: EXCLUSIVAMENTE o canonico vigente preservado pelo
+      // kernel (agent/model, sem sessionID). Ausente/invalido => bounded, sem
+      // fallback para selection, sem reselecao (itens #22).
+      try {
+        const rec = requireRecoveryExecutor(state);
+        roundAgent = rec.agent;
+        roundModel = rec.model;
+      } catch (err) {
+        return { abort: true, result: await failRun(state, contract.runID, err) };
+      }
     } else {
       const target = prev?.switchTo;
       if (!target || typeof target.agent !== "string" || !target.agent.trim() || typeof target.model !== "string" || !target.model.trim()) {
@@ -495,8 +540,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       // sessionID presente (garantido em 2b); mesma sessao, sem createWorker.
       workerSessionID = recoverySessionID as string;
     } else {
-      // initial / fresh-same / switch-*: cria NOVA worker session (switch nunca
-      // reutiliza a antiga e nunca usa ctx.session.switchModel/switchAgent).
+      // initial / fresh-same / switch-* / replan: cria NOVA worker session
+      // (nunca reutiliza a antiga, nunca usa ctx.session.switchModel/switchAgent).
       const workerAgent = roundAgent;
       const workerModel = splitModelRef(roundModel);
       try {
@@ -518,9 +563,9 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         return { abort: true, result: await failRun(state, contract.runID, err) };
       }
       if (mode !== "initial" && usedWorkerSessions.has(workerSessionID)) {
-        // fresh-same / switch-*: sessao precisa ser realmente nova. Erro de
-        // integracao bounded — nunca executa a rodada fingindo ser nova.
-        const code = mode === "fresh-same" ? "fresh-not-fresh" : "switch-not-fresh";
+        // fresh-same / switch-* / replan: sessao precisa ser realmente nova.
+        // Erro de integracao bounded — nunca executa fingindo ser nova.
+        const code = mode === "fresh-same" ? "fresh-not-fresh" : mode === "replan" ? "replan-not-fresh" : "switch-not-fresh";
         return {
           abort: true,
           result: await failRun(
@@ -548,13 +593,13 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       const promptMeta = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-round": state.round };
       let promptText: string;
       if (mode === "initial") {
-        promptText = buildWorkerPrompt(contract, state.round, contract.maxRounds);
+        promptText = buildWorkerPrompt(state.contract, state.round, state.contract.maxRounds);
       } else {
         promptText = buildRecoveryPrompt({
           action: mode,
-          contract,
+          contract: state.contract,
           round: state.round,
-          maxRounds: contract.maxRounds,
+          maxRounds: state.contract.maxRounds,
           failureClass: prev?.verdict?.failureClass ?? "implementation",
           previousResultSummary: prev?.evidence?.resultSummary ?? "",
           failedChecks: prev?.evidence?.deterministicChecks.filter((ck) => ck.status !== "pass") ?? [],
@@ -666,11 +711,11 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       if (!createdSessionID) throw new OrchestrationError("critic-create-failed", "createCritic nao retornou sessionID");
       criticSessionID = createdSessionID;
       const criticPrompt = buildCriticPrompt({
-        objective: contract.objective,
-        acceptanceCriteria: contract.acceptanceCriteria,
-        requiredEvidence: contract.requiredEvidence,
+        objective: state.contract.objective,
+        acceptanceCriteria: state.contract.acceptanceCriteria,
+        requiredEvidence: state.contract.requiredEvidence,
         round: state.round,
-        maxRounds: contract.maxRounds,
+        maxRounds: state.contract.maxRounds,
         workerOutcome: outcome,
         resultSummary: baseEvidence.resultSummary,
         deterministicChecks: baseEvidence.deterministicChecks,
@@ -868,7 +913,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       const attempts = executorAttempts(out.state.history);
       const current = { agent: out.evidence.executor.agent, model: out.evidence.executor.model };
       const switchInput = {
-        contract,
+        contract: out.state.contract,
         round: out.state.round,
         current,
         failureClass: out.verdict.failureClass,
@@ -919,7 +964,96 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         });
       }
     }
-    // Terminal / boundary: accept => completed; stop => stopped; replan/human
+    if (firstCommand === "replan") {
+      // Replan (#11): kernel avancou round e entrou planning (executor sem
+      // sessionID). maxRounds barrado => awaiting-human (sem orchestrator aqui).
+      if (out.state.phase !== "planning") {
+        pendingCommands = out.transition.commands.map((cmd) => cmd.type);
+        break;
+      }
+      // Identidade canonica vigente para o planner (agent/model, sem sessionID
+      // por design). Ausente/invalida => bounded, sem fallback e sem reselecao.
+      let orchAgent: string;
+      let orchModel: string;
+      try {
+        const rec = requireRecoveryExecutor(out.state);
+        orchAgent = rec.agent;
+        orchModel = rec.model;
+      } catch (err) {
+        return await failRun(out.state, contract.runID, err, {
+          worker: last.worker,
+          critic: last.critic,
+          evidence: out.evidence,
+          verdict: out.verdict,
+          rounds,
+        });
+      }
+      // Orchestrator dedicado: sessao NOVA read-only (policy no adapter).
+      let orchestratorSessionID: string;
+      try {
+        const created = await deps.orchestrator.createOrchestrator({
+          agent: orchAgent,
+          model: splitModelRef(orchModel),
+          location: deps.location ? { directory: deps.location.directory } : undefined,
+          metadata: {
+            "jev-orchestration": true,
+            "jev-run-id": contract.runID,
+            "jev-round": out.state.round,
+            "jev-role": "orchestrator",
+            "jev-agent-role": "orchestrator",
+            "jev-router": "orchestration-internal",
+          },
+        });
+        orchestratorSessionID = created.sessionID;
+        if (!orchestratorSessionID) {
+          throw new OrchestrationError("orchestrator-create-failed", "createOrchestrator nao retornou sessionID");
+        }
+      } catch (err) {
+        return await failRun(out.state, contract.runID, err, {
+          worker: last.worker,
+          critic: last.critic,
+          evidence: out.evidence,
+          verdict: out.verdict,
+          rounds,
+        });
+      }
+      // Proposta bounded (contrato VIGENTE do estado) -> parse estrito ->
+      // CONTRACT_READY (kernel valida runID/budget) -> mode replan -> continue.
+      // Nenhum Jev extra: o verdict replan ja decidiu; ha UMA proposta.
+      try {
+        const replanPrompt = buildReplanPrompt({
+          contract: out.state.contract,
+          round: out.state.round,
+          failureClass: out.verdict.failureClass,
+          previousResultSummary: out.evidence.resultSummary,
+          failedChecks: out.evidence.deterministicChecks.filter((ck) => ck.status !== "pass"),
+          criticFindings: out.evidence.criticFindings,
+          maxRounds: out.state.contract.maxRounds,
+        });
+        const orchMeta = { "jev-router": "orchestration-internal", "jev-role": "orchestrator", "jev-round": out.state.round };
+        await deps.orchestrator.prompt({ sessionID: orchestratorSessionID, text: replanPrompt, metadata: orchMeta });
+        await withTimeout(
+          () => deps.orchestrator.wait({ sessionID: orchestratorSessionID }),
+          orchestratorTimeoutMs,
+          () => deps.orchestrator.interrupt?.({ sessionID: orchestratorSessionID }),
+        );
+        const orchMessages = await deps.orchestrator.context({ sessionID: orchestratorSessionID });
+        const revised = parseRevisedContract(extractFinalAssistantText(orchMessages));
+        state = transitionRun(state, { type: "CONTRACT_READY", contract: revised }).state;
+        await persist(deps, { kind: "contract-revised", runID: contract.runID, orchestratorSessionID, state, at: now() });
+      } catch (err) {
+        return await failRun(out.state, contract.runID, err, {
+          worker: last.worker,
+          critic: last.critic,
+          evidence: out.evidence,
+          verdict: out.verdict,
+          rounds,
+        });
+      }
+      mode = "replan";
+      continue;
+    }
+    // Terminal / boundary: accept => completed; stop => stopped; human
     // => pending command mapeado pelo kernel.
     pendingCommands = out.state.phase === "completed" ? [] : out.transition.commands.map((c) => c.type);
     break;

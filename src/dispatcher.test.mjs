@@ -26,6 +26,9 @@ import {
   buildCriticContextInstruction,
 } from "./worker-hooks.ts";
 import { buildCriticPermissionRules } from "./orchestration/readonly-policy.ts";
+import * as workerHooks from "./worker-hooks.ts";
+import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
+import * as replanMod from "./orchestration/replan.ts";
 import { isFreeModel, FREE_POOL } from "./config.ts";
 import pluginDefault from "../index.ts";
 import {
@@ -992,7 +995,64 @@ function fakeDeps(over = {}) {
     },
     ...over.decisions,
   };
-  return { runtime, critic, decisions, effects, promptCalls, selectModelCalls, selectAgentCalls };
+  // Orchestrator dedicado (#11): sessao read-only com logical role orchestrator.
+  // Default: revised contract valido (runID test-run-1, objective revisado).
+  let orchestratorSeq = 0;
+  const nextOrchestratorSessionID = () => {
+    const ids = over.orchestratorSessionIDs ?? [];
+    const id = ids[orchestratorSeq] ?? "o1";
+    orchestratorSeq += 1;
+    return id;
+  };
+  let orchMsgSeq = 0;
+  const nextOrchestratorMessages = () => {
+    const seq = over.orchestratorMessagesSeq;
+    if (Array.isArray(seq)) {
+      const m = seq[orchMsgSeq] ?? seq[seq.length - 1];
+      orchMsgSeq += 1;
+      return m;
+    }
+    return over.orchestratorMessages ?? [
+      { type: "assistant", content: [{ type: "text", text: over.orchestratorResponse ?? JSON.stringify({
+        runID: "test-run-1",
+        objective: "revised objective",
+        scope: { include: [], exclude: [] },
+        constraints: [],
+        acceptanceCriteria: ["done"],
+        requiredEvidence: ["worker-session-outcome"],
+        maxRounds: 2,
+      }) }] },
+    ];
+  };
+  const orchestratorCalls = [];
+  const orchestratorPromptCalls = [];
+  const orchestrator = {
+    createOrchestrator: async (input) => {
+      effects.push("orchestrator-create");
+      orchestratorCalls.push(input);
+      if (over.orchestratorCreateError) throw over.orchestratorCreateError;
+      return { sessionID: nextOrchestratorSessionID() };
+    },
+    prompt: async ({ sessionID, text, metadata } = {}) => {
+      effects.push("orchestrator-prompt");
+      orchestratorPromptCalls.push({ sessionID, text, metadata });
+    },
+    wait: async () => {
+      effects.push("orchestrator-wait");
+      if (over.orchestratorWaitBlocks) return await new Promise(() => {});
+    },
+    get: async () => {
+      effects.push("orchestrator-get");
+      return over.orchestratorView ?? { outcome: "succeeded" };
+    },
+    context: async () => {
+      effects.push("orchestrator-context");
+      return nextOrchestratorMessages();
+    },
+    interrupt: async () => { effects.push("orchestrator-interrupt"); },
+    ...over.orchestrator,
+  };
+  return { runtime, critic, decisions, effects, promptCalls, selectModelCalls, selectAgentCalls, orchestrator, orchestratorCalls, orchestratorPromptCalls };
 }
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
@@ -2038,6 +2098,129 @@ describe("context hook: worker recebe instrucao de trabalhador, normal preservad
   });
 });
 
+// ─────────────────────────── ORC. replan parser/prompt (puro) ───────────────────────────
+
+describe("replan parser/prompt puros (ORC1-ORC7)", () => {
+  const validContractJSON = () => JSON.stringify({
+    runID: "run-1",
+    objective: "Reimplementar auth com nova arquitetura",
+    scope: { include: ["src/"], exclude: ["node_modules/"] },
+    constraints: ["nao alterar o runtime ativo"],
+    acceptanceCriteria: ["typecheck passa"],
+    requiredEvidence: ["npm test"],
+    maxRounds: 2,
+  });
+
+  it("ORC1: JSON valido completo -> revised contract normalizado", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    const out = replanMod.parseRevisedContract(validContractJSON());
+    assert.equal(out.runID, "run-1");
+    assert.equal(out.objective, "Reimplementar auth com nova arquitetura");
+    assert.equal(out.maxRounds, 2);
+    assert.deepEqual(Object.keys(out).sort(), ["acceptanceCriteria", "constraints", "maxRounds", "objective", "requiredEvidence", "runID", "scope"]);
+  });
+
+  it("ORC2: single ```json fence -> valido", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    const out = replanMod.parseRevisedContract("```json\n" + validContractJSON() + "\n```");
+    assert.equal(out.objective, "Reimplementar auth com nova arquitetura");
+  });
+
+  it("ORC3: trailing prose -> reject", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    assert.throws(() => replanMod.parseRevisedContract(validContractJSON() + "\nHere is my reasoning..."), /prose|trailing|apos/i);
+  });
+
+  it("ORC4: unknown top-level field agent -> reject nomeando o campo", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    const bad = JSON.stringify({ ...JSON.parse(validContractJSON()), agent: "plan" });
+    assert.throws(() => replanMod.parseRevisedContract(bad), /agent/);
+  });
+
+  it("ORC5: subcontracts -> reject (sem fan-out)", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    const bad = JSON.stringify({ ...JSON.parse(validContractJSON()), subcontracts: [{ objective: "x" }] });
+    assert.throws(() => replanMod.parseRevisedContract(bad), /subcontracts/);
+  });
+
+  it("ORC6: oversized output -> reject bounded", async () => {
+    assert.equal(typeof replanMod.MAX_REPLAN_OUTPUT, "number", "MAX_REPLAN_OUTPUT existe (RED)");
+    const big = "x".repeat(replanMod.MAX_REPLAN_OUTPUT + 1);
+    assert.throws(() => replanMod.parseRevisedContract(big), /grand|limit|tamanho|size/i);
+  });
+
+  it("ORC7: invalid contract shape -> reject", async () => {
+    assert.equal(typeof replanMod.parseRevisedContract, "function", "parseRevisedContract existe (RED)");
+    const bad = JSON.stringify({ ...JSON.parse(validContractJSON()), acceptanceCriteria: [] });
+    assert.throws(() => replanMod.parseRevisedContract(bad));
+  });
+
+  it("ORC-prompt: buildReplanPrompt com invariantes bounded, sem raw", async () => {
+    assert.equal(typeof replanMod.buildReplanPrompt, "function", "buildReplanPrompt existe (RED)");
+    const text = replanMod.buildReplanPrompt({
+      contract: JSON.parse(validContractJSON()),
+      round: 2,
+      failureClass: "bad-contract",
+      previousResultSummary: "auth module incomplete",
+      failedChecks: [{ name: "worker-final-response", status: "fail" }],
+      criticFindings: [],
+      maxRounds: 3,
+    });
+    assert.ok(text.includes("run-1"), "RUN_ID presente");
+    assert.ok(text.includes("MAX_ROUNDS_CANNOT_INCREASE"), "invariante de budget");
+    assert.ok(text.includes("REVISED_MAX_ROUNDS_MUST_BE"), "piso de budget");
+    assert.ok(text.includes("no agent"), "sem agent");
+    assert.ok(text.includes("no model"), "sem model");
+    assert.ok(!text.includes("chain-of-thought"), "sem CoT");
+  });
+});
+
+// ─────────────────────────── ORCH. orchestrator role / isolation (puro) ───────────────────────────
+
+describe("orchestrator role/isolation pura (ORCH2/ORCH4-text/ORCH5)", () => {
+  it("ORCH2: detector reconhece worker/critic/orchestrator e rejeita sessao normal", async () => {
+    const isOrch = workerHooks.isInternalOrchestrationSession;
+    assert.equal(typeof isOrch, "function", "isInternalOrchestrationSession existe (RED: nao existe)");
+    const base = { "jev-router": "orchestration-internal" };
+    assert.equal(isOrch({ ...base, "jev-role": "worker" }), true);
+    assert.equal(isOrch({ ...base, "jev-role": "critic" }), true);
+    assert.equal(isOrch({ ...base, "jev-role": "orchestrator" }), true, "orchestrator reconhecido");
+    assert.equal(isOrch({ ...base, "jev-role": "user" }), false);
+    assert.equal(isOrch(undefined), false);
+    const roleOf = workerHooks.orchestrationRoleOf;
+    if (typeof roleOf === "function") {
+      assert.equal(roleOf({ ...base, "jev-role": "orchestrator" }), "orchestrator");
+    }
+  });
+
+  it("ORCH4-text: orchestrator instruction propoe contrato, sem executar/decidir", async () => {
+    const build = workerHooks.buildOrchestratorContextInstruction;
+    assert.equal(typeof build, "function", "buildOrchestratorContextInstruction existe (RED: nao existe)");
+    const text = build();
+    assert.ok(text.includes("propose a revised ExecutionContract"), "tarefa = propor contrato");
+    assert.ok(text.includes("Do not select an agent or model"), "nao escolhe executor");
+    assert.ok(!text.includes("tools.jev.decide"), "nao chama Jev");
+    assert.ok(!text.toLowerCase().includes("chain-of-thought"), "sem CoT");
+  });
+
+  it("ORCH5: orchestrator permissions = read-only envelope (nega edit/shell/subagent/execute)", async () => {
+    const build = readonlyPolicy.buildOrchestratorPermissionRules;
+    assert.equal(typeof build, "function", "buildOrchestratorPermissionRules existe (RED: nao existe)");
+    const rules = build();
+    const has = (action, effect) => rules.some((r) => r.action === action && r.effect === effect);
+    assert.ok(has("read", "allow"), "read permitido");
+    for (const a of ["edit", "shell", "subagent", "execute", "skill", "question", "webfetch", "websearch", "external_directory"]) {
+      assert.ok(has(a, "deny"), `orchestrator nega ${a}`);
+    }
+    assert.ok(!rules.some((r) => r.effect === "ask"), "nenhum ask (sem escalada)");
+    assert.deepEqual(
+      rules,
+      readonlyPolicy.buildCriticPermissionRules(),
+      "mesmo envelope read-only do critic (sem duplicacao de policy)",
+    );
+  });
+});
+
 // ─────────────────────────── RCV. runtime recovery: repair-same / fresh-same ───────────────────────────
 
 describe("runtime recovery same-executor: repair-same e fresh-same (multi-round bounded)", () => {
@@ -2469,18 +2652,24 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.equal(t.effects.indexOf("create", c2 + 1), -1, "nenhum create alem da round3");
   });
 
-  it("RCV13: unsupported action boundary — replan -> pending, NENHUMA round2 executada", async () => {
-    const t = fakeDeps({ judgeAnswers: replanAnswers() });
+  it("RCV13: human continua boundary pending; #11 removeu somente replan desse grupo", async () => {
+    const humanAnswers = {
+      done: { type: "noul", noul: 0.1 },
+      failure_class: { type: "choice", choice: "missing-context" },
+      same_executor_can_repair: { type: "noul", noul: 0.1 },
+      next_action: { type: "choice", choice: "human", confidence: 0.8 },
+    };
+    const t = fakeDeps({ judgeAnswers: humanAnswers });
     const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
       runtime: t.runtime, critic: t.critic, decisions: t.decisions,
     });
-    assert.deepEqual(result.pendingCommands, ["replan"]);
-    assert.equal(result.round, 2, "kernel ja avancou round para 2 (boundary)");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(result.round, 1, "human nao abre nova rodada");
     assert.equal(result.rounds.length, 1, "nenhuma round2 executada");
     assert.equal(t.promptCalls.length, 1, "nenhum prompt alem da round1");
     assert.equal(t.effects.filter((e) => e === "critic-create").length, 1);
-    assert.equal(t.selectModelCalls.length, 0, "replan nao dispara select");
-    assert.equal(t.selectAgentCalls.length, 0, "replan nao dispara select");
+    assert.equal(t.selectModelCalls.length, 0);
+    assert.equal(t.selectAgentCalls.length, 0);
   });
 
   it("RCV13b: switch-model executa round2 via Jev selection (#10 substitui o pending antigo)", async () => {
@@ -3393,6 +3582,158 @@ describe("switch executor: attempt history bounded (SW0)", () => {
       { agent: "build", model: "opencode/big-pickle" },
       "round2 registra o executor executado",
     );
+  });
+});
+
+// ─────────────────────────── REPLAN. dispatcher replan runtime ───────────────────────────
+
+describe("dispatcher replan runtime (REPLAN1-REPLAN6)", () => {
+  const revisedResponse = (over = {}) => JSON.stringify({
+    runID: "test-run-1",
+    objective: "revised objective",
+    scope: { include: [], exclude: [] },
+    constraints: [],
+    acceptanceCriteria: ["done"],
+    requiredEvidence: ["worker-session-outcome"],
+    maxRounds: 2,
+    ...over,
+  });
+
+  it("REPLAN1: round1 bad-contract -> orchestrator revised -> round2 executa revised + completed", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+      orchestratorResponse: revisedResponse(),
+      workerSessionIDs: ["w1", "w2"],
+      criticSessionIDs: ["c1", "c2"],
+      orchestratorSessionIDs: ["o1"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 2);
+    assert.equal(result.rounds.length, 2);
+    assert.equal(result.rounds[1].action, "replan", "auditoria: replan, nunca initial");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "worker nova");
+    assert.notEqual(result.rounds[0].criticSessionID, result.rounds[1].criticSessionID, "critic novo");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selectExecutor 1x");
+    // ORCH1: metadata do orchestrator
+    assert.equal(t.orchestratorCalls.length, 1, "orchestrator criado 1x");
+    assert.equal(t.orchestratorCalls[0].agent, "build", "mesmo canonical agent");
+    assert.deepEqual(t.orchestratorCalls[0].model, { providerID: "opencode", id: "big-pickle" }, "mesmo canonical model");
+    assert.equal(t.orchestratorCalls[0].metadata?.["jev-role"], "orchestrator");
+    assert.equal(t.orchestratorCalls[0].metadata?.["jev-agent-role"], "orchestrator");
+    assert.equal(t.orchestratorCalls[0].metadata?.["jev-router"], "orchestration-internal");
+    // ORCH6: sessao distinta de ambas as workers
+    assert.equal(t.orchestratorPromptCalls[0].sessionID, "o1", "orchestrator em sessao propria");
+    assert.ok(!["w1", "w2"].includes(t.orchestratorPromptCalls[0].sessionID), "distinta das workers");
+    // worker round2 recebeu o revised contract como ativo
+    const w2prompts = t.promptCalls.filter((p) => p.sessionID === "w2");
+    assert.equal(w2prompts.length, 1);
+    assert.ok(w2prompts[0].text.includes("revised objective"), "round2 executa revised");
+    assert.ok(!w2prompts[0].text.includes("Implementar o modulo auth"), "contract antigo nao e ativo");
+    // history audita a revisao
+    assert.equal(result.history[0].verdict.nextAction, "replan");
+    assert.equal(result.history[0].contractRevision.to.objective, "revised objective");
+  });
+
+  it("REPLAN2: switch-agent -> replan preserva specialist/M1 (nunca volta p/ build)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchAgentAnswers(), replanAnswers(), acceptAnswers()],
+      agentSelections: ["specialist"],
+      orchestratorResponse: revisedResponse({ maxRounds: 3 }),
+      workerSessionIDs: ["w1", "w2", "w3"],
+      criticSessionIDs: ["c1", "c2", "c3"],
+      orchestratorSessionIDs: ["o1"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "specialist", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "specialist", model: "opencode/big-pickle", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 3);
+    assert.equal(result.rounds[2].action, "replan");
+    assert.equal(result.rounds[2].agent, "specialist", "canonical vigente preservado");
+    assert.equal(result.rounds[2].model, "opencode/big-pickle");
+    assert.deepEqual(
+      [result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, result.rounds[2].workerSessionID],
+      ["w1", "w2", "w3"],
+      "todas as workers em sessoes distintas",
+    );
+    assert.equal(t.orchestratorCalls[0].agent, "specialist", "orchestrator usa canonical vigente");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "sem reselecao");
+    assert.equal(t.selectAgentCalls.length, 1, "switch-agent 1x");
+  });
+
+  it("REPLAN3: orchestrator propoe maxRounds=4 (old 3) -> failed, zero round2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+      orchestratorResponse: revisedResponse({ maxRounds: 4 }),
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "failed", "budget increase rejeitado, sem clamp");
+    assert.ok(result.error && result.error.includes("maxRounds"), "diagnostico de budget");
+    assert.equal(t.effects.filter((e) => e === "orchestrator-create").length, 1, "orchestrator rodou");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "zero worker round2");
+  });
+
+  it("REPLAN4: maxRounds=1 + replan -> awaiting-human, orchestrator 0x", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [replanAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "awaiting-human");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(t.effects.filter((e) => e === "orchestrator-create").length, 0, "sem planner com budget esgotado");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "sem worker round2");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "sem critic round2");
+  });
+
+  it("REPLAN5: orchestrator malformed -> failed, 1x orchestrator, 1 worker, 1 critic", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+      orchestratorResponse: "not json at all {{{",
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "failed");
+    assert.ok(result.error, "erro bounded presente");
+    assert.equal(t.effects.filter((e) => e === "orchestrator-create").length, 1);
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhuma round2");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "nenhum critic round2");
+  });
+
+  it("REPLAN6: switch posterior usa revised contract (selectModel input.contract)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), switchModelAnswers(), acceptAnswers()],
+      orchestratorResponse: revisedResponse({ objective: "revised objective", maxRounds: 3 }),
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      workerSessionIDs: ["w1", "w2", "w3"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.selectModelCalls.length, 1);
+    assert.equal(t.selectModelCalls[0].contract.objective, "revised objective", "switch usa contrato vigente");
   });
 });
 
