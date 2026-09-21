@@ -1052,9 +1052,12 @@ export default Plugin.define({
       editor.add({
         name: "orchestrate_once",
         description:
-          "Runtime entrypoint EXPLICITO do dispatcher de orquestracao (slice UMA rodada): o Jev seleciona o executor, " +
-          "cria uma worker session OpenCode real, executa o ExecutionContract, coleta EvidencePacket e o Jev julga a " +
-          "rodada (JevVerdict). Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
+          "Runtime entrypoint EXPLICITO do dispatcher de orquestracao (scheduler multi-round bounded): o Jev seleciona o " +
+          "executor UMA vez, cria a worker session OpenCode real, executa o ExecutionContract com EvidencePacket e o Jev julga " +
+          "cada rodada (JevVerdict). Apos verdict repair-same/fresh-same, uma NOVA rodada e executada automaticamente " +
+          "(repair-same reutiliza a MESMA worker session; fresh-same cria sessao NOVA, mesmo agent/model), sempre com critic " +
+          "novo, ate accept/stop ou o limite maxRounds (kernel). Demais acoes (switch-model/switch-agent/replan/human) param " +
+          "no boundary e voltam como pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
           type: "object",
@@ -1095,7 +1098,9 @@ export default Plugin.define({
                   type: "integer",
                   minimum: 1,
                   maximum: 100,
-                  description: "Limite de rodadas (este slice executa apenas a rodada 1)",
+                  description:
+                    "Limite de rodadas do scheduler (kernel e a autoridade): repair-same/fresh-same executam rounds " +
+                    "internos enquanto round+1 <= maxRounds; alem do limite, o kernel emite awaiting-human + request-human.",
                 },
               },
               required: ["runID", "objective", "acceptanceCriteria", "maxRounds"],

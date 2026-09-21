@@ -804,16 +804,54 @@ function repairAnswers() {
   };
 }
 
+function freshAnswers() {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "reasoning" },
+    same_executor_can_repair: { type: "noul", noul: 0.8 },
+    next_action: { type: "choice", choice: "fresh-same", confidence: 0.7 },
+  };
+}
+
+function stopAnswers() {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "environment" },
+    same_executor_can_repair: { type: "noul", noul: 0.1 },
+    next_action: { type: "choice", choice: "stop", confidence: 0.8 },
+  };
+}
+
+function switchModelAnswers() {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "wrong-model" },
+    same_executor_can_repair: { type: "noul", noul: 0.1 },
+    next_action: { type: "choice", choice: "switch-model", confidence: 0.8 },
+  };
+}
+
 /** Fake runtime + fake decisions que registram a ordem dos efeitos. */
 function fakeDeps(over = {}) {
   const effects = [];
+  const promptCalls = [];
+  let workerSeq = 0;
+  const nextWorkerSessionID = () => {
+    const ids = over.workerSessionIDs ?? [];
+    const id = ids[workerSeq] ?? "w1";
+    workerSeq += 1;
+    return id;
+  };
   const runtime = {
     createWorker: async (input) => {
       effects.push("create");
       if (over.createError) throw over.createError;
-      return { sessionID: "w1" };
+      return { sessionID: nextWorkerSessionID() };
     },
-    prompt: async () => { effects.push("prompt"); },
+    prompt: async ({ sessionID, text, metadata } = {}) => {
+      effects.push("prompt");
+      promptCalls.push({ sessionID, text, metadata });
+    },
     wait: async () => {
       effects.push("wait");
       if (over.waitBlocks) return await new Promise(() => {});
@@ -832,11 +870,35 @@ function fakeDeps(over = {}) {
   // Critic isolado: sessao distinta, efeitos observaveis e configuravel. O
   // default e GREEN (findings []) para que o pipeline exista em todo teste;
   // cada teste de critic sobrepoe via over.critic* sem tocar no worker.
+  // Critic isolado: sessao distinta, efeitos observaveis e configuravel. O
+  // default e GREEN (findings []) para que o pipeline exista em todo teste;
+  // cada teste de critic sobrepoe via over.critic* sem tocar no worker.
+  let criticSeq = 0;
+  let criticMsgSeq = 0;
+  const nextCriticSessionID = () => {
+    const ids = over.criticSessionIDs ?? [];
+    const id = ids[criticSeq] ?? over.criticSessionID ?? "c1";
+    criticSeq += 1;
+    return id;
+  };
+  const nextCriticMessages = () => {
+    const seq = over.criticMessagesSeq;
+    if (Array.isArray(seq)) {
+      const m = seq[criticMsgSeq] ?? seq[seq.length - 1];
+      criticMsgSeq += 1;
+      return m;
+    }
+    return (
+      over.criticMessages ?? [
+        { type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] },
+      ]
+    );
+  };
   const critic = {
     createCritic: async (input) => {
       effects.push("critic-create");
       if (over.criticCreateError) throw over.criticCreateError;
-      return { sessionID: over.criticSessionID ?? "c1" };
+      return { sessionID: nextCriticSessionID() };
     },
     prompt: async () => { effects.push("critic-prompt"); },
     wait: async () => {
@@ -849,15 +911,12 @@ function fakeDeps(over = {}) {
     },
     context: async () => {
       effects.push("critic-context");
-      return (
-        over.criticMessages ?? [
-          { type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] },
-        ]
-      );
+      return nextCriticMessages();
     },
     interrupt: async () => { effects.push("critic-interrupt"); },
     ...over.critic,
   };
+  let judgeSeq = 0;
   const decisions = {
     selectExecutor: async () => {
       effects.push("select");
@@ -866,11 +925,17 @@ function fakeDeps(over = {}) {
     },
     judgeRound: async () => {
       effects.push("judge");
+      const seq = over.judgeAnswersSeq;
+      if (Array.isArray(seq)) {
+        const m = seq[judgeSeq] ?? seq[seq.length - 1];
+        judgeSeq += 1;
+        return m;
+      }
       return over.judgeAnswers ?? acceptAnswers();
     },
     ...over.decisions,
   };
-  return { runtime, critic, decisions, effects };
+  return { runtime, critic, decisions, effects, promptCalls };
 }
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
@@ -1010,17 +1075,19 @@ describe("runOrchestrationOnce: failed worker / verdicts nao-accept / timeout / 
     assert.ok(result.error && result.error.includes("hard failure"), "erro bounded do gate deterministico");
   });
 
-  it("P2: verdict repair-same -> phase repairing, pendingCommands=[repair-same], SEM segunda worker", async () => {
+  it("P2: verdict repair-same -> recovery na MESMA sessao; repair encadeado para no limite (awaiting-human)", async () => {
     const t = fakeDeps({ judgeAnswers: repairAnswers() });
     const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
       runtime: t.runtime,
       critic: t.critic,
       decisions: t.decisions,
     });
-    assert.equal(result.phase, "repairing");
-    assert.deepEqual(result.pendingCommands, ["repair-same"]);
-    assert.equal(result.verdict.nextAction, "repair-same");
-    assert.equal(t.effects.filter((e) => e === "create").length, 1, "proxima rodada NAO executada neste slice");
+    assert.equal(result.phase, "awaiting-human", "kernel impede round alem do maxRounds");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(result.round, 2);
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "repair nao cria nova sessao");
+    assert.equal(t.promptCalls.filter((p) => p.sessionID === "w1").length, 2, "worker reutilizado na recovery");
+    assert.equal(t.effects.filter((e) => e === "judge").length, 2, "Jev julgou ambas as rodadas");
   });
 
   it("P3: timeout do wait -> interrupt chamado, sem loop, resultado nao completed", async () => {
@@ -1885,5 +1952,415 @@ describe("context hook: worker recebe instrucao de trabalhador, normal preservad
     assert.ok(text.includes("tools.jev.decide"));
     assert.ok(text.length < 900);
     assert.ok(ev.system[1].text.includes("retry"), "pending-recovery continua funcionando");
+  });
+});
+
+// ─────────────────────────── RCV. runtime recovery: repair-same / fresh-same ───────────────────────────
+
+describe("runtime recovery same-executor: repair-same e fresh-same (multi-round bounded)", () => {
+  it("RCV1: repair reutiliza a MESMA worker session (create 1x, prompt 2x em w1, agent/model iguais, round 2)", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 2);
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "createWorker chamado somente 1 vez");
+    assert.equal(t.promptCalls.filter((p) => p.sessionID === "w1").length, 2, "worker prompt chamado 2 vezes em w1");
+    assert.equal(result.worker.sessionID, "w1");
+    assert.equal(result.rounds.length, 2, "projecao por rodada presente");
+    assert.equal(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "round1.worker.sessionID === round2.worker.sessionID");
+    assert.equal(result.rounds[0].agent, result.rounds[1].agent, "agent preservado");
+    assert.equal(result.rounds[0].model, result.rounds[1].model, "model preservado");
+  });
+
+  it("RCV2: repair NAO reseleciona executor (selectExecutor exatamente 1x em duas rodadas)", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector chamado apenas na rodada inicial");
+  });
+
+  it("RCV3: correction prompt da round 2 contem recovery bounded (round, failureClass, checks, findings, regra) sem contexto bruto", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      criticMessagesSeq: [
+        [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [{ severity: "critical", summary: "criteria X violated" }] }) }] }],
+        [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] }],
+      ],
+      messages: [{ type: "assistant", content: [{ type: "text", text: "INITIAL_WORK_FAILED" }] }],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    const correction = t.promptCalls.find((p) => p.sessionID === "w1" && p.text.includes("RECOVERY_ACTION"));
+    assert.ok(correction, "correction prompt presente na sessao reutilizada");
+    assert.ok(correction.text.includes("repair-same"), "RECOVERY_ACTION: repair-same");
+    assert.ok(correction.text.includes("2/2"), "ROUND: 2/maxRounds");
+    assert.ok(correction.text.includes("implementation"), "PREVIOUS_FAILURE_CLASS da round 1");
+    assert.ok(correction.text.includes("INITIAL_WORK_FAILED"), "resultSummary bounded anterior");
+    assert.ok(correction.text.includes("criteria X violated"), "critic findings relevantes");
+    assert.ok(correction.text.includes("Correct the observed failure only"), "regra explicita de recovery");
+    assert.ok(correction.text.includes("The external judge decides acceptance"), "worker nao se autoaprova");
+    assert.ok(correction.text.includes("worker-session-outcome") || correction.text.includes("FAILED"), "checks falhos da round 1");
+    assert.ok(!correction.text.includes("where's the cot"), "sem chain-of-thought");
+    assert.ok(!correction.text.includes("{type:"), "sem raw message history");
+  });
+
+  it("RCV4: fresh cria session NOVA (w1 != w2, createWorker 2x)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.effects.filter((e) => e === "create").length, 2, "createWorker chamado 2 vezes");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "round1.worker.sessionID !== round2.worker.sessionID");
+    assert.equal(result.rounds[1].workerSessionID, "w2");
+    assert.equal(t.promptCalls.filter((p) => p.sessionID === "w1").length, 1, "w1 recebeu 1 prompt");
+    assert.equal(t.promptCalls.filter((p) => p.sessionID === "w2").length, 1, "w2 recebeu 1 prompt (nova sessao)");
+  });
+
+  it("RCV5: fresh preserva agent/model; selector NAO chamado novamente", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector nao chamado de novo");
+    assert.equal(result.rounds[0].agent, result.rounds[1].agent, "agent exatamente igual");
+    assert.equal(result.rounds[0].model, result.rounds[1].model, "model exatamente igual");
+  });
+
+  it("RCV6: fresh com sessionID reutilizada -> bounded failure, nunca executa fingindo ser fresh", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w1"], // runtime devolve a MESMA id de novo
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "fresh nao-fresh e erro de integracao bounded");
+    assert.ok(result.error && result.error.length > 0, "erro bounded presente");
+    assert.equal(t.promptCalls.filter((p) => p.sessionID === "w1").length, 1, "round 2 NUNCA executada com session duplicada");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "nenhum critic da rodada falsamente fresh");
+  });
+
+  it("RCV7: evidence correta por rodada — Jev r1 recebe evidence r1, Jev r2 recebe evidence r2 (sem checks/findings stale)", async () => {
+    const seen = [];
+    const t = fakeDeps({
+      criticMessagesSeq: [
+        [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [{ severity: "important", summary: "r1-finding" }] }) }] }],
+        [{ type: "assistant", content: [{ type: "text", text: JSON.stringify({ findings: [] }) }] }],
+      ],
+      decisions: {
+        judgeRound: async (input) => {
+          seen.push({ round: input.state.round, checks: input.state.deterministicChecks, findings: input.state.criticFindings });
+          return seen.length === 1 ? repairAnswers() : acceptAnswers();
+        },
+      },
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(seen.length, 2, "Jev julgou ambas as rodadas");
+    assert.equal(seen[0].round, 1);
+    assert.equal(seen[1].round, 2);
+    assert.equal(seen[0].findings.length, 1, "finding da round 1 vista pelo Jev na round 1");
+    assert.equal(seen[1].findings.length, 0, "findings da round 1 NAO aparecem na round 2");
+    assert.equal(seen[0].checks[0].name, "worker-session-outcome");
+    assert.equal(seen[1].checks[0].name, "worker-session-outcome");
+    assert.ok(!JSON.stringify(seen[1]).includes("r1-finding"), "sem vazamento de evidence entre rodadas");
+  });
+
+  it("RCV8: critic NOVO em cada rodada (repair e fresh) — duas critic sessions distintas", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      criticSessionIDs: ["c1", "c2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 2, "critic por rodada");
+    assert.notEqual(result.rounds[0].criticSessionID, result.rounds[1].criticSessionID, "critic sessions distintas");
+    // fresh também
+    const t2 = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      criticSessionIDs: ["c1", "c2"],
+    });
+    const r2 = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t2.runtime, critic: t2.critic, decisions: t2.decisions,
+    });
+    assert.equal(t2.effects.filter((e) => e === "critic-create").length, 2, "critic novo no fresh tambem");
+    assert.notEqual(r2.rounds[0].criticSessionID, r2.rounds[1].criticSessionID);
+  });
+
+  it("RCV9: history final bounded com round 1 e round 2 fechadas, sem raw context", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.ok(Array.isArray(result.history) && result.history.length === 2, "history com 2 entradas");
+    assert.equal(result.history[0].round, 1);
+    assert.equal(result.history[1].round, 2);
+    assert.ok(result.history.every((h) => h.outcome), "outcome presente");
+    assert.ok(result.history.every((h) => h.resultSummary), "resultSummary presente");
+    assert.ok(!JSON.stringify(result.history).includes("wmsg-"), "nenhum raw context no history");
+  });
+
+  it("RCV10: maxRounds=1 + repair/fresh -> awaiting-human + request-human, ZERO execucao de round 2", async () => {
+    const t = fakeDeps({ judgeAnswers: repairAnswers() });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "awaiting-human");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(result.round, 1);
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhuma nova worker session");
+    assert.equal(t.promptCalls.length, 1, "nenhum prompt de round 2");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "nenhum segundo critic");
+  });
+
+  it("RCV11: maxRounds=2, repair 2x -> kernel impede round 3, worker executou exatamente 2 rodadas", async () => {
+    const t = fakeDeps({ judgeAnswers: repairAnswers() });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "awaiting-human");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(result.rounds.length, 2, "exatamente duas rodadas executadas");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "repair nao cria sessao nova");
+    assert.equal(t.promptCalls.length, 2, "worker executou 2 vezes na mesma sessao");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 2, "critic novo por rodada");
+  });
+
+  it("RCV12: fresh so executa DEPOIS do pipeline completo da round2 (worker->critic->Jev); nunca pre-agendar", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 3);
+    assert.equal(result.rounds.length, 3);
+    assert.equal(t.effects.filter((e) => e === "judge").length, 3, "Jev julgou cada rodada ");
+    // a ordem: judge da round1 antes do create da round2; judge da round2 antes do create da round3
+    const c1 = t.effects.indexOf("create");
+    const j1 = t.effects.indexOf("judge");
+    const c2 = t.effects.indexOf("create", c1 + 1);
+    const j2 = t.effects.indexOf("judge", j1 + 1);
+    assert.equal(result.rounds[1].action, "repair-same", "round2 executa repair na MESMA sessao (nenhum create entre judge1 e judge2)");
+    assert.ok(j1 < c2, "round2 (fresh) so apos Jev julgar round1");
+    assert.equal(t.effects.slice(j1 + 1, j2).filter((e) => e === "create").length, 0, "round2 repair: zero creates");
+    assert.ok(j2 < c2, "round3 (fresh) so apos Jev julgar round2");
+    assert.equal(t.effects.indexOf("create", c2 + 1), -1, "nenhum create alem da round3");
+  });
+
+  it("RCV13: unsupported action boundary — switch-model-> select-model, NENHUMA round2 executada", async () => {
+    const t = fakeDeps({ judgeAnswers: switchModelAnswers() });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "ready");
+    assert.deepEqual(result.pendingCommands, ["select-model"]);
+    assert.equal(result.round, 2, "kernel ja avancou round para 2 (boundary)");
+    assert.equal(result.rounds.length, 1, "nenhuma round2 executada");
+    assert.equal(t.promptCalls.length, 1, "nenhum prompt alem da round1");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1);
+  });
+
+  it("RCV14: happy path preservado — 1 worker, 1 critic, 1 judge, completed", async () => {
+    const t = fakeDeps();
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1);
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1);
+    assert.equal(t.effects.filter((e) => e === "judge").length, 1);
+    assert.deepEqual(result.pendingCommands, []);
+  });
+
+  it("RCV15: persistencia bounded por rodada — checkpoints refletem round/workerSessionID/criticSessionID/history; repair mantem session, fresh muda", async () => {
+    const kinds = [];
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      criticSessionIDs: ["c1", "c2"],
+    });
+    const persist = async ({ kind, state, workerSessionID, criticSessionID }) => {
+      kinds.push({ kind, round: state.round, phase: state.phase, workerSessionID, criticSessionID, historyCount: state.history.length });
+    };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, persist, now: () => 1,
+    });
+    assert.equal(result.phase, "completed");
+    const ev2 = kinds.filter((k) => k.kind === "evidence-ready");
+    assert.equal(ev2.length, 2, "evidence por rodada");
+    assert.equal(ev2[0].round, 1);
+    assert.equal(ev2[1].round, 2);
+    assert.equal(ev2[0].workerSessionID, "w1");
+    assert.equal(ev2[1].workerSessionID, "w1", "repair: workerSessionID permanece igual");
+    assert.equal(ev2[0].criticSessionID, "c1");
+    assert.equal(ev2[1].criticSessionID, "c2", "critic da avaliacao atual por rodada");
+    const v2 = kinds.filter((k) => k.kind === "verdict-applied");
+    assert.equal(v2.length, 2, "verdict-applied por rodada");
+    assert.equal(v2[0].round, 2, "kernel incrementou round no verdict repair-same (autoridade do kernel)");
+    assert.equal(v2[1].round, 2, "accept nao incrementa alem do limite");
+    assert.equal(v2[0].historyCount, 1);
+    assert.equal(v2[1].historyCount, 2, "history bounded reflete rodadas fechadas");
+
+    const kinds2 = [];
+    const t2 = fakeDeps({ judgeAnswersSeq: [freshAnswers(), acceptAnswers()], workerSessionIDs: ["w1", "w2"] });
+    const persist2 = async ({ kind, state, workerSessionID }) => { kinds2.push({ kind, round: state.round, workerSessionID }); };
+    const r2 = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t2.runtime, critic: t2.critic, decisions: t2.decisions, persist: persist2, now: () => 1,
+    });
+    assert.equal(r2.phase, "completed");
+    const fev2 = kinds2.filter((k) => k.kind === "evidence-ready");
+    assert.equal(fev2[0].workerSessionID, "w1");
+    assert.equal(fev2[1].workerSessionID, "w2", "fresh: workerSessionID muda");
+  });
+});
+
+// ─────────────────────────── E2E tool-level: entrypoint real com stub Jev ───────────────────────────
+
+describe("tool orchestrate_once: E2E recovery repair-same / fresh-same (entrypoint real, stub Jev)", () => {
+  it("E2E-repair: round1 failed -> Jev repair-same -> round2 na MESMA worker session, critic novo, Jev julga 2x, sem round 3", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "FAILED_INITIAL" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "FIXED_AFTER_REPAIR" }] }],
+        ],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? repairAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-repair",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed", "round2 fechou com accept");
+      assert.equal(out.round, 2);
+      const workerCreates = () => m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates().length, 1, "uma unica worker session criada");
+      const w = m.workerSessions.get(out.worker.sessionID);
+      assert.ok(w, "sessao registrada no runtime");
+      assert.equal(w.prompts.length, 2, "dois prompts na mesma sessao (inicial + correction)");
+      assert.equal(out.rounds.length, 2, "nenhuma terceira rodada");
+      assert.equal(out.rounds[0].workerSessionID, out.rounds[1].workerSessionID, "repair: MESMA sessionID");
+      assert.equal(out.rounds[0].agent, out.rounds[1].agent, "agent preservado");
+      assert.equal(out.rounds[0].model, out.rounds[1].model, "model preservado");
+      assert.notEqual(out.rounds[0].criticSessionID, out.rounds[1].criticSessionID, "critic session nova por rodada");
+      const judges = stub.calls.filter((c) => c.body?.questions?.done);
+      assert.equal(judges.length, 2, "Jev julgou ambas as rodadas");
+      assert.equal(out.rounds[1].outcome, "succeeded");
+      const r2res = JSON.stringify(out.rounds[1]);
+      assert.ok(r2res.includes("FIXED_AFTER_REPAIR"), "resultSummary bounded da rodada presente (projecao exigida)");
+      assert.equal(out.rounds[1].messages, undefined, "output bounded: nenhum raw context na projecao");
+      assert.equal(out.rounds[1].context, undefined, "output bounded: nenhum raw context na projecao");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-fresh: round1 failed -> Jev fresh-same -> round2 em NOVA worker session, mesmo agent/model, critic novo, sem reuso de contexto", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "STALE_CONTEXT_MARKER" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "FRESH_WORK_OK" }] }],
+        ],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? freshAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-fresh",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.round, 2);
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 2, "duas worker sessions criadas (fresh)");
+      const s1 = out.rounds[0].workerSessionID;
+      const s2 = out.rounds[1].workerSessionID;
+      assert.notEqual(s1, s2, "fresh: sessionIDs diferentes");
+      assert.equal(out.rounds[1].action, "fresh-same");
+      assert.equal(out.rounds[0].agent, out.rounds[1].agent, "agent preservado");
+      assert.equal(out.rounds[0].model, out.rounds[1].model, "model preservado");
+      assert.notEqual(out.rounds[0].criticSessionID, out.rounds[1].criticSessionID, "critic novo por rodada");
+      const w1 = m.workerSessions.get(s1);
+      const w2 = m.workerSessions.get(s2);
+      assert.equal(w1.prompts.length, 1, "sessao antiga recebeu 1 prompt");
+      assert.equal(w2.prompts.length, 1, "sessao nova recebeu 1 prompt");
+      assert.ok(w2.prompts[0].text.includes("RECOVERY_ACTION: fresh-same"), "correction prompt enviado SOMENTE a nova sessao");
+      assert.ok(w2.prompts[0].metadata["jev-round"] === 2, "nova sessao recebe metadata da nova rodada");
+      assert.ok(w2.prompts[0].text.includes("PREVIOUS_RESULT_SUMMARY: STALE_CONTEXT_MARKER"), "summary bounded anterior (projecao exigida)");
+      assert.ok(!w2.prompts[0].text.includes("wr1"), "nenhum raw message id do contexto antigo no prompt");
+      assert.ok(!w2.prompts[0].text.includes('"content"'), "nenhum raw message history no prompt");
+      assert.equal(out.evidence.resultSummary, "FRESH_WORK_OK", "evidence da round2 reflete a nova sessao");
+      assert.equal(out.rounds.length, 2, "nenhuma terceira rodada");
+    } finally {
+      stub.restore();
+    }
   });
 });

@@ -34,8 +34,12 @@ export function makeStorage(seed = {}) {
  * `session`: estado inicial da sessao: { agent, model: {providerID, id} }.
  * `switchBehavior`: { switchModelError?, switchAgentError? } para injetar falhas.
  * `location`: diretorio do ctx.location (contorno do dispatcher).
- * `workerBehavior`: { outcome?, messages?, waitBlocks? } para o fake runtime de
- *   worker sessions (usado pelo dispatcher via ctx.session.create/prompt/wait/...).
+ * `workerBehavior`: { outcome?, messages?, waitBlocks?, outcomes?, messagesByRound? }
+ *   para o fake runtime de worker sessions. `outcomes`/`messagesByRound` sao
+ *   sequencias indexadas por jev-round (1-based) para observar comportamento
+ *   POR RODADA — essencial quando repair-same reutiliza a mesma session e
+ *   fresh-same cria sessions novas (tambem valido para `criticBehavior`).
+ *   (usado pelo dispatcher via ctx.session.create/prompt/wait/...).
  */
 export function makeCtx({
   models = [],
@@ -110,6 +114,41 @@ export function makeCtx({
     };
   }
 
+  // Roudo atual observavel de uma sessao: o jev-round do ULTIMO prompt recebido
+  // (o dispatcher envia jev-round no metadata do prompt — worker e critic). Isso
+  // permite comportamento por rodada mesmo quando repair reutiliza a session.
+  const lastRoundOf = (w) => {
+    if (!w) return 1;
+    const last = w.prompts[w.prompts.length - 1];
+    const metaRound = last?.metadata?.["jev-round"];
+    if (typeof metaRound === "number") return metaRound;
+    const createRound = w.metadata?.["jev-round"];
+    if (typeof createRound === "number") return createRound;
+    return 1;
+  };
+
+  // Seleciona o item da sequencia por round (1-based), com fallback estavel.
+  const pickSeq = (arr, round, fallback) => {
+    if (Array.isArray(arr) && arr.length > 0) {
+      const idx = Math.min(Math.max(round - 1, 0), arr.length - 1);
+      return arr[idx];
+    }
+    return fallback;
+  };
+
+  const roundMessagesFor = (w, behavior, role) => {
+    const round = lastRoundOf(w);
+    return role === "critic"
+      ? pickSeq(behavior.messagesByRound, round, behavior.messages ?? defaultCriticMessages)
+      : pickSeq(behavior.messagesByRound, round, behavior.messages ?? defaultWorkerMessages);
+  };
+  const roundOutcomeFor = (w, behavior, role) => {
+    const round = lastRoundOf(w);
+    return role === "critic"
+      ? pickSeq(behavior.outcomes, round, behavior.outcome ?? "succeeded")
+      : pickSeq(behavior.outcomes, round, behavior.outcome ?? "succeeded");
+  };
+
   const ctx = {
     options,
     storage,
@@ -135,11 +174,12 @@ export function makeCtx({
         const sessionID = typeof idOrOpts === "string" ? idOrOpts : idOrOpts?.sessionID;
         if (sessionID && workerSessions.has(sessionID)) {
           const w = workerSessions.get(sessionID);
+          const role = roleOf({ metadata: w.metadata });
           return {
             id: w.id,
             agent: w.agent,
             model: w.model,
-            outcome: w.outcome,
+            outcome: roundOutcomeFor(w, role === "critic" ? criticBehavior : workerBehavior, role),
             metadata: w.metadata,
             location: w.location,
           };
@@ -183,7 +223,9 @@ export function makeCtx({
       context: async ({ sessionID } = {}) => {
         workerCalls.context.push({ sessionID });
         const w = workerSessions.get(sessionID);
-        return w?.messages ?? [];
+        if (!w) return [];
+        const role = roleOf({ metadata: w.metadata });
+        return roundMessagesFor(w, role === "critic" ? criticBehavior : workerBehavior, role);
       },
       interrupt: async ({ sessionID } = {}) => {
         workerCalls.interrupt.push({ sessionID });
