@@ -352,10 +352,23 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       workerSessionID = reused;
     } else {
       // initial / fresh-same: cria nova worker session (fresh exige id realmente nova)
+      // A identidade do executor depende do modo:
+      //   - initial: usa selection (a escolha inicial do Jev)
+      //   - fresh-same: usa state.executor (o executor canônico preservado pelo kernel)
+      //             NUNCA volta para selection inicial.
+      const isInitial = mode === "initial";
+      const workerAgent = isInitial ? selection.agent : (state.executor?.agent ?? selection.agent);
+      // Determina o model do worker: inicial usa selection, fresh usa state.executor
+      let workerModel: { providerID: string; id: string };
+      if (isInitial) {
+        workerModel = splitModelRef(selection.model);
+      } else {
+        workerModel = splitModelRef(state.executor?.model ?? selection.model);
+      }
       try {
         const created = await deps.runtime.createWorker({
-          agent: selection.agent,
-          model: splitModelRef(selection.model),
+          agent: workerAgent,
+          model: workerModel,
           location: deps.location ? { directory: deps.location.directory } : undefined,
           metadata: {
             "jev-orchestration": true,
@@ -392,7 +405,13 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     try {
       state = transitionRun(state, {
         type: "EXECUTION_STARTED",
-        executor: { agent: selection.agent, model: selection.model, sessionID: workerSessionID },
+        // Identidade do executor: initial usa selection; repair/fresh usam
+        // o executor canonico preservado pelo kernel (state.executor).
+        // Para repair-same, workerSessionID == state.executor.sessionID (reuso).
+        // Para fresh-same, workerSessionID e a nova sessao criada com agent/model canonicos.
+        executor: mode === "initial"
+          ? { agent: selection.agent, model: selection.model, sessionID: workerSessionID }
+          : { agent: state.executor?.agent ?? selection.agent, model: state.executor?.model ?? selection.model, sessionID: workerSessionID },
       }).state;
       const promptMeta = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-round": state.round };
       let promptText: string;
@@ -432,7 +451,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           round: state.round,
           pendingCommands: [],
           error: bounded(err),
-          worker: { sessionID: workerSessionID, agent: selection.agent, model: selection.model, outcome: "interrupted", finalText: "" },
+          worker: { sessionID: workerSessionID, agent: mode === "initial" ? selection.agent : (state.executor?.agent ?? selection.agent), model: mode === "initial" ? selection.model : (state.executor?.model ?? selection.model), outcome: "interrupted", finalText: "" },
           rounds,
         },
       };
@@ -442,8 +461,10 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     const finalText = extractFinalAssistantText(messages);
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
-    const agent = view.agent?.trim() || selection.agent;
-    const model = view.model?.trim() || selection.model;
+    const expectedAgent = mode === "initial" ? selection.agent : (state.executor?.agent ?? selection.agent);
+    const expectedModel = mode === "initial" ? selection.model : (state.executor?.model ?? selection.model);
+    const agent = view.agent?.trim() || expectedAgent;
+    const model = view.model?.trim() || expectedModel;
 
     state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome }).state;
 
@@ -471,17 +492,20 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       summary: "critic not executed",
     };
     let criticFindings: CriticFinding[] = [];
+    // Identidade inicial do critic acompanha o worker REAL da rodada
+    // (agent/model ja resolvidos do runtime ou fallback canonico), nunca a
+    // selection inicial stale.
     let criticProj: NonNullable<OrchestrationRunResult["critic"]> = {
       sessionID: "",
-      agent: selection.agent,
-      model: selection.model,
+      agent,
+      model,
       outcome: "failed",
       findingsCount: 0,
     };
     try {
       const created = await deps.critic.createCritic({
-        agent: selection.agent,
-        model: splitModelRef(selection.model),
+        agent,
+        model: splitModelRef(model),
         location: deps.location ? { directory: deps.location.directory } : undefined,
         metadata: {
           "jev-orchestration": true,
@@ -528,8 +552,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         // deterministicCheck critic-session-outcome (fail).
         criticProj = {
           sessionID: criticSessionID,
-          agent: cView.agent?.trim() || selection.agent,
-          model: cView.model?.trim() || selection.model,
+          agent: cView.agent?.trim() || agent,
+          model: cView.model?.trim() || model,
           outcome: "failed",
           findingsCount: 0,
         };
@@ -540,8 +564,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         // do output (compatibilidade com runtimes que nao projetam outcome).
         criticProj = {
           sessionID: criticSessionID,
-          agent: cView.agent?.trim() || selection.agent,
-          model: cView.model?.trim() || selection.model,
+          agent: cView.agent?.trim() || agent,
+          model: cView.model?.trim() || model,
           outcome: parsed.ok ? "succeeded" : "failed",
           findingsCount: parsed.ok ? parsed.findings.length : 0,
         };
@@ -555,8 +579,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } catch (err) {
       criticProj = {
         sessionID: criticSessionID ?? "",
-        agent: selection.agent,
-        model: selection.model,
+        agent,
+        model,
         outcome: "failed",
         findingsCount: 0,
       };

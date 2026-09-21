@@ -842,6 +842,7 @@ function fakeDeps(over = {}) {
     workerSeq += 1;
     return id;
   };
+  let viewSeq = 0;
   const runtime = {
     createWorker: async (input) => {
       effects.push("create");
@@ -858,6 +859,12 @@ function fakeDeps(over = {}) {
     },
     get: async () => {
       effects.push("get");
+      const vseq = over.viewsByRound;
+      if (Array.isArray(vseq)) {
+        const v = vseq[viewSeq] ?? vseq[vseq.length - 1];
+        viewSeq += 1;
+        return v;
+      }
       return over.view ?? { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" };
     },
     context: async () => {
@@ -2040,6 +2047,125 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.equal(result.rounds[0].model, result.rounds[1].model, "model exatamente igual");
   });
 
+  it("RCV16: repair model drift — runtime devolve M2, round2 NAO volta para M1", async () => {
+    // Drift real: selection inicial = build/big-pickle (M1), mas o runtime
+    // reporta build/mimo-v2.5-free (M2) via get(). O kernel canonaliza M2 em
+    // state.executor; o repair deve continuar em M2.
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+      criticSessionIDs: ["c1", "c2"],
+    });
+    // Captura o INPUT REAL do createCritic por rodada.
+    const criticInputs = [];
+    const origCriticCreate = t.critic.createCritic;
+    t.critic.createCritic = async (input) => { criticInputs.push(input); return origCriticCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.rounds[0].model, "opencode/mimo-v2.5-free", "round1 model e o runtime real (M2), nao a selection (M1)");
+    assert.equal(result.rounds[1].model, "opencode/mimo-v2.5-free", "repair: round2 model = state.executor (M2), NAO volta para M1");
+    assert.equal(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "repair: mesma sessionID");
+    assert.equal(result.selection.model, "opencode/big-pickle", "selection preservada como auditoria da escolha inicial");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "repair nao cria worker novo");
+    assert.notEqual(result.rounds[0].criticSessionID, result.rounds[1].criticSessionID, "critic novo por rodada");
+    assert.deepEqual(criticInputs[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "critic round2 acompanha identidade corrente (M2), nao selection stale (M1)");
+    assert.equal(criticInputs[1].agent, "build", "critic round2 agent corrente");
+  });
+
+  it("RCV17: fresh model drift — round2 createWorker recebe M2 (input real), nao M1", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+    });
+    // Captura o INPUT REAL enviado ao createWorker (prova além da projeção final).
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(createdInputs.length, 2, "createWorker chamado 2 vezes (initial + fresh)");
+    assert.deepEqual(createdInputs[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "fresh: createWorker round2 recebe M2 canonico, nao M1");
+    assert.equal(createdInputs[1].agent, "build", "fresh: agent canonico preservado");
+    assert.equal(result.rounds[1].model, "opencode/mimo-v2.5-free", "fresh: round2 model = M2");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "fresh: sessions diferentes");
+    assert.equal(result.rounds[1].workerSessionID, "w2", "round2 usa a nova sessao");
+    assert.equal(result.selection.model, "opencode/big-pickle", "selection preservada como auditoria");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+    assert.equal(result.rounds[1].action, "fresh-same");
+  });
+
+  it("RCV18: repair agent drift — runtime devolve general, round2 NAO volta para build", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "general", model: "opencode/big-pickle", outcome: "succeeded" },
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.rounds[0].agent, "general", "round1 agent e o runtime real, nao a selection");
+    assert.equal(result.rounds[1].agent, "general", "repair: round2 agent = state.executor (general), NAO volta para build");
+    assert.equal(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "repair: mesma sessionID");
+    assert.equal(result.selection.agent, "build", "selection preservada como auditoria");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+  });
+
+  it("RCV19: fresh agent drift — round2 createWorker recebe general (input real), nao build", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      view: { agent: "general", model: "opencode/big-pickle", outcome: "succeeded" },
+    });
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(createdInputs.length, 2, "createWorker chamado 2 vezes");
+    assert.equal(createdInputs[1].agent, "general", "fresh: createWorker round2 recebe agent canonico (general), nao build");
+    assert.deepEqual(createdInputs[1].model, { providerID: "opencode", id: "big-pickle" }, "fresh: model canonico preservado");
+    assert.equal(result.rounds[1].agent, "general", "fresh: round2 agent = general");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "fresh: sessions diferentes");
+    assert.equal(result.selection.agent, "build", "selection preservada como auditoria");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+    assert.equal(result.rounds[1].action, "fresh-same");
+  });
+
+  it("RCV20: repair fallback — get() vazio na round2 usa canonico M2, nao M1", async () => {
+    // Round1 reporta M2 explicitamente (drift); round2 omite agent/model no
+    // get(). O fallback NAO pode regredir para a selection inicial (M1):
+    // deve usar o executor canonico preservado pelo kernel (M2).
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), acceptAnswers()],
+      selection: { agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 },
+      viewsByRound: [
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+        { outcome: "succeeded" },
+      ],
+      criticSessionIDs: ["c1", "c2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.rounds[1].model, "opencode/mimo-v2.5-free", "repair fallback: round2 model = canonico (M2), NAO M1");
+    assert.equal(result.rounds[1].agent, "build", "repair fallback: agent canonico preservado");
+    assert.equal(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "repair: mesma sessionID");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector so na rodada inicial");
+  });
+
   it("RCV6: fresh com sessionID reutilizada -> bounded failure, nunca executa fingindo ser fresh", async () => {
     const t = fakeDeps({
       judgeAnswersSeq: [freshAnswers(), acceptAnswers()],
@@ -2359,6 +2485,128 @@ describe("tool orchestrate_once: E2E recovery repair-same / fresh-same (entrypoi
       assert.ok(!w2.prompts[0].text.includes('"content"'), "nenhum raw message history no prompt");
       assert.equal(out.evidence.resultSummary, "FRESH_WORK_OK", "evidence da round2 reflete a nova sessao");
       assert.equal(out.rounds.length, 2, "nenhuma terceira rodada");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-repair-drift: selection build/M1, runtime reporta general/M2, repair preserva M2 na mesma session", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "FAILED_INITIAL" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "FIXED_AFTER_REPAIR" }] }],
+        ],
+        // DRIFT: selecao inicial (via route stub) = build/big-pickle, mas o
+        // runtime reporta general/mimo-v2.5-free em ambas as rodadas.
+        agentByRound: ["general", "general"],
+        modelByRound: ["opencode/mimo-v2.5-free", "opencode/mimo-v2.5-free"],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? repairAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-repair-drift",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.round, 2);
+      assert.equal(out.selection.agent, "build", "selection = auditoria da escolha inicial");
+      assert.equal(out.selection.model, "opencode/big-pickle", "selection.model = M1 inicial");
+      assert.equal(out.rounds[0].workerSessionID, out.rounds[1].workerSessionID, "repair: MESMA sessionID");
+      assert.equal(out.rounds[1].agent, "general", "repair drift: round2 agent = runtime real, nao build");
+      assert.equal(out.rounds[1].model, "opencode/mimo-v2.5-free", "repair drift: round2 model = M2, nao M1");
+      const workerCreates = () => m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates().length, 1, "repair nao cria worker novo");
+      assert.notEqual(out.rounds[0].criticSessionID, out.rounds[1].criticSessionID, "critic novo por rodada");
+      const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
+      assert.equal(criticCreates.length, 2, "critic criado 2 vezes");
+      assert.equal(criticCreates[1].agent, "general", "critic round2 acompanha identidade corrente");
+      assert.deepEqual(criticCreates[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "critic round2 model corrente (M2)");
+      const routes = stub.calls.filter((c) => c.body?.questions?.route);
+      assert.equal(routes.length, 1, "selectExecutor (route) chamado 1 vez");
+      const judges = stub.calls.filter((c) => c.body?.questions?.done);
+      assert.equal(judges.length, 2, "Jev julgou ambas as rodadas");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-fresh-drift: selection build/M1, runtime reporta general/M2, fresh cria worker com M2", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "STALE_CONTEXT_MARKER" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "FRESH_WORK_OK" }] }],
+        ],
+        agentByRound: ["general", "general"],
+        modelByRound: ["opencode/mimo-v2.5-free", "opencode/mimo-v2.5-free"],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? freshAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-fresh-drift",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.round, 2);
+      assert.equal(out.rounds[1].action, "fresh-same");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 2, "fresh cria 2 workers");
+      // PROVA DO INPUT REAL: o segundo createWorker usa a identidade canonica.
+      assert.equal(workerCreates[1].agent, "general", "fresh drift: createWorker round2 agent = general, nao build");
+      assert.deepEqual(workerCreates[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "fresh drift: createWorker round2 model = M2, nao M1");
+      assert.notEqual(out.rounds[0].workerSessionID, out.rounds[1].workerSessionID, "fresh: sessions diferentes");
+      assert.equal(out.rounds[1].agent, "general", "fresh drift: round2 agent = general");
+      assert.equal(out.rounds[1].model, "opencode/mimo-v2.5-free", "fresh drift: round2 model = M2");
+      assert.equal(out.selection.agent, "build", "selection = auditoria da escolha inicial");
+      const routes = stub.calls.filter((c) => c.body?.questions?.route);
+      assert.equal(routes.length, 1, "selectExecutor (route) chamado 1 vez");
     } finally {
       stub.restore();
     }

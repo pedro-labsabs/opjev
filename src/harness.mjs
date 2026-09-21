@@ -34,12 +34,15 @@ export function makeStorage(seed = {}) {
  * `session`: estado inicial da sessao: { agent, model: {providerID, id} }.
  * `switchBehavior`: { switchModelError?, switchAgentError? } para injetar falhas.
  * `location`: diretorio do ctx.location (contorno do dispatcher).
- * `workerBehavior`: { outcome?, messages?, waitBlocks?, outcomes?, messagesByRound? }
- *   para o fake runtime de worker sessions. `outcomes`/`messagesByRound` sao
- *   sequencias indexadas por jev-round (1-based) para observar comportamento
- *   POR RODADA — essencial quando repair-same reutiliza a mesma session e
- *   fresh-same cria sessions novas (tambem valido para `criticBehavior`).
- *   (usado pelo dispatcher via ctx.session.create/prompt/wait/...).
+ * `workerBehavior`: { outcome?, messages?, waitBlocks?, outcomes?, messagesByRound?,
+ *   agentByRound?, modelByRound? } para o fake runtime de worker sessions.
+ *   `outcomes`/`messagesByRound`/`agentByRound`/`modelByRound` sao sequencias
+ *   indexadas por jev-round (1-based) para observar comportamento POR RODADA —
+ *   essencial quando repair-same reutiliza a mesma session e fresh-same cria
+ *   sessions novas (tambem valido para `criticBehavior`). `agentByRound` /
+ *   `modelByRound` permitem simular DRIFT: o runtime reporta identidade
+ *   diferente da usada na criacao (usado pelo dispatcher via
+ *   ctx.session.create/prompt/wait/...).
  */
 export function makeCtx({
   models = [],
@@ -175,11 +178,15 @@ export function makeCtx({
         if (sessionID && workerSessions.has(sessionID)) {
           const w = workerSessions.get(sessionID);
           const role = roleOf({ metadata: w.metadata });
+          const behavior = role === "critic" ? criticBehavior : workerBehavior;
+          const round = lastRoundOf(w);
           return {
             id: w.id,
-            agent: w.agent,
-            model: w.model,
-            outcome: roundOutcomeFor(w, role === "critic" ? criticBehavior : workerBehavior, role),
+            // agentByRound/modelByRound permitem DRIFT: identidade reportada
+            // difere da usada na criacao; sem override, ecoa a criacao.
+            agent: pickSeq(behavior.agentByRound, round, w.agent),
+            model: pickSeq(behavior.modelByRound, round, w.model),
+            outcome: roundOutcomeFor(w, behavior, role),
             metadata: w.metadata,
             location: w.location,
           };
