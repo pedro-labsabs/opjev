@@ -30,6 +30,8 @@ import {
   JEV_AGENT_ROLE,
   type AgentCatalog,
 } from "./src/orchestration/agent-catalog.ts";
+import { attemptKey } from "./src/orchestration/dispatcher.ts";
+import type { AgentCatalogEntry } from "./src/orchestration/agent-catalog.ts";
 import {
   buildCriticContextInstruction,
   buildWorkerContextInstruction,
@@ -120,6 +122,42 @@ async function validAgents(ctx: any): Promise<string[]> {
   } catch {
     return ["build", "plan"];
   }
+}
+
+/**
+ * Candidatos de switch-model (#10): FREE_POOL ∩ catalogo runtime, menos o
+ * model atual e menos pares (currentAgent, candidato) ja tentados no run.
+ * Nunca paid/external (isFreeModel e necessario, nao suficiente: precisa
+ * estar na lista). Nunca apresenta o que sera rejeitado depois.
+ */
+async function switchModelCandidates(
+  ctx: any,
+  currentAgent: string,
+  currentModel: string,
+  attempts: Array<{ agent: string; model: string }>,
+): Promise<string[]> {
+  const pool = await freeCandidates(ctx);
+  const tried = new Set((attempts ?? []).map((a) => attemptKey(a.agent, a.model)));
+  return pool.filter((m) => m !== currentModel && !tried.has(attemptKey(currentAgent, m)));
+}
+
+/**
+ * Candidatos de switch-agent (#10): Agent Catalog primaryEligible, menos o
+ * agent atual e menos pares (candidato, currentModel) ja tentados. Nunca
+ * subagent-only/hidden/unknown/inventado (reutiliza as regras da #9).
+ */
+async function switchAgentCandidates(
+  ctx: any,
+  currentAgent: string,
+  currentModel: string,
+  attempts: Array<{ agent: string; model: string }>,
+): Promise<AgentCatalogEntry[]> {
+  const catalog = await discoverAgentCatalog(ctx);
+  const tried = new Set((attempts ?? []).map((a) => attemptKey(a.agent, a.model)));
+  const lowerCurrent = String(currentAgent ?? "").toLowerCase();
+  return primaryEligibleAgents(catalog).filter(
+    (e) => e.id.toLowerCase() !== lowerCurrent && !tried.has(attemptKey(e.id, currentModel)),
+  );
 }
 
 async function isAgentAvailable(ctx: any, agent: string): Promise<boolean> {
@@ -613,6 +651,114 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
         apiKey: await getKey(),
         timeoutMs: opts.jevTimeoutMs,
       });
+    },
+    // selectModel (#10): Jev escolhe UM novo modelo entre candidatos validos
+    // via decideGeneric ESTRITO (sem heuristic fallback). Jev indisponivel /
+    // resposta fora dos candidates / paid / repetido => erro bounded; o
+    // scheduler falha sem criar worker. Dispatcher nao escolhe nada local.
+    async selectModel(input) {
+      const current = { agent: String(input.current?.agent ?? ""), model: String(input.current?.model ?? "") };
+      const attempts = Array.isArray(input.attempts) ? input.attempts : [];
+      const candidates = await switchModelCandidates(ctx, current.agent, current.model, attempts);
+      if (candidates.length === 0) {
+        throw new OrchestrationError(
+          "no-model-candidates",
+          `switch-model sem candidatos validos (FREE_POOL ∩ catalogo − atual − tentados, attempts=${attempts.length})`,
+        );
+      }
+      const criteria: Record<string, string> = {};
+      for (const m of candidates) criteria[m] = `Eligible FREE model for the next round (${m})`;
+      const answers = await decideGeneric({
+        state: {
+          objective: String(input.contract?.objective ?? "").slice(0, 2000),
+          round: input.round,
+          maxRounds: input.contract?.maxRounds,
+          current,
+          failureClass: input.failureClass,
+          resultSummary: String(input.resultSummary ?? "").slice(0, 500),
+          attempts: attempts.length,
+        },
+        questions: {
+          selected_model: {
+            type: "choice",
+            instructions: "Which eligible FREE model should execute the next round? Choose ONLY one of the presented candidates.",
+            criteria,
+          },
+        },
+        jevModel: opts.jevModel,
+        jevEndpoint: opts.jevEndpoint,
+        apiKey: await getKey(),
+        timeoutMs: opts.jevTimeoutMs,
+      });
+      const ans: any = answers["selected_model"];
+      const model = ans && ans.type === "choice" && typeof ans.choice === "string" ? ans.choice.trim() : "";
+      if (!model || !isFreeModel(model) || !candidates.includes(model)) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `switch-model fora dos candidatos validos: ${model || "(vazio)"} (candidates=${candidates.length})`,
+        );
+      }
+      const tried = new Set(attempts.map((a) => attemptKey(a.agent, a.model)));
+      if (tried.has(attemptKey(current.agent, model))) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `switch-model repetido neste run: ${current.agent}/${model} ja tentado`,
+        );
+      }
+      return { model };
+    },
+    // selectAgent (#10): espelho de selectModel sobre o Agent Catalog (#9).
+    // Somente primaryEligible; subagent-only/hidden/unknown/inventado nunca
+    // sao apresentados nem aceitos (resolvePrimaryAgent). Sem heuristic.
+    async selectAgent(input) {
+      const current = { agent: String(input.current?.agent ?? ""), model: String(input.current?.model ?? "") };
+      const attempts = Array.isArray(input.attempts) ? input.attempts : [];
+      const candidates = await switchAgentCandidates(ctx, current.agent, current.model, attempts);
+      if (candidates.length === 0) {
+        throw new OrchestrationError(
+          "no-agent-candidates",
+          `switch-agent sem candidatos validos (primary − atual − tentados, attempts=${attempts.length})`,
+        );
+      }
+      const catalog = await discoverAgentCatalog(ctx);
+      const criteria: Record<string, string> = {};
+      for (const e of candidates) criteria[e.id] = e.description || `Eligible primary agent for the next round (${e.id})`;
+      const answers = await decideGeneric({
+        state: {
+          objective: String(input.contract?.objective ?? "").slice(0, 2000),
+          round: input.round,
+          maxRounds: input.contract?.maxRounds,
+          current,
+          failureClass: input.failureClass,
+          resultSummary: String(input.resultSummary ?? "").slice(0, 500),
+          attempts: attempts.length,
+        },
+        questions: {
+          selected_agent: {
+            type: "choice",
+            instructions: "Which eligible primary agent should execute the next round? Choose ONLY one of the presented candidates.",
+            criteria,
+          },
+        },
+        jevModel: opts.jevModel,
+        jevEndpoint: opts.jevEndpoint,
+        apiKey: await getKey(),
+        timeoutMs: opts.jevTimeoutMs,
+      });
+      const ans: any = answers["selected_agent"];
+      const agent = ans && ans.type === "choice" && typeof ans.choice === "string" ? ans.choice.trim() : "";
+      if (!agent) {
+        throw new OrchestrationError("invalid-selection", "switch-agent sem agent valido na resposta do Jev");
+      }
+      const entry = resolvePrimaryAgent(catalog, agent);
+      const tried = new Set(attempts.map((a) => attemptKey(a.agent, a.model)));
+      if (tried.has(attemptKey(entry.id, current.model))) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `switch-agent repetido neste run: ${entry.id}/${current.model} ja tentado`,
+        );
+      }
+      return { agent: entry.id };
     },
   };
 }
@@ -1113,8 +1259,10 @@ export default Plugin.define({
           "executor UMA vez, cria a worker session OpenCode real, executa o ExecutionContract com EvidencePacket e o Jev julga " +
           "cada rodada (JevVerdict). Apos verdict repair-same/fresh-same, uma NOVA rodada e executada automaticamente " +
           "(repair-same reutiliza a MESMA worker session; fresh-same cria sessao NOVA, mesmo agent/model), sempre com critic " +
-          "novo, ate accept/stop ou o limite maxRounds (kernel). Demais acoes (switch-model/switch-agent/replan/human) param " +
-          "no boundary e voltam como pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
+          "novo, ate accept/stop ou o limite maxRounds (kernel). Apos verdict switch-model/switch-agent, o Jev seleciona o " +
+          "novo executor entre candidatos validos e uma NOVA rodada e executada automaticamente (nova worker session, mesmo " +
+          "agent/model conforme o switch, critic novo). Demais acoes (replan/human) param no boundary e voltam como " +
+          "pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
           type: "object",
@@ -1156,8 +1304,8 @@ export default Plugin.define({
                   minimum: 1,
                   maximum: 100,
                   description:
-                    "Limite de rodadas do scheduler (kernel e a autoridade): repair-same/fresh-same executam rounds " +
-                    "internos enquanto round+1 <= maxRounds; alem do limite, o kernel emite awaiting-human + request-human.",
+                    "Limite de rodadas do scheduler (kernel e a autoridade): repair-same/fresh-same/switch-model/switch-agent " +
+                    "executam rounds internos enquanto round+1 <= maxRounds; alem do limite, o kernel emite awaiting-human + request-human.",
                 },
               },
               required: ["runID", "objective", "acceptanceCriteria", "maxRounds"],

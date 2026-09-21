@@ -832,6 +832,33 @@ function switchModelAnswers() {
   };
 }
 
+function environmentAnswers(next = "switch-model") {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "environment" },
+    same_executor_can_repair: { type: "noul", noul: 0.1 },
+    next_action: { type: "choice", choice: next, confidence: 0.8 },
+  };
+}
+
+function replanAnswers() {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "bad-contract" },
+    same_executor_can_repair: { type: "noul", noul: 0.1 },
+    next_action: { type: "choice", choice: "replan", confidence: 0.8 },
+  };
+}
+
+function switchAgentAnswers() {
+  return {
+    done: { type: "noul", noul: 0.1 },
+    failure_class: { type: "choice", choice: "wrong-agent" },
+    same_executor_can_repair: { type: "noul", noul: 0.1 },
+    next_action: { type: "choice", choice: "switch-agent", confidence: 0.8 },
+  };
+}
+
 /** Fake runtime + fake decisions que registram a ordem dos efeitos. */
 function fakeDeps(over = {}) {
   const effects = [];
@@ -925,6 +952,8 @@ function fakeDeps(over = {}) {
     ...over.critic,
   };
   let judgeSeq = 0;
+  const selectModelCalls = [];
+  const selectAgentCalls = [];
   const decisions = {
     selectExecutor: async () => {
       effects.push("select");
@@ -941,9 +970,29 @@ function fakeDeps(over = {}) {
       }
       return over.judgeAnswers ?? acceptAnswers();
     },
+    selectModel: async (input) => {
+      effects.push("select-model");
+      selectModelCalls.push(input);
+      const seq = over.modelSelections;
+      if (Array.isArray(seq)) {
+        const m = seq[selectModelCalls.length - 1] ?? seq[seq.length - 1];
+        return typeof m === "string" ? { model: m } : m;
+      }
+      return over.modelSelection ?? { model: "opencode/mimo-v2.5-free" };
+    },
+    selectAgent: async (input) => {
+      effects.push("select-agent");
+      selectAgentCalls.push(input);
+      const seq = over.agentSelections;
+      if (Array.isArray(seq)) {
+        const a = seq[selectAgentCalls.length - 1] ?? seq[seq.length - 1];
+        return typeof a === "string" ? { agent: a } : a;
+      }
+      return over.agentSelection ?? { agent: "plan" };
+    },
     ...over.decisions,
   };
-  return { runtime, critic, decisions, effects, promptCalls };
+  return { runtime, critic, decisions, effects, promptCalls, selectModelCalls, selectAgentCalls };
 }
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
@@ -1576,6 +1625,24 @@ describe("critic tool-level: read-only runtime, anti-rerouting, role instruction
 });
 
 // ─────────────────────────── Q. tool orchestrate_once (schema + exec) ───────────────────────────
+
+describe("tool orchestrate_once: public description reflete #10 (DESC1)", () => {
+  it("DESC1: descricao publicada informa switch-model/switch-agent executados, sem pending stale", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const tool = m.tools.orchestrate_once;
+    assert.ok(tool, "tool registrada com namespace jev");
+    const desc = String(tool.description ?? "");
+    assert.match(desc, /switch-model.{0,120}executa/i, "switch-model informado como executado internamente");
+    assert.match(desc, /switch-agent.{0,120}executa/i, "switch-agent informado como executado internamente");
+    assert.ok(!desc.includes("switch-model/switch-agent/replan/human"), "sem stale pending conjunto");
+    assert.ok(desc.includes("replan"), "replan continua boundary documentado");
+    assert.ok(desc.includes("human"), "human continua boundary documentado");
+  });
+});
 
 describe("tool orchestrate_once (schema, Code Mode, execucao real)", () => {
   it("Q1: ferramenta existe em tools.jev com namespace jev + codemode e NAO cria global jev_orchestrate_once", async () => {
@@ -2402,17 +2469,36 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.equal(t.effects.indexOf("create", c2 + 1), -1, "nenhum create alem da round3");
   });
 
-  it("RCV13: unsupported action boundary — switch-model-> select-model, NENHUMA round2 executada", async () => {
-    const t = fakeDeps({ judgeAnswers: switchModelAnswers() });
+  it("RCV13: unsupported action boundary — replan -> pending, NENHUMA round2 executada", async () => {
+    const t = fakeDeps({ judgeAnswers: replanAnswers() });
     const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
       runtime: t.runtime, critic: t.critic, decisions: t.decisions,
     });
-    assert.equal(result.phase, "ready");
-    assert.deepEqual(result.pendingCommands, ["select-model"]);
+    assert.deepEqual(result.pendingCommands, ["replan"]);
     assert.equal(result.round, 2, "kernel ja avancou round para 2 (boundary)");
     assert.equal(result.rounds.length, 1, "nenhuma round2 executada");
     assert.equal(t.promptCalls.length, 1, "nenhum prompt alem da round1");
     assert.equal(t.effects.filter((e) => e === "critic-create").length, 1);
+    assert.equal(t.selectModelCalls.length, 0, "replan nao dispara select");
+    assert.equal(t.selectAgentCalls.length, 0, "replan nao dispara select");
+  });
+
+  it("RCV13b: switch-model executa round2 via Jev selection (#10 substitui o pending antigo)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      workerSessionIDs: ["w1", "w2"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.rounds.length, 2, "round2 executada (nao mais pending)");
+    assert.equal(result.rounds[1].action, "switch-model");
+    assert.deepEqual(result.pendingCommands, [], "sem pending apos completed");
   });
 
   it("RCV14: happy path preservado — 1 worker, 1 critic, 1 judge, completed", async () => {
@@ -3037,6 +3123,279 @@ describe("tool orchestrate_once: agent catalog eligibility (ARC4-ARC11)", () => 
     }
   });
 });
+// ─────────────────────────── SW. Jev-guided switch-model / switch-agent ───────────────────────────
+
+describe("switch-model end-to-end (SW1)", () => {
+  it("SW1: switch-model — round2 mesmo agent, novo model, nova session", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      workerSessionIDs: ["w1", "w2"],
+      criticSessionIDs: ["c1", "c2"],
+      // Runtime coerente: round2 reporta a identidade da nova sessao (M2).
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+      ],
+    });
+    // Prova do INPUT REAL: createWorker round2 usa o model selecionado.
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 2);
+    assert.equal(result.rounds.length, 2);
+    assert.equal(result.rounds[0].action, "initial");
+    assert.equal(result.rounds[1].action, "switch-model", "auditoria distingue switch de fresh");
+    assert.deepEqual(createdInputs[1].model, { providerID: "opencode", id: "mimo-v2.5-free" }, "createWorker round2 = M2 selecionado");
+    assert.equal(createdInputs[1].agent, "build", "createWorker round2 preserva agent");
+    assert.equal(result.rounds[1].agent, "build", "agent preservado");
+    assert.equal(result.rounds[1].model, "opencode/mimo-v2.5-free", "model novo");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "nova session");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector inicial 1x");
+    assert.equal(t.selectModelCalls.length, 1, "model selector 1x");
+  });
+});
+
+describe("switch-agent end-to-end (SA1)", () => {
+  it("SA1: switch-agent — round2 novo agent, mesmo model, nova session", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchAgentAnswers(), acceptAnswers()],
+      agentSelections: ["specialist"],
+      workerSessionIDs: ["w1", "w2"],
+      criticSessionIDs: ["c1", "c2"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "specialist", model: "opencode/big-pickle", outcome: "succeeded" },
+      ],
+    });
+    const createdInputs = [];
+    const origCreate = t.runtime.createWorker;
+    t.runtime.createWorker = async (input) => { createdInputs.push(input); return origCreate(input); };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 2);
+    assert.equal(result.rounds.length, 2);
+    assert.equal(result.rounds[1].action, "switch-agent", "auditoria distingue switch de fresh");
+    assert.equal(createdInputs[1].agent, "specialist", "createWorker round2 = agent selecionado");
+    assert.deepEqual(createdInputs[1].model, { providerID: "opencode", id: "big-pickle" }, "createWorker round2 preserva model");
+    assert.equal(result.rounds[1].agent, "specialist", "agent novo");
+    assert.equal(result.rounds[1].model, "opencode/big-pickle", "model preservado");
+    assert.notEqual(result.rounds[0].workerSessionID, result.rounds[1].workerSessionID, "nova session");
+    assert.equal(t.effects.filter((e) => e === "select").length, 1, "selector inicial 1x");
+    assert.equal(t.selectAgentCalls.length, 1, "agent selector 1x");
+  });
+});
+
+describe("switch-model selection guards (SW2d/SW3/SW4)", () => {
+  it("SW2d: selectModel recebe contexto bounded (current, attempts, failure — sem raw)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(t.selectModelCalls.length, 1);
+    const input = t.selectModelCalls[0];
+    assert.deepEqual(input.current, { agent: "build", model: "opencode/big-pickle" });
+    assert.deepEqual(input.attempts, [{ agent: "build", model: "opencode/big-pickle" }], "round1 ja e tentativa");
+    assert.equal(input.failureClass, "wrong-model");
+    assert.ok(typeof input.resultSummary === "string" && input.resultSummary.length > 0);
+    const ser = JSON.stringify(input);
+    assert.ok(!ser.includes("content"), "sem raw conversation no input");
+    assert.ok(!ser.includes("sessionID") || ser.includes("w1") === false, "sem sessionID interna vazada");
+  });
+
+  it("SW3: Jev responde modelo ja tentado (M1) — reject bounded, zero round2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["opencode/big-pickle"],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "combinacao repetida rejeitada");
+    assert.ok(result.error && result.error.includes("tentado"), "diagnostico menciona repeticao");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "zero round2 worker");
+    assert.equal(t.selectModelCalls.length, 1, "select chamado, resposta rejeitada");
+  });
+
+  it("SW4: Jev responde paid/out-of-pool — reject bounded, zero round2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["openai/gpt-paid"],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed");
+    assert.ok(result.error && result.error.includes("FREE_POOL"), "diagnostico FREE_POOL");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "paid nunca chega a createWorker");
+  });
+});
+
+describe("switch-agent selection guards (SA3a)", () => {
+  it("SA3a: selectAgent vazio/malformed — reject bounded, zero round2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchAgentAnswers(), acceptAnswers()],
+      agentSelections: [{ agent: "   " }],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "zero round2 worker");
+  });
+});
+
+describe("switch repeated-combination loop prevention (LOOP)", () => {
+  it("LOOPm: A/M1 -> A/M2 -> Jev tenta M1 de novo — reject, rounds<=2", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free", "opencode/big-pickle"],
+      workerSessionIDs: ["w1", "w2", "w3"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "failed" },
+        { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "M1 repetido rejeitado na segunda selecao");
+    assert.equal(t.selectModelCalls.length, 2, "duas selecoes tentadas");
+    assert.deepEqual(
+      t.selectModelCalls[1].attempts,
+      [
+        { agent: "build", model: "opencode/big-pickle" },
+        { agent: "build", model: "opencode/mimo-v2.5-free" },
+      ],
+      "attempts acumulam ambas as rodadas",
+    );
+    assert.ok((result.rounds ?? []).length <= 2, "round3 nunca executou");
+    assert.equal(t.effects.filter((e) => e === "create").length, 2, "zero worker de round3");
+  });
+
+  it("LOOPa: A/M1 -> B/M1 -> Jev tenta A de novo — reject", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchAgentAnswers(), switchAgentAnswers(), acceptAnswers()],
+      agentSelections: ["specialist", "build"],
+      workerSessionIDs: ["w1", "w2", "w3"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "A/M1 repetido rejeitado");
+    assert.equal(t.selectAgentCalls.length, 2);
+    assert.ok((result.rounds ?? []).length <= 2, "round3 nunca executou");
+  });
+});
+
+describe("switch maxRounds kernel authority (MAX)", () => {
+  it("MAXm: maxRounds=1 + switch-model -> awaiting-human, selectModel 0x, round2 0x", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [switchModelAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "awaiting-human");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(t.selectModelCalls.length, 0, "sem select apos kernel barrar");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "sem worker de round2");
+    assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "sem critic de round2");
+  });
+
+  it("MAXa: maxRounds=1 + switch-agent -> awaiting-human, selectAgent 0x", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [switchAgentAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "awaiting-human");
+    assert.deepEqual(result.pendingCommands, ["request-human"]);
+    assert.equal(t.selectAgentCalls.length, 0, "sem select apos kernel barrar");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "sem worker de round2");
+  });
+});
+
+describe("switch throttle / environment semantics (THR/ENV)", () => {
+  it("THR: evidencia 429 + verdict switch-model — sem storm, bounded, sem penalidade", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [switchModelAnswers(), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      messages: [{ type: "assistant", content: [{ type: "text", text: "Error 429: rate limit exceeded, retry later" }] }],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "failed", "throttle nao abre cadeia de switches");
+    assert.ok(result.error && result.error.includes("429"), "diagnostico especifico cita o sinal");
+    assert.equal(t.selectModelCalls.length, 0, "selectModel nunca chamado sob throttle");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhuma round2");
+  });
+
+  it("THRctl: failureClass environment SEM sinal concreto — switch-model prossegue", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [environmentAnswers("switch-model"), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed", "environment generico nao vira throttle automatico");
+    assert.equal(result.rounds[1].action, "switch-model");
+    assert.equal(t.selectModelCalls.length, 1);
+  });
+
+  it("ENVhist: environment registrado sem scoring — history sem capabilityPenalty/modelScore", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [environmentAnswers("switch-model"), acceptAnswers()],
+      modelSelections: ["opencode/mimo-v2.5-free"],
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.history[0].verdict.failureClass, "environment", "failureClass auditavel");
+    const ser = JSON.stringify(result);
+    assert.ok(!ser.includes("capabilityPenalty"), "sem scoring de capability");
+    assert.ok(!ser.includes("modelScore"), "sem scoring de modelo");
+  });
+});
+
+describe("switch executor: attempt history bounded (SW0)", () => {
+  it("SW0: history canonica carrega executor agent/model por rodada", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.history.length, 2);
+    assert.deepEqual(
+      result.history[0].executor,
+      { agent: "build", model: "opencode/big-pickle" },
+      "round1 registra o executor executado",
+    );
+    assert.deepEqual(
+      result.history[1].executor,
+      { agent: "build", model: "opencode/big-pickle" },
+      "round2 registra o executor executado",
+    );
+  });
+});
+
 // ─────────────────────────── ARC15. unknown explicit Jev agent ───────────────────────────
 
 describe("tool orchestrate_once: explicit unknown Jev agent is rejected (ARC15)", () => {
@@ -3076,6 +3435,315 @@ describe("tool orchestrate_once: explicit unknown Jev agent is rejected (ARC15)"
       assert.equal(criticCreates.length, 0, "critic nunca criado");
       assert.ok(out.error && out.error.includes("ghost-agent"), "erro menciona o ID rejeitado");
       assert.ok(out.error.includes("catalogo"), "erro menciona o catalogo");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+// ─────────────────────────── SW/SA adapter: candidates + strict selection ───────────────────────────
+
+describe("switch candidates via adapter (SW2/SA2/SA3b)", () => {
+  it("SW2: criteria do switch-model excluem M1 atual, paid e tentados; so FREE validos", async () => {
+    let switchBody;
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_model) {
+        switchBody = body;
+        return okJev({ selected_model: choice("opencode/mimo-v2.5-free", 0.9) });
+      }
+      if (body?.questions?.done) {
+        judgeCountSW2 += 1;
+        return okJev(judgeCountSW2 === 1 ? switchModelAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    let judgeCountSW2 = 0;
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "sw2-candidates",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.ok(switchBody, "Jev foi consultado para switch-model");
+      const criteria = Object.keys(switchBody.questions.selected_model.criteria);
+      assert.ok(!criteria.includes("opencode/big-pickle"), "M1 atual excluido");
+      assert.ok(criteria.every((c) => isFreeModel(c)), "so modelos FREE apresentados");
+      assert.ok(criteria.includes("opencode/mimo-v2.5-free"), "M2 valido apresentado");
+      assert.ok(out, "execucao observada");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("SW5: Jev indisponivel no switch-select — bounded failure, sem heuristic local, zero round2", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_model) {
+        throw new Error("network down");
+      }
+      if (body?.questions?.done) {
+        return okJev(switchModelAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "sw5-select-down",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "sem heuristic para inventar destino de switch");
+      assert.ok(out.error, "erro bounded presente");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 1, "zero round2 worker");
+      assert.ok(!JSON.stringify(workerCreates).includes("mimo"), "nenhum modelo assumido localmente");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("SA2: criteria do switch-agent sao so primaryEligible (sem atual, subagent, hidden, tried)", async () => {
+    let switchBody;
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "build", name: "Build", mode: "primary", hidden: false },
+        { id: "specialist", name: "Specialist", mode: "primary", hidden: false },
+        { id: "explore", name: "Explore", mode: "subagent", hidden: false },
+        { id: "compaction", name: "Compaction", mode: "primary", hidden: true },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_agent) {
+        switchBody = body;
+        return okJev({ selected_agent: choice("specialist", 0.9) });
+      }
+      if (body?.questions?.done) {
+        judgeCountSA2 += 1;
+        return okJev(judgeCountSA2 === 1 ? switchAgentAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    let judgeCountSA2 = 0;
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "sa2-candidates",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.ok(switchBody, "Jev foi consultado para switch-agent");
+      const criteria = Object.keys(switchBody.questions.selected_agent.criteria);
+      assert.deepEqual(criteria, ["specialist"], "so specialist: sem build atual, explore subagent, compaction hidden");
+      assert.ok(out, "execucao observada");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("SA3b: switch-agent responde explore (subagent) — adapter rejeita, zero round2", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "build", name: "Build", mode: "primary", hidden: false },
+        { id: "explore", name: "Explore", mode: "subagent", hidden: false },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_agent) {
+        return okJev({ selected_agent: choice("explore", 0.9) });
+      }
+      if (body?.questions?.done) {
+        return okJev(switchAgentAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "sa3b-subagent-answer",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "failed", "resposta subagent-only rejeitada");
+      const workerCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "worker");
+      assert.equal(workerCreates.length, 1, "zero round2 worker");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+// ─────────────────────────── E2E switch-model / switch-agent ───────────────────────────
+
+describe("tool orchestrate_once: E2E switch-model / switch-agent", () => {
+  it("E2E-switch-model: build/M1 falha -> switch-model M2 -> build/M2 nova session -> accept", async () => {
+    let switchCriteria;
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "BROKEN_ON_M1" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "FIXED_ON_M2" }] }],
+        ],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_model) {
+        switchCriteria = Object.keys(body.questions.selected_model.criteria);
+        return okJev({ selected_model: choice("opencode/mimo-v2.5-free", 0.9) });
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? switchModelAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-switch-model",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.round, 2);
+      assert.equal(out.rounds[0].action, "initial");
+      assert.equal(out.rounds[1].action, "switch-model");
+      assert.equal(out.rounds[1].agent, "build", "mesmo agent");
+      assert.equal(out.rounds[1].model, "opencode/mimo-v2.5-free", "novo model");
+      assert.notEqual(out.rounds[0].workerSessionID, out.rounds[1].workerSessionID, "nova session");
+      assert.notEqual(out.rounds[0].criticSessionID, out.rounds[1].criticSessionID, "critic novo");
+      assert.ok(!switchCriteria.includes("opencode/big-pickle"), "M1 ausente dos candidates");
+      assert.ok(out.history.length >= 2, "history com ambos os pares");
+      assert.deepEqual(out.history[0].executor, { agent: "build", model: "opencode/big-pickle" });
+      assert.deepEqual(out.history[1].executor, { agent: "build", model: "opencode/mimo-v2.5-free" });
+      assert.equal(out.rounds[1].outcome, "succeeded");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("E2E-switch-agent: build/M1 falha -> switch-agent specialist -> specialist/M1 nova session -> accept", async () => {
+    let switchCriteria;
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: [
+        { id: "build", name: "Build", mode: "primary", hidden: false },
+        { id: "specialist", name: "Specialist", mode: "primary", hidden: false },
+        { id: "explore", name: "Explore", mode: "subagent", hidden: false },
+      ],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcomes: ["failed", "succeeded"],
+        messagesByRound: [
+          [{ id: "wr1", type: "assistant", content: [{ type: "text", text: "WRONG_AGENT" }] }],
+          [{ id: "wr2", type: "assistant", content: [{ type: "text", text: "RIGHT_AGENT_OK" }] }],
+        ],
+      },
+    });
+    let judgeCount = 0;
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      if (body?.questions?.selected_agent) {
+        switchCriteria = Object.keys(body.questions.selected_agent.criteria);
+        return okJev({ selected_agent: choice("specialist", 0.9) });
+      }
+      if (body?.questions?.done) {
+        judgeCount += 1;
+        return okJev(judgeCount === 1 ? switchAgentAnswers() : acceptAnswers());
+      }
+      return okJev(acceptAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "e2e-switch-agent",
+          objective: "Implementar o modulo auth",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["done"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 2,
+        },
+      });
+      const out = JSON.parse(res.content);
+      assert.equal(out.phase, "completed");
+      assert.equal(out.round, 2);
+      assert.equal(out.rounds[1].action, "switch-agent");
+      assert.equal(out.rounds[1].agent, "specialist", "agent mudou");
+      assert.equal(out.rounds[1].model, "opencode/big-pickle", "model preservado");
+      assert.notEqual(out.rounds[0].workerSessionID, out.rounds[1].workerSessionID, "nova session");
+      assert.ok(!switchCriteria.includes("explore"), "subagent-only nunca candidato");
+      assert.ok(!switchCriteria.includes("build"), "atual excluido");
+      assert.deepEqual(out.history[1].executor, { agent: "specialist", model: "opencode/big-pickle" });
     } finally {
       stub.restore();
     }
