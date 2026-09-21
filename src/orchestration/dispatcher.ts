@@ -4,12 +4,15 @@
 // (WorkerRuntime, CriticRuntime, DispatcherDecisions). O index.ts faz a
 // adaptacao para o runtime real (ctx.session.*) e para as decisoes do Jev.
 //
-// Este slice transforma repair-same/fresh-same em efeitos runtime reais:
+// Este slice transforma repair-same/fresh-same/switch-model/switch-agent em
+// efeitos runtime reais:
 //   - repair-same: round+1 na MESMA worker session (mesmo agent/model);
 //   - fresh-same:  round+1 em NOVA worker session (mesmo agent/model);
-//   - demais acoes param no boundary e voltam como pendingCommands.
+//   - switch-model/switch-agent: round+1 em NOVA worker session com executor
+//     escolhido pelo Jev entre candidatos validos (selectModel/selectAgent);
+//   - demais acoes (replan/human) param no boundary e voltam como pendingCommands.
 // O Jev decide a estrategia; o dispatcher apenas executa deterministicamente.
-// Nenhuma nova rodada acontece sem um JevVerdict valido pedindo repair/fresh.
+// Nenhuma nova rodada acontece sem um JevVerdict valido.
 
 import {
   OrchestrationError,
@@ -387,8 +390,11 @@ function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["hi
  * inicial (somente UMA vez). Apos cada JevVerdict:
  *   - repair-same / fresh-same: nova rodada e EXECUTADA neste slice (bounded
  *     por maxRounds validado pelo kernel);
- *   - demais acoes (switch-model/switch-agent/replan/human/stop): param no
- *     boundary e voltam como pendingCommands.
+ *   - switch-model / switch-agent: Jev seleciona o novo executor (selectModel/
+ *     selectAgent, sem heuristic local) e a proxima rodada e EXECUTADA em nova
+ *     worker session, com pipeline integral e critic novo;
+ *   - demais acoes (replan/human): param no boundary e voltam como
+ *     pendingCommands (accept/stop sao terminais).
  * Toda rodada roda pipeline integral: worker -> evidence -> critic novo -> Jev.
  * Nunca ha recovery automatica sem um JevVerdict valido.
  */

@@ -1626,6 +1626,24 @@ describe("critic tool-level: read-only runtime, anti-rerouting, role instruction
 
 // ─────────────────────────── Q. tool orchestrate_once (schema + exec) ───────────────────────────
 
+describe("tool orchestrate_once: public description reflete #10 (DESC1)", () => {
+  it("DESC1: descricao publicada informa switch-model/switch-agent executados, sem pending stale", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const tool = m.tools.orchestrate_once;
+    assert.ok(tool, "tool registrada com namespace jev");
+    const desc = String(tool.description ?? "");
+    assert.match(desc, /switch-model.{0,120}executa/i, "switch-model informado como executado internamente");
+    assert.match(desc, /switch-agent.{0,120}executa/i, "switch-agent informado como executado internamente");
+    assert.ok(!desc.includes("switch-model/switch-agent/replan/human"), "sem stale pending conjunto");
+    assert.ok(desc.includes("replan"), "replan continua boundary documentado");
+    assert.ok(desc.includes("human"), "human continua boundary documentado");
+  });
+});
+
 describe("tool orchestrate_once (schema, Code Mode, execucao real)", () => {
   it("Q1: ferramenta existe em tools.jev com namespace jev + codemode e NAO cria global jev_orchestrate_once", async () => {
     const m = await bootCtx({

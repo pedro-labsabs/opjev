@@ -1259,8 +1259,10 @@ export default Plugin.define({
           "executor UMA vez, cria a worker session OpenCode real, executa o ExecutionContract com EvidencePacket e o Jev julga " +
           "cada rodada (JevVerdict). Apos verdict repair-same/fresh-same, uma NOVA rodada e executada automaticamente " +
           "(repair-same reutiliza a MESMA worker session; fresh-same cria sessao NOVA, mesmo agent/model), sempre com critic " +
-          "novo, ate accept/stop ou o limite maxRounds (kernel). Demais acoes (switch-model/switch-agent/replan/human) param " +
-          "no boundary e voltam como pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
+          "novo, ate accept/stop ou o limite maxRounds (kernel). Apos verdict switch-model/switch-agent, o Jev seleciona o " +
+          "novo executor entre candidatos validos e uma NOVA rodada e executada automaticamente (nova worker session, mesmo " +
+          "agent/model conforme o switch, critic novo). Demais acoes (replan/human) param no boundary e voltam como " +
+          "pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
           type: "object",
@@ -1302,8 +1304,8 @@ export default Plugin.define({
                   minimum: 1,
                   maximum: 100,
                   description:
-                    "Limite de rodadas do scheduler (kernel e a autoridade): repair-same/fresh-same executam rounds " +
-                    "internos enquanto round+1 <= maxRounds; alem do limite, o kernel emite awaiting-human + request-human.",
+                    "Limite de rodadas do scheduler (kernel e a autoridade): repair-same/fresh-same/switch-model/switch-agent " +
+                    "executam rounds internos enquanto round+1 <= maxRounds; alem do limite, o kernel emite awaiting-human + request-human.",
                 },
               },
               required: ["runID", "objective", "acceptanceCriteria", "maxRounds"],
