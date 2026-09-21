@@ -13,6 +13,7 @@ import { buildDecisionRecord, sanitizeState } from "./src/sanitize.ts";
 import { buildToolRecoverQuestions } from "./src/jev-client.ts";
 import {
   runOrchestrationOnce,
+  runOrchestrationResume,
   type CriticRuntime,
   type DispatcherDecisions,
   type DispatcherDeps,
@@ -22,6 +23,7 @@ import {
   type WorkerSessionView,
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
+import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
   buildAgentCatalog,
@@ -820,15 +822,25 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
 /** Persistencia minima bounded: orchestration/run/<runID>. Best-effort. */
 async function persistOrchestrationRun(
   ctx: any,
-  input: { kind: string; runID: string; workerSessionID?: string; criticSessionID?: string; state: any; at: number },
+  input: {
+    kind: string;
+    runID: string;
+    workerSessionID?: string;
+    criticSessionID?: string;
+    orchestratorSessionID?: string;
+    state: any;
+    at: number;
+  },
 ): Promise<void> {
   const key = `orchestration/run/${input.runID}`;
   const prior: any = await safeStorageGet(ctx, key);
   await ctx.storage.set(key, {
     ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior : {}),
+    checkpoint: input.kind,
     state: input.state,
     workerSessionID: input.workerSessionID,
     criticSessionID: input.criticSessionID,
+    orchestratorSessionID: input.orchestratorSessionID,
     updatedAt: input.at,
   });
 }
@@ -1318,8 +1330,11 @@ export default Plugin.define({
           "novo executor entre candidatos validos e uma NOVA rodada e executada automaticamente (nova worker session, mesmo " +
           "agent/model conforme o switch, critic novo). Apos verdict replan, um orchestrator read-only propoe UM revised " +
           "ExecutionContract (kernel valida: mesmo runID, sem aumento de maxRounds) e uma NOVA rodada executa o contrato " +
-          "revisado em nova worker session, com critic novo. Demais acoes (human) param no boundary e voltam como " +
-          "pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
+          "revisado em nova worker session, com critic novo. Verdict human (ou esgotamento de maxRounds) pausa o run no " +
+          "boundary humano: fase awaiting-human (checkpoint human-awaiting) com pendingHuman exposto (HumanRequest " +
+          "deterministico com requestID) e a retomada EXPLICITA e feita por um humano via orchestrate_resume " +
+          "(resume/stop) — nunca auto-resume: o run permanece pausado ate a decisao humana chegar. " +
+          "Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
           type: "object",
@@ -1389,6 +1404,104 @@ export default Plugin.define({
             return {
               content: `orchestrate_once falhou: ${err instanceof Error ? err.message : String(err)}`,
             };
+          }
+        },
+      });
+
+      editor.add({
+        name: "orchestrate_resume",
+        description:
+          "Seam UNICO de retomada do gate humano (#12): aplica um HumanDecision bounded " +
+          "(requestID do pendingHuman, action resume|stop, instruction <= 1000 chars, newMaxRounds <= 100) a um run " +
+          "pausado em awaiting-human (checkpoint human-awaiting). A autoridade e SEMPRE humana: o caller e inferido " +
+          "so do Tool.Context real (context.sessionID), nunca de input, e sessao interna de orchestration " +
+          "(worker/critic/orchestrator) e rejeitada; input.callerRole e proibido no schema e na execucao. resume abre " +
+          "exatamente uma rodada em mode human-resume com o executor canonico (sem reselecao); sem newMaxRounds o " +
+          "orcamento nao muda e resume sem budget suficiente e rejeitado. stop encerra sem trabalho novo. Nunca ha " +
+          "auto-resume: o run permanece pausado ate a decisao humana explicita chegar por esta tool.",
+        input: {
+          type: "object",
+          properties: {
+            runID: { type: "string", description: "Identificador do run pausado em awaiting-human" },
+            decision: {
+              type: "object",
+              description:
+                "HumanDecision bounded: requestID = pendingHuman.requestID obrigatorio; action resume|stop; " +
+                "instruction (so resume, <= 1000 chars) e newMaxRounds (1..100, >= maxRounds atual) opcionais.",
+              properties: {
+                requestID: { type: "string", description: "requestID do pendingHuman (deterministico)" },
+                action: { type: "string", enum: ["resume", "stop"], description: "resume (nova rodada) ou stop (encerra)" },
+                instruction: { type: "string", maxLength: 1000, description: "Instrucao bounded da autoridade humana (so resume)" },
+                newMaxRounds: {
+                  type: "integer",
+                  minimum: 1,
+                  maximum: 100,
+                  description: "Novo limite de rodadas (so resume; nunca reduz o orcamento atual)",
+                },
+              },
+              required: ["requestID", "action"],
+              additionalProperties: false,
+            },
+          },
+          required: ["runID", "decision"],
+          additionalProperties: false,
+        },
+        options: { namespace: "jev", codemode: true },
+        // Caller guard via Tool.Context REAL (@opencode/plugin 2.0.7): o plugin
+        // injeta { sessionID, agent, messageID, id } no runtime — nao e
+        // spoofavel via input. Nenhum resultado de run e fabricado sem ele.
+        execute: async (input: any, context: any) => {
+          try {
+            // 1. Chaves estritas: callerRole (e qualquer chave desconhecida)
+            //    nunca chega nem no schema (additionalProperties:false) nem aqui.
+            const inputObj = input && typeof input === "object" ? input : {};
+            for (const key of Object.keys(inputObj)) {
+              if (key !== "runID" && key !== "decision") {
+                return {
+                  content: `orchestrate_resume: chave desconhecida proibida: ${key} (somente runID|decision; callerRole nunca e aceito)`,
+                };
+              }
+            }
+            if (context?.callerRole !== undefined) {
+              return { content: "orchestrate_resume: callerRole no Tool.Context e proibido — caller vem de context.sessionID" };
+            }
+            // 2. Caller humano verificavel no Tool.Context real; nada inferido.
+            const callerSessionID = String(context?.sessionID ?? "");
+            if (!callerSessionID) {
+              return { content: "orchestrate_resume: contexto do chamador ausente — Tool.Context.sessionID obrigatorio" };
+            }
+            // 3. Worker/critic/orchestrator internos nunca decidem o gate humano.
+            const role = await orchestrationRoleOf(ctx, callerSessionID, context ?? {});
+            if (role) {
+              return {
+                content: `orchestrate_resume: chamada interna de orchestration (papel ${role}) — somente um humano decide resume/stop`,
+              };
+            }
+            const runID = String(inputObj.runID ?? "");
+            if (!runID) return { content: "orchestrate_resume: runID obrigatorio" };
+            // 4. O run persistido deve estar exatamente em awaiting-human
+            //    (nunca createRunState/selectExecutor/restart de history).
+            const stored: any = await safeStorageGet(ctx, `orchestration/run/${runID}`);
+            if (!stored || typeof stored !== "object" || Array.isArray(stored) || !stored.state) {
+              return { content: `[invalid-resumable-run] RunState nao retomavel: run ${runID} inexistente` };
+            }
+            validateResumableRunState(stored.state, runID);
+            const result = await runOrchestrationResume(
+              {
+                runID,
+                state: stored.state,
+                decision: inputObj.decision,
+                workerSessionID: stored.workerSessionID,
+                criticSessionID: stored.criticSessionID,
+              },
+              makeOrchestrationDeps(ctx, opts, getKey),
+            );
+            return { content: JSON.stringify(result) };
+          } catch (err) {
+            if (err instanceof OrchestrationError) {
+              return { content: `[${err.code}] ${err.message}` };
+            }
+            return { content: `orchestrate_resume falhou: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       });
