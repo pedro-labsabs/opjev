@@ -47,6 +47,7 @@ export function makeCtx({
   integrationList = [],
   location = "/fake/project",
   workerBehavior = {},
+  criticBehavior = {},
 } = {}) {
   const hooks = { session: {}, tool: {} };
   const tools = {};
@@ -55,9 +56,11 @@ export function makeCtx({
   const errorCounts = {};
   const loc = typeof location === "string" ? { directory: location } : location ?? { directory: "/fake/project" };
 
-  // Worker sessions (runtime falso do dispatcher): separadas da sessao principal
-  // (que representa o usuario). Toda criacao via ctx.session.create ganha um id
-  // novo; os efeitos ficam observaveis em `workerCalls` / `workerSessions`.
+  // Worker/critic sessions (runtime falso do dispatcher): separadas da sessao
+  // principal (que representa o usuario). Toda criacao via ctx.session.create
+  // ganha um id novo; os efeitos ficam observaveis em `workerCalls` /
+  // `workerSessions`. O papel (worker|critic) e detectado pelo metadata
+  // jev-role para variar comportamento default por role.
   const workerSessions = new Map();
   const workerCalls = { create: [], prompt: [], wait: [], get: [], context: [], interrupt: [] };
   let workerSeq = 0;
@@ -72,17 +75,34 @@ export function makeCtx({
       finish: "stop",
     },
   ];
+  // Critic GREEN por default: findings vazio em JSON estrito. Cada teste pode
+  // sobrescrever com criticBehavior.messages/outcome/waitBlocks.
+  const defaultCriticMessages = [
+    {
+      id: "cmsg-1",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      content: [{ type: "text", text: JSON.stringify({ findings: [] }) }],
+      time: { created: 1, completed: 2 },
+      finish: "stop",
+    },
+  ];
+
+  const roleOf = (input = {}) => input?.metadata?.["jev-role"] === "critic" ? "critic" : "worker";
 
   function workerInfo(input = {}) {
     workerSeq += 1;
     const id = `worker-${workerSeq}`;
+    const role = roleOf(input);
     return {
       id,
       projectID: "fake",
       agent: input.agent,
       model: { ...(input.model ?? { providerID: "opencode", id: "big-pickle" }) },
-      outcome: workerBehavior.outcome ?? "succeeded",
+      outcome: role === "critic" ? criticBehavior.outcome ?? "succeeded" : workerBehavior.outcome ?? "succeeded",
       metadata: input.metadata,
+      permissions: input.permissions,
       location: input.location ?? { directory: loc.directory },
       time: { created: Date.now(), updated: Date.now() },
       messages: null, // preenchido no create abaixo
@@ -135,7 +155,10 @@ export function makeCtx({
       create: async (input = {}) => {
         workerCalls.create.push(input);
         const info = workerInfo(input);
-        info.messages = workerBehavior.messages ?? defaultWorkerMessages;
+        info.messages =
+          roleOf(input) === "critic"
+            ? criticBehavior.messages ?? defaultCriticMessages
+            : workerBehavior.messages ?? defaultWorkerMessages;
         workerSessions.set(info.id, info);
         return { ...info };
       },
@@ -147,10 +170,12 @@ export function makeCtx({
       wait: async ({ sessionID } = {}) => {
         workerCalls.wait.push({ sessionID });
         const w = workerSessions.get(sessionID);
+        if (!w) return;
+        const blockedSource = roleOf({ metadata: w.metadata }) === "critic" ? criticBehavior : workerBehavior;
         const blocked =
-          workerBehavior.waitBlocks &&
-          (!Array.isArray(workerBehavior.blockedSessions) ||
-            workerBehavior.blockedSessions.includes(sessionID));
+          blockedSource.waitBlocks &&
+          (!Array.isArray(blockedSource.blockedSessions) ||
+            blockedSource.blockedSessions.includes(sessionID));
         if (blocked) {
           return await new Promise(() => {}); // wait bloqueado (timeout testavel)
         }

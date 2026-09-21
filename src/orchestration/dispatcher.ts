@@ -14,9 +14,11 @@ import {
 } from "./types.ts";
 import { createRunState, transitionRun } from "./state-machine.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
+import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
 
 export const WORKER_TIMEOUT_MS = 60_000;
+export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
 export const MAX_FINAL_TEXT = 2000;
 
 // ───────────────────────── interfaces injetaveis ─────────────────────────
@@ -42,6 +44,33 @@ export interface WorkerSessionView {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Runtime do critic: sessao separada da worker, contexto fresco, role
+ * `critic`. A injecao de permissions read-only e responsabilidade do adapter
+ * (index.ts), que passa as regras ao `ctx.session.create` do critic. O
+ * kernel/dispatcher nao conhece regras de permissao: apenas cria/chama.
+ */
+export interface CriticRuntime {
+  createCritic(input: {
+    agent: string;
+    model: { providerID: string; id: string };
+    location?: { directory?: string };
+    metadata: Record<string, unknown>;
+  }): Promise<{ sessionID: string }>;
+  prompt(input: { sessionID: string; text: string; metadata?: Record<string, unknown> }): Promise<void>;
+  wait(input: { sessionID: string }): Promise<void>;
+  get(input: { sessionID: string }): Promise<CriticSessionView>;
+  context(input: { sessionID: string }): Promise<unknown[]>;
+  interrupt?(input: { sessionID: string }): Promise<void>;
+}
+
+export interface CriticSessionView {
+  agent?: string;
+  model?: string;
+  outcome?: ExecutionOutcome;
+  metadata?: Record<string, unknown>;
+}
+
 export interface ExecutorSelection {
   agent: string;
   model: string;
@@ -59,10 +88,19 @@ export interface DispatcherDecisions {
 
 export interface DispatcherDeps {
   runtime: WorkerRuntime;
+  critic: CriticRuntime;
   decisions: DispatcherDecisions;
   workerTimeoutMs?: number;
+  criticTimeoutMs?: number;
   location?: { directory?: string };
-  persist?(input: { kind: "worker-created" | "evidence-ready" | "verdict-applied"; runID: string; workerSessionID?: string; state: RunState; at: number }): Promise<void>;
+  persist?(input: {
+    kind: "worker-created" | "evidence-ready" | "verdict-applied";
+    runID: string;
+    workerSessionID?: string;
+    criticSessionID?: string;
+    state: RunState;
+    at: number;
+  }): Promise<void>;
   now?(): number;
 }
 
@@ -72,6 +110,8 @@ export interface OrchestrationRunResult {
   round: number;
   selection?: ExecutorSelection;
   worker?: { sessionID: string; agent: string; model: string; outcome: ExecutionOutcome; finalText: string };
+  /** Projecao bounded do critic (auditoria minima): nunca contexto/mensagens. */
+  critic?: { sessionID: string; agent: string; model: string; outcome: "succeeded" | "failed"; findingsCount: number };
   evidence?: EvidencePacket;
   verdict?: JevVerdict;
   pendingCommands: string[];
@@ -127,7 +167,14 @@ export function extractFinalAssistantText(messages: unknown[]): string {
   return "";
 }
 
-function withTimeout<T>(op: () => Promise<T>, timeoutMs: number, onTimeout?: () => Promise<void> | void): Promise<T> {
+function withTimeout<T>(
+  op: () => Promise<T>,
+  timeoutMs: number,
+  onTimeout?: () => Promise<void> | void,
+  opts?: { code?: string; label?: string },
+): Promise<T> {
+  const code = opts?.code ?? "worker-timeout";
+  const label = opts?.label ?? "worker";
   return new Promise<T>((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
@@ -138,7 +185,7 @@ function withTimeout<T>(op: () => Promise<T>, timeoutMs: number, onTimeout?: () 
       Promise.resolve()
         .then(() => (onTimeout ? onTimeout() : undefined))
         .catch(() => undefined)
-        .finally(() => reject(new OrchestrationError("worker-timeout", `execucao do worker excedeu ${timeoutMs}ms; worker interrompido best-effort`)));
+        .finally(() => reject(new OrchestrationError(code, `execucao do ${label} excedeu ${timeoutMs}ms; ${label} interrompido best-effort`)));
     }, timeoutMs);
     op().then(
       (v) => { if (!settled) { settled = true; cleanup(); resolve(v); } },
@@ -175,10 +222,20 @@ async function failRun(state: RunState, runID: string, error: unknown, extra?: P
   return { runID, phase: "failed", round: state.round, pendingCommands: [], error: bounded(error), ...extra };
 }
 
-async function persist(deps: DispatcherDeps, kind: "worker-created" | "evidence-ready" | "verdict-applied", runID: string, workerSessionID: string | undefined, state: RunState, at: number): Promise<void> {
+async function persist(
+  deps: DispatcherDeps,
+  input: {
+    kind: "worker-created" | "evidence-ready" | "verdict-applied";
+    runID: string;
+    workerSessionID?: string;
+    criticSessionID?: string;
+    state: RunState;
+    at: number;
+  },
+): Promise<void> {
   if (!deps.persist) return;
   try {
-    await deps.persist({ kind, runID, workerSessionID, state, at });
+    await deps.persist(input);
   } catch {
     // best-effort: storage falha nao corrompe o kernel
   }
@@ -233,7 +290,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
   let view: WorkerSessionView;
   let messages: unknown[];
   try {
-    await persist(deps, "worker-created", contract.runID, workerSessionID, state, now());
+    await persist(deps, { kind: "worker-created", runID: contract.runID, workerSessionID, state, at: now() });
     state = transitionRun(state, { type: "EXECUTION_STARTED", executor: { agent: selection.agent, model: selection.model, sessionID: workerSessionID } }).state;
     const promptText = buildWorkerPrompt(contract, state.round, state.contract.maxRounds);
     await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: { "jev-router": "orchestration-internal", "jev-role": "worker" } });
@@ -260,7 +317,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     };
   }
 
-  // 5. EXECUTION_FINISHED + evidence
+  // 5. EXECUTION_FINISHED + evidence deterministica BASE (worker)
   const finalText = extractFinalAssistantText(messages);
   const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
   const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
@@ -269,7 +326,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
 
   state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome }).state;
 
-  const evidence: EvidencePacket = {
+  const baseEvidence: EvidencePacket = {
     round: state.round,
     executor: { agent, model, sessionID: workerSessionID },
     outcome,
@@ -281,12 +338,108 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     resultSummary: finalText.trim() ? finalText.slice(0, 500) : "[worker sem resposta final]",
   };
 
+  // 5b. critic isolado (verifier): DEPOIS da evidence deterministica do
+  // worker e ANTES do Jev. Sessao distinta (metadata jev-role=critic),
+  // read-only (permissions injectadas pelo adapter). O critic tenta
+  // FALSIFICAR o resultado: findings estruturados somente. Em timeout /
+  // falha de sessao / output invalido NAO ha retry nem segunda sessao nem
+  // finding fabricado: registra-se critic-session-outcome=fail (bounded) e o
+  // fluxo SEGUE ate o Jev — o gate deterministico existente no kernel impede
+  // que esse fail seja convertido em accept/completed.
+  const criticTimeoutMs = deps.criticTimeoutMs ?? CRITIC_TIMEOUT_MS;
+  let criticSessionID: string | undefined;
+  let criticCheck: { name: string; status: "pass" | "fail"; summary?: string } = {
+    name: "critic-session-outcome",
+    status: "fail",
+    summary: "critic not executed",
+  };
+  let criticFindings: CriticFinding[] = [];
+  let criticProj: NonNullable<OrchestrationRunResult["critic"]> = {
+    sessionID: "",
+    agent: selection.agent,
+    model: selection.model,
+    outcome: "failed",
+    findingsCount: 0,
+  };
+  try {
+    const created = await deps.critic.createCritic({
+      agent: selection.agent,
+      model: splitModelRef(selection.model),
+      location: deps.location ? { directory: deps.location.directory } : undefined,
+      metadata: {
+        "jev-orchestration": true,
+        "jev-run-id": contract.runID,
+        "jev-round": state.round,
+        "jev-role": "critic",
+        "jev-router": "orchestration-internal",
+      },
+    });
+    const createdSessionID = created.sessionID;
+    if (!createdSessionID) throw new OrchestrationError("critic-create-failed", "createCritic nao retornou sessionID");
+    criticSessionID = createdSessionID;
+    const criticPrompt = buildCriticPrompt({
+      objective: contract.objective,
+      acceptanceCriteria: contract.acceptanceCriteria,
+      requiredEvidence: contract.requiredEvidence,
+      round: state.round,
+      maxRounds: contract.maxRounds,
+      workerOutcome: outcome,
+      resultSummary: baseEvidence.resultSummary,
+      deterministicChecks: baseEvidence.deterministicChecks,
+    });
+    await deps.critic.prompt({
+      sessionID: criticSessionID,
+      text: criticPrompt,
+      metadata: { "jev-router": "orchestration-internal", "jev-role": "critic" },
+    });
+    await withTimeout(
+      () => deps.critic.wait({ sessionID: createdSessionID }),
+      criticTimeoutMs,
+      () => deps.critic.interrupt?.({ sessionID: createdSessionID }),
+      { code: "critic-timeout", label: "critic" },
+    );
+    const cView = await deps.critic.get({ sessionID: createdSessionID });
+    const cMessages = await deps.critic.context({ sessionID: createdSessionID });
+    const raw = extractFinalAssistantText(cMessages);
+    const parsed = parseCriticOutput(raw);
+    criticProj = {
+      sessionID: criticSessionID,
+      agent: cView.agent?.trim() || selection.agent,
+      model: cView.model?.trim() || selection.model,
+      outcome: parsed.ok ? "succeeded" : "failed",
+      findingsCount: parsed.ok ? parsed.findings.length : 0,
+    };
+    if (parsed.ok) {
+      criticFindings = parsed.findings;
+      criticCheck = { name: "critic-session-outcome", status: "pass" };
+    } else {
+      criticCheck = criticOutcomeCheck("fail", parsed.summary); // classe bounded da falha
+    }
+  } catch (err) {
+    criticProj = {
+      sessionID: criticSessionID ?? "",
+      agent: selection.agent,
+      model: selection.model,
+      outcome: "failed",
+      findingsCount: 0,
+    };
+    // Sem loop, sem segunda sessao, sem finding fabricado: falha bounded, o
+    // Jev ainda recebe a evidence final (com critic-session-outcome=fail).
+    criticCheck = criticOutcomeCheck("fail", `critic ${bounded(err)}`);
+  }
+
+  const evidence: EvidencePacket = {
+    ...baseEvidence,
+    deterministicChecks: [...baseEvidence.deterministicChecks, criticCheck],
+    criticFindings,
+  };
+
   try {
     state = transitionRun(state, { type: "EVIDENCE_READY", evidence }).state;
   } catch (err) {
-    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText } });
+    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj });
   }
-  await persist(deps, "evidence-ready", contract.runID, workerSessionID, state, now());
+  await persist(deps, { kind: "evidence-ready", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
 
   // 6. judge
   let answers: unknown;
@@ -295,7 +448,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     const questions = buildRoundJudgementQuestions();
     answers = await deps.decisions.judgeRound({ state: judgementState, questions });
   } catch (err) {
-    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText } });
+    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj });
   }
 
   // 7. parse + verdict
@@ -303,7 +456,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
   try {
     verdict = parseRoundVerdict(answers);
   } catch (err) {
-    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText } });
+    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj });
   }
 
   // 8. apply
@@ -312,9 +465,9 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     transition = transitionRun(state, { type: "VERDICT_RECEIVED", verdict });
     state = transition.state;
   } catch (err) {
-    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, verdict });
+    return await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, verdict });
   }
-  await persist(deps, "verdict-applied", contract.runID, workerSessionID, state, now());
+  await persist(deps, { kind: "verdict-applied", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
 
   const pendingCommands: string[] = state.phase === "completed" ? [] : transition.commands.map((c) => c.type);
   return {
@@ -323,6 +476,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     round: state.round,
     selection,
     worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+    critic: criticProj,
     evidence,
     verdict,
     pendingCommands,

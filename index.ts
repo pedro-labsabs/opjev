@@ -13,6 +13,7 @@ import { buildDecisionRecord, sanitizeState } from "./src/sanitize.ts";
 import { buildToolRecoverQuestions } from "./src/jev-client.ts";
 import {
   runOrchestrationOnce,
+  type CriticRuntime,
   type DispatcherDecisions,
   type DispatcherDeps,
   type OrchestrationRunResult,
@@ -20,9 +21,13 @@ import {
   type WorkerSessionView,
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
+import { buildCriticPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
+  buildCriticContextInstruction,
   buildWorkerContextInstruction,
+  hasInternalCriticPromptMarker,
   hasInternalPromptMarker,
+  isInternalCriticSession,
   isInternalWorkerSession,
 } from "./src/worker-hooks.ts";
 
@@ -388,15 +393,18 @@ function orchestrationModelOf(info: any): string | undefined {
   return undefined;
 }
 
-/** Sessao e worker de orchestration? Marker confiavel: metadata da sessao OU do prompt. */
-async function isOrchestrationWorker(ctx: any, sessionID: string, event: any): Promise<boolean> {
-  if (hasInternalPromptMarker(event?.metadata) || hasInternalPromptMarker(event?.prompt?.metadata)) return true;
-  if (!sessionID) return false;
+/** Papel interno de orchestration (worker|critic|null). Marker confiavel: metadata da sessao OU do prompt. */
+async function orchestrationRoleOf(ctx: any, sessionID: string, event: any): Promise<"worker" | "critic" | null> {
+  if (hasInternalPromptMarker(event?.metadata) || hasInternalPromptMarker(event?.prompt?.metadata)) return "worker";
+  if (hasInternalCriticPromptMarker(event?.metadata) || hasInternalCriticPromptMarker(event?.prompt?.metadata)) return "critic";
+  if (!sessionID) return null;
   try {
     const info: any = await ctx.session.get({ sessionID });
-    return isInternalWorkerSession(info?.metadata);
+    if (isInternalWorkerSession(info?.metadata)) return "worker";
+    if (isInternalCriticSession(info?.metadata)) return "critic";
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -412,6 +420,54 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
         throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
+      }
+      return { sessionID };
+    },
+    async prompt({ sessionID, text, metadata }) {
+      await ctx.session.prompt({ sessionID, text, metadata });
+    },
+    async wait({ sessionID }) {
+      await ctx.session.wait({ sessionID });
+    },
+    async get({ sessionID }): Promise<WorkerSessionView> {
+      const info: any = await ctx.session.get({ sessionID });
+      return {
+        agent: orchestrationAgentOf(info),
+        model: orchestrationModelOf(info),
+        outcome: info?.outcome,
+        metadata: info?.metadata,
+      };
+    },
+    async context({ sessionID }) {
+      const out: any = await ctx.session.context({ sessionID });
+      return Array.isArray(out) ? out : [];
+    },
+    async interrupt({ sessionID }) {
+      await ctx.session.interrupt?.({ sessionID });
+    },
+  };
+}
+
+/**
+ * Runtime do critic: mesma API de sessao, mas a criacao injeta as permission
+ * rules read-only (buildCriticPermissionRules) no `ctx.session.create` do
+ * critic. Enforcement e do runtime OpenCode; o adapter apenas declara a
+ * policy. O worker (makeWorkerRuntime) NUNCA recebe permission rules —
+ * cria sem o campo, entao nao herda restricao do critic.
+ */
+function makeCriticRuntime(ctx: any): CriticRuntime {
+  return {
+    async createCritic(input) {
+      const info: any = await ctx.session.create({
+        agent: input.agent,
+        model: input.model,
+        location: input.location,
+        metadata: input.metadata,
+        permissions: buildCriticPermissionRules(),
+      });
+      const sessionID = String(info?.id ?? "");
+      if (!sessionID) {
+        throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
       }
       return { sessionID };
     },
@@ -507,7 +563,7 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
 /** Persistencia minima bounded: orchestration/run/<runID>. Best-effort. */
 async function persistOrchestrationRun(
   ctx: any,
-  input: { kind: string; runID: string; workerSessionID?: string; state: any; at: number },
+  input: { kind: string; runID: string; workerSessionID?: string; criticSessionID?: string; state: any; at: number },
 ): Promise<void> {
   const key = `orchestration/run/${input.runID}`;
   const prior: any = await safeStorageGet(ctx, key);
@@ -515,6 +571,7 @@ async function persistOrchestrationRun(
     ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior : {}),
     state: input.state,
     workerSessionID: input.workerSessionID,
+    criticSessionID: input.criticSessionID,
     updatedAt: input.at,
   });
 }
@@ -523,6 +580,7 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
   const dir = orchestrationDirectory(ctx);
   return {
     runtime: makeWorkerRuntime(ctx),
+    critic: makeCriticRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
@@ -1181,15 +1239,14 @@ export default Plugin.define({
         const sessionID = String(event?.sessionID ?? "");
         const text = String(event?.prompt?.text ?? "");
 
-        // Worker interno de orchestration: bypass TOTAL do auto-routing. A
-        // decisao de executor (agent/model) ja foi tomada pelo dispatcher; uma
-        // segunda rota aqui violaria a arquitetura (Jev decide -> worker executa
-        // -> Jev julga). Nunca decidir, nunca trocar agent/model.
-        if (await isOrchestrationWorker(ctx, sessionID, event)) {
+        // Sessao interna de orchestration: bypass TOTAL do auto-routing.
+        // Worker e critic ja tem papel definido pelo dispatcher; nunca rerrotear.
+        const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
+        if (orchestrationRole) {
           event.metadata = {
             ...event.metadata,
             "jev-router": "orchestration-internal",
-            "jev-role": "worker",
+            "jev-role": orchestrationRole,
           };
           return;
         }
@@ -1290,13 +1347,20 @@ export default Plugin.define({
       await ctx.session.hook("context", async (event: any) => {
         const sessionID = String(event?.sessionID ?? "");
 
-        // Worker interno de orchestration: instrucao de TRABALHADOR (executa o
-        // contrato, nao decide executor, nao julga, nao consulta o Jev). O
-        // dispatcher ja decidiu; o worker so executa. Sem pending recovery.
-        if (await isOrchestrationWorker(ctx, sessionID, event)) {
+        // Sessao interna de orchestration recebe instrucao especifica do papel.
+        // Worker executa; critic verifica read-only. Nenhum deles rerroteia.
+        const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
+        if (orchestrationRole === "worker") {
           event.system.push({
             type: "text",
             text: buildWorkerContextInstruction(),
+          });
+          return;
+        }
+        if (orchestrationRole === "critic") {
+          event.system.push({
+            type: "text",
+            text: buildCriticContextInstruction(),
           });
           return;
         }
