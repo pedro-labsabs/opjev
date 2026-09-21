@@ -4,7 +4,7 @@
 //   HUMAN1-8  -> kernel: HumanRequest no estado de pausa + HumanDecision bounded
 //   HUMA1     -> auditoria humanDecision na history projetada (sem crescimento)
 //   PAUSE1    -> pausa persiste checkpoint human-awaiting e expoe pendingHuman
-//   RESUME1-11/9b -> retomada (preservacao de switch, instrucao bounded,
+//   RESUME1-12/9b -> retomada (preservacao de switch, instrucao bounded,
 //                validacao do estado persistido, storage-truth na falha,
 //                sem createRunState/selectExecutor, checkpoints, ordem,
 //                stop, duplicata/stale, frescor de sessao)
@@ -130,6 +130,9 @@ function makeDeps(over = {}) {
     createWorker: async () => {
       effects.push("create");
       if (over.createError) throw over.createError;
+      if (over.createErrorAt !== undefined && workerSeq + 1 >= over.createErrorAt) {
+        throw over.createError ?? new Error("createWorker quebrou na retomada");
+      }
       workerSeq += 1;
       const ids = over.workerSessionIDs ?? [];
       return { sessionID: ids[workerSeq - 1] ?? `w${workerSeq}` };
@@ -763,7 +766,7 @@ describe("RESUME: runOrchestrationResume (scheduler compartilhado, seam unico)",
     assert.equal(state.history.length, 1, "fixture tem a rodada pre-pausa");
     const res = await resume(t, state, resumeDecision(state));
     assert.equal(res.phase, "completed");
-    assert.equal(res.round, 2, "round 2 vem do estado persistido (createRestarteria round 1)");
+    assert.equal(res.round, 2, "round 2 vem do estado persistido (createRunState daria round 1)");
     assert.equal(res.selection, undefined, "resume nunca reseleciona executor");
     assert.equal(res.history.length, 2, "history preservada + nova rodada");
     assert.equal(res.history[0].round, 1, "rodada pre-pausa preservada (nunca history restart)");
@@ -898,6 +901,38 @@ describe("RESUME: runOrchestrationResume (scheduler compartilhado, seam unico)",
     assert.equal(last.workerSessionID, "w2", "checkpoint carrega a worker da rodada que falhou");
     assert.equal(last.criticSessionID, "c2", "checkpoint carrega o critic da rodada que falhou");
     assert.equal(last.state.round, 2, "round da falha preservada");
+  });
+
+  it("RESUME12: createWorker/executor canonico fora do pool falham POS-resume -> run-failed e a ultima verdade", async () => {
+    // (a) createWorker quebra na rodada retomada: a autoridade (human-decision,
+    // phase ready) ja foi aplicada; a ultima verdade do store NUNCA pode
+    // permanecer ready quando a API falhou.
+    const a = await pausedRun({ maxRounds: 3, judgeSeq: [humanAnswers()], createErrorAt: 2 });
+    const resA = await resume(a.t, a.state, resumeDecision(a.state));
+    assert.equal(resA.phase, "failed");
+    assert.ok(resA.error && resA.error.includes("createWorker quebrou na retomada"), resA.error);
+    const kindsA = a.t.persistCalls.map((c) => c.kind);
+    const hdA = kindsA.indexOf("human-decision");
+    assert.ok(hdA >= 0, "decisao persistida antes do scheduler");
+    const lastA = a.t.persistCalls[a.t.persistCalls.length - 1];
+    assert.equal(lastA.kind, "run-failed");
+    assert.equal(lastA.state.phase, "failed");
+    assert.ok(
+      !a.t.persistCalls.some((c, i) => i > hdA && c.state.phase === "ready"),
+      "nenhuma escrita ready apos a decisao quando a retomada falha",
+    );
+
+    // (b) executor canonico com model fora do FREE_POOL (estado pausado
+    // corrompido/stale): validacao de forma passa, mas o dispatcher falha
+    // bounded ANTES da worker — e tambem persiste run-failed.
+    const b = await pausedRun({ maxRounds: 3, judgeSeq: [humanAnswers()] });
+    const tampered = { ...b.state, executor: { agent: "build", model: "openai/gpt-4o" } };
+    const resB = await resume(b.t, tampered, resumeDecision(tampered));
+    assert.equal(resB.phase, "failed");
+    assert.ok(resB.error && resB.error.includes("FREE_POOL"), resB.error);
+    const lastB = b.t.persistCalls[b.t.persistCalls.length - 1];
+    assert.equal(lastB.kind, "run-failed");
+    assert.equal(lastB.state.phase, "failed");
   });
 });
 

@@ -599,10 +599,10 @@ async function executeSchedule(
         recoveryModel = rec.model;
         recoverySessionID = rec.sessionID;
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
       if (mode === "repair-same" && !recoverySessionID) {
-        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado")) };
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado"), undefined, { deps, kind: "run-failed" }) };
       }
     }
 
@@ -619,6 +619,8 @@ async function executeSchedule(
             state,
             contract.runID,
             new OrchestrationError("initial-no-selection", "mode initial exige selection do Jev"),
+            undefined,
+            { deps, kind: "run-failed" },
           ),
         };
       }
@@ -636,7 +638,7 @@ async function executeSchedule(
         roundAgent = rec.agent;
         roundModel = rec.model;
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
     } else if (mode === "human-resume") {
       // Retomada por decisao humana (#12): EXCLUSIVAMENTE o executor canonico
@@ -648,12 +650,12 @@ async function executeSchedule(
         roundAgent = rec.agent;
         roundModel = rec.model;
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
     } else {
       const target = prev?.switchTo;
       if (!target || typeof target.agent !== "string" || !target.agent.trim() || typeof target.model !== "string" || !target.model.trim()) {
-        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("switch-no-selection", `round ${mode} sem executor selecionado pelo Jev`)) };
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("switch-no-selection", `round ${mode} sem executor selecionado pelo Jev`), undefined, { deps, kind: "run-failed" }) };
       }
       roundAgent = target.agent;
       roundModel = target.model;
@@ -685,7 +687,7 @@ async function executeSchedule(
         workerSessionID = created.sessionID;
         if (!workerSessionID) throw new OrchestrationError("worker-create-failed", "createWorker nao retornou sessionID");
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
       if (mode !== "initial" && usedWorkerSessions.has(workerSessionID)) {
         // fresh-same / switch-* / replan / human-resume: sessao precisa ser
@@ -1091,6 +1093,12 @@ async function executeSchedule(
             `verdict ${firstCommand} sob throttle global observavel — nenhuma nova worker, sem storm (evidencia: ${out.evidence.resultSummary.slice(0, 160)})`,
           ),
           { worker: last.worker, critic: last.critic, evidence: out.evidence, verdict: out.verdict, rounds },
+          {
+            deps,
+            kind: "run-failed",
+            workerSessionID: last.worker.sessionID,
+            criticSessionID: last.critic.sessionID,
+          },
         );
       }
       // Attempt history canonica (item #8/#10): a rodada que falhou ja entrou
@@ -1146,6 +1154,11 @@ async function executeSchedule(
           evidence: out.evidence,
           verdict: out.verdict,
           rounds,
+        }, {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last.worker.sessionID,
+          criticSessionID: last.critic.sessionID,
         });
       }
     }

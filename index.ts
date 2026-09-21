@@ -1470,6 +1470,13 @@ export default Plugin.define({
             if (!callerSessionID) {
               return { content: "orchestrate_resume: contexto do chamador ausente — Tool.Context.sessionID obrigatorio" };
             }
+            // Leitura da sessao e OBRIGATORIA: falha de leitura nunca vira
+            // "humano" (fail-closed no gate de autoridade — guard minimo).
+            try {
+              await ctx.session.get({ sessionID: callerSessionID });
+            } catch {
+              return { content: "orchestrate_resume: contexto do chamador nao verificavel — falha ao ler a sessao" };
+            }
             // 3. Worker/critic/orchestrator internos nunca decidem o gate humano.
             const role = await orchestrationRoleOf(ctx, callerSessionID, context ?? {});
             if (role) {
