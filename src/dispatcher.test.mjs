@@ -2221,6 +2221,66 @@ describe("orchestrator role/isolation pura (ORCH2/ORCH4-text/ORCH5)", () => {
   });
 });
 
+// ─────────────────────────── ORCH hooks adapter (ORCH3/ORCH4) + DESC2 ───────────────────────────
+
+describe("orchestrator hooks no adapter (ORCH3/ORCH4-adapter)", () => {
+  const orchMeta = () => ({
+    "jev-orchestration": true, "jev-run-id": "s1", "jev-round": 2,
+    "jev-role": "orchestrator", "jev-router": "orchestration-internal",
+  });
+
+  it("ORCH3: prompt hook NAO rerroteia orchestrator (bypass total)", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const info = await m.ctx.session.create({
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      metadata: orchMeta(),
+    });
+    const ev = { sessionID: info.id, prompt: { text: "propose a revised contract", metadata: {} }, metadata: {}, delivery: {} };
+    await m.hooks.session.prompt(ev);
+    assert.equal(ev.metadata["jev-router"], "orchestration-internal", "bypass marca router interno");
+    assert.equal(ev.metadata["jev-role"], "orchestrator", "papel preservado");
+    assert.equal(ev.metadata["jev-agent"], undefined, "sem agente roteado");
+    assert.equal(ev.metadata["jev-route"], undefined, "sem rota decidida");
+  });
+
+  it("ORCH4-adapter: context hook injeta instrucao do orchestrator (sem Jev normal)", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const info = await m.ctx.session.create({
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      metadata: orchMeta(),
+    });
+    const ev = { sessionID: info.id, agent: "build", model: { providerID: "opencode", id: "big-pickle" }, system: [], messages: [], tools: {}, options: {} };
+    await m.hooks.session.context(ev);
+    assert.equal(ev.system.length, 1, "so a instrucao do papel");
+    assert.ok(ev.system[0].text.includes("propose a revised ExecutionContract"), "instrucao do orchestrator");
+    assert.ok(!ev.system[0].text.includes("decision boundaries"), "NAO e a instrucao normal (sem Jev)");
+  });
+});
+
+describe("tool orchestrate_once: public description reflete #11 (DESC2)", () => {
+  it("DESC2: descricao informa replan (orchestrator + revised + nova rodada) e human boundary", async () => {
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+    });
+    const desc = String(m.tools.orchestrate_once.description ?? "");
+    assert.match(desc, /replan.{0,160}orchestrator/i, "replan via orchestrator documentado");
+    assert.match(desc, /replan.{0,200}nova rodada/i, "nova rodada pos-replan documentada");
+    assert.ok(desc.includes("human"), "human continua boundary documentado");
+  });
+});
+
 // ─────────────────────────── RCV. runtime recovery: repair-same / fresh-same ───────────────────────────
 
 describe("runtime recovery same-executor: repair-same e fresh-same (multi-round bounded)", () => {

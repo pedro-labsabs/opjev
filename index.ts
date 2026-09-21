@@ -1316,7 +1316,9 @@ export default Plugin.define({
           "(repair-same reutiliza a MESMA worker session; fresh-same cria sessao NOVA, mesmo agent/model), sempre com critic " +
           "novo, ate accept/stop ou o limite maxRounds (kernel). Apos verdict switch-model/switch-agent, o Jev seleciona o " +
           "novo executor entre candidatos validos e uma NOVA rodada e executada automaticamente (nova worker session, mesmo " +
-          "agent/model conforme o switch, critic novo). Demais acoes (replan/human) param no boundary e voltam como " +
+          "agent/model conforme o switch, critic novo). Apos verdict replan, um orchestrator read-only propoe UM revised " +
+          "ExecutionContract (kernel valida: mesmo runID, sem aumento de maxRounds) e uma NOVA rodada executa o contrato " +
+          "revisado em nova worker session, com critic novo. Demais acoes (human) param no boundary e voltam como " +
           "pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
