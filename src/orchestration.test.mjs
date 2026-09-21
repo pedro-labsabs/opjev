@@ -893,7 +893,7 @@ describe("state machine: replan instala contrato revisado", () => {
     const revised = contract({ maxRounds: 2, objective: "Reimplementar auth com nova arquitetura" });
     const r2 = transitionRun(r.state, { type: "CONTRACT_READY", contract: revised });
     assert.equal(r2.state.phase, "ready");
-    assert.deepEqual(r2.commands, [{ type: "dispatch", mode: "initial" }]);
+    assert.deepEqual(r2.commands, [{ type: "dispatch", mode: "replan" }], "#11: revised declara replan, nunca initial");
     assert.equal(r2.state.round, 2, "replan nao reinicia o round");
     assert.equal(r2.state.contract.objective, "Reimplementar auth com nova arquitetura", "contrato revisado instalado");
     assert.equal(r2.state.contract.runID, "run-1", "runID preservado");
@@ -1103,8 +1103,10 @@ describe("state machine: transicoes invalidas falham deterministicamente", () =>
     expectErr(() => transitionRun(failed, { type: "EVIDENCE_READY", evidence: evidence({ round: 1 }) }), "invalid-transition");
   });
 
-  it("planning + COMMAND_FAILED falha (nenhum comando pendente)", () => {
-    expectErr(() => transitionRun(planningState(contract()), { type: "COMMAND_FAILED", command: "dispatch" }), "invalid-transition");
+  it("planning + COMMAND_FAILED falha bounded (#11: sem run preso em planning)", () => {
+    const r = transitionRun(planningState(contract()), { type: "COMMAND_FAILED", command: "replan", error: "orchestrator falhou" });
+    assert.equal(r.state.phase, "failed");
+    assert.ok(String(r.state.lastError).includes("orchestrator falhou"));
   });
 
   it("VERDICT_RECEIVED com verdict inconsistente falha (invalid-verdict)", () => {
@@ -1175,5 +1177,63 @@ describe("o kernel nao conhece ctx nem runtime", () => {
     for (const action of NEXT_ACTIONS) {
       assert.ok(["accept", "repair-same", "fresh-same", "switch-model", "switch-agent", "replan", "human", "stop"].includes(action));
     }
+  });
+});
+// ─────────────────────── replan lifecycle #11 (RP1/RP2/RP7/RP8) ───────────────────────
+
+describe("state machine: replan lifecycle #11", () => {
+  const REPLAN = verdict({ done: false, failureClass: "bad-contract", sameExecutorCanRepair: false, nextAction: "replan" });
+
+  it("RP1: replan preserva agent/model canonicos mas DESCARTA sessionID", async () => {
+    const s = evaluateState(contract({ maxRounds: 3 }));
+    assert.deepEqual(s.executor, { agent: "build", model: "opencode/big-pickle", sessionID: "s1" }, "setup: executor completo");
+    const r = transitionRun(s, { type: "VERDICT_RECEIVED", verdict: REPLAN });
+    assert.equal(r.state.phase, "planning");
+    assert.equal(r.state.round, 2);
+    assert.deepEqual(r.commands, [{ type: "replan" }]);
+    assert.deepEqual(
+      r.state.executor,
+      { agent: "build", model: "opencode/big-pickle" },
+      "agent/model preservados, sessionID descartada (proxima worker sera fresh)",
+    );
+  });
+
+  it("RP2: CONTRACT_READY revised declara dispatch=replan (nunca initial)", async () => {
+    const s = transitionRun(evaluateState(contract({ maxRounds: 3 })), { type: "VERDICT_RECEIVED", verdict: REPLAN }).state;
+    const revised = contract({ objective: "Reimplementar auth com nova arquitetura" });
+    const r = transitionRun(s, { type: "CONTRACT_READY", contract: revised });
+    assert.equal(r.state.phase, "ready");
+    assert.equal(r.state.round, 2, "round nao reseta");
+    assert.deepEqual(r.commands, [{ type: "dispatch", mode: "replan" }], "dispatch declara replan, nao initial");
+    assert.equal(r.state.contract.objective, "Reimplementar auth com nova arquitetura");
+  });
+
+  it("RP7: history audita contractRevision no entry do verdict replan", async () => {
+    const s = transitionRun(evaluateState(contract({ maxRounds: 3 })), { type: "VERDICT_RECEIVED", verdict: REPLAN }).state;
+    const revised = contract({ objective: "Reimplementar auth com nova arquitetura", maxRounds: 2 });
+    const r = transitionRun(s, { type: "CONTRACT_READY", contract: revised });
+    const last = r.state.history[r.state.history.length - 1];
+    assert.equal(last.round, 1, "revisao associada ao entry da rodada julgada");
+    assert.equal(last.verdict?.nextAction, "replan");
+    assert.ok(last.contractRevision, "contractRevision presente");
+    assert.equal(last.contractRevision.from.objective, "Implementar o modulo de auth");
+    assert.equal(last.contractRevision.to.objective, "Reimplementar auth com nova arquitetura");
+    assert.ok(Array.isArray(last.contractRevision.changedFields), "changedFields e lista");
+    assert.ok(last.contractRevision.changedFields.includes("objective"), "objective listado como alterado");
+    assert.ok(last.contractRevision.changedFields.includes("maxRounds"), "maxRounds listado como alterado");
+    for (const f of last.contractRevision.changedFields) {
+      assert.ok(
+        ["objective", "scope", "constraints", "acceptanceCriteria", "requiredEvidence", "maxRounds"].includes(f),
+        `changedField conhecido: ${f}`,
+      );
+    }
+  });
+
+  it("RP8: COMMAND_FAILED em planning falha bounded (sem run preso em planning)", async () => {
+    const s = transitionRun(evaluateState(contract({ maxRounds: 3 })), { type: "VERDICT_RECEIVED", verdict: REPLAN }).state;
+    assert.equal(s.phase, "planning");
+    const r = transitionRun(s, { type: "COMMAND_FAILED", command: "replan", error: "orchestrator output invalido" });
+    assert.equal(r.state.phase, "failed");
+    assert.ok(String(r.state.lastError).includes("orchestrator output invalido"), "erro bounded registrado");
   });
 });

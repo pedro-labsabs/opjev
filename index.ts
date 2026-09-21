@@ -17,11 +17,12 @@ import {
   type DispatcherDecisions,
   type DispatcherDeps,
   type OrchestrationRunResult,
+  type OrchestratorRuntime,
   type WorkerRuntime,
   type WorkerSessionView,
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
-import { buildCriticPermissionRules } from "./src/orchestration/readonly-policy.ts";
+import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -34,10 +35,13 @@ import { attemptKey } from "./src/orchestration/dispatcher.ts";
 import type { AgentCatalogEntry } from "./src/orchestration/agent-catalog.ts";
 import {
   buildCriticContextInstruction,
+  buildOrchestratorContextInstruction,
   buildWorkerContextInstruction,
   hasInternalCriticPromptMarker,
+  hasInternalOrchestratorPromptMarker,
   hasInternalPromptMarker,
   isInternalCriticSession,
+  isInternalOrchestratorSession,
   isInternalWorkerSession,
 } from "./src/worker-hooks.ts";
 
@@ -464,14 +468,16 @@ function orchestrationModelOf(info: any): string | undefined {
 }
 
 /** Papel interno de orchestration (worker|critic|null). Marker confiavel: metadata da sessao OU do prompt. */
-async function orchestrationRoleOf(ctx: any, sessionID: string, event: any): Promise<"worker" | "critic" | null> {
+async function orchestrationRoleOf(ctx: any, sessionID: string, event: any): Promise<"worker" | "critic" | "orchestrator" | null> {
   if (hasInternalPromptMarker(event?.metadata) || hasInternalPromptMarker(event?.prompt?.metadata)) return "worker";
   if (hasInternalCriticPromptMarker(event?.metadata) || hasInternalCriticPromptMarker(event?.prompt?.metadata)) return "critic";
+  if (hasInternalOrchestratorPromptMarker(event?.metadata) || hasInternalOrchestratorPromptMarker(event?.prompt?.metadata)) return "orchestrator";
   if (!sessionID) return null;
   try {
     const info: any = await ctx.session.get({ sessionID });
     if (isInternalWorkerSession(info?.metadata)) return "worker";
     if (isInternalCriticSession(info?.metadata)) return "critic";
+    if (isInternalOrchestratorSession(info?.metadata)) return "orchestrator";
     return null;
   } catch {
     return null;
@@ -554,6 +560,54 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
       await ctx.session.wait({ sessionID });
     },
     async get({ sessionID }): Promise<WorkerSessionView> {
+      const info: any = await ctx.session.get({ sessionID });
+      return {
+        agent: orchestrationAgentOf(info),
+        model: orchestrationModelOf(info),
+        outcome: info?.outcome,
+        metadata: info?.metadata,
+      };
+    },
+    async context({ sessionID }) {
+      const out: any = await ctx.session.context({ sessionID });
+      return Array.isArray(out) ? out : [];
+    },
+    async interrupt({ sessionID }) {
+      await ctx.session.interrupt?.({ sessionID });
+    },
+  };
+}
+
+/**
+ * Runtime do orchestrator (#11): sessao dedicada de logical role orchestrator.
+ * Canonical agent/model vindos do dispatcher (nunca selection hardcoded, nunca
+ * escolha do planner); location atual; read-only (mesmo envelope do critic,
+ * com execute=deny contra tools.jev.* e recursao); metadata com jev-role
+ * orchestrator + jev-agent-role orchestrator. Nao registra agent novo.
+ */
+function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
+  return {
+    async createOrchestrator(input) {
+      const info: any = await ctx.session.create({
+        agent: input.agent,
+        model: input.model,
+        location: input.location,
+        metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "orchestrator" },
+        permissions: buildOrchestratorPermissionRules(),
+      });
+      const sessionID = String(info?.id ?? "");
+      if (!sessionID) {
+        throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
+      }
+      return { sessionID };
+    },
+    async prompt({ sessionID, text, metadata }) {
+      await ctx.session.prompt({ sessionID, text, metadata });
+    },
+    async wait({ sessionID }) {
+      await ctx.session.wait({ sessionID });
+    },
+    async get({ sessionID }) {
       const info: any = await ctx.session.get({ sessionID });
       return {
         agent: orchestrationAgentOf(info),
@@ -784,6 +838,7 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
   return {
     runtime: makeWorkerRuntime(ctx),
     critic: makeCriticRuntime(ctx),
+    orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
@@ -1261,7 +1316,9 @@ export default Plugin.define({
           "(repair-same reutiliza a MESMA worker session; fresh-same cria sessao NOVA, mesmo agent/model), sempre com critic " +
           "novo, ate accept/stop ou o limite maxRounds (kernel). Apos verdict switch-model/switch-agent, o Jev seleciona o " +
           "novo executor entre candidatos validos e uma NOVA rodada e executada automaticamente (nova worker session, mesmo " +
-          "agent/model conforme o switch, critic novo). Demais acoes (replan/human) param no boundary e voltam como " +
+          "agent/model conforme o switch, critic novo). Apos verdict replan, um orchestrator read-only propoe UM revised " +
+          "ExecutionContract (kernel valida: mesmo runID, sem aumento de maxRounds) e uma NOVA rodada executa o contrato " +
+          "revisado em nova worker session, com critic novo. Demais acoes (human) param no boundary e voltam como " +
           "pendingCommands. Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
           "Contract invalido e rejeitado localmente (validateExecutionContract).",
         input: {
@@ -1450,7 +1507,8 @@ export default Plugin.define({
         const text = String(event?.prompt?.text ?? "");
 
         // Sessao interna de orchestration: bypass TOTAL do auto-routing.
-        // Worker e critic ja tem papel definido pelo dispatcher; nunca rerrotear.
+        // Worker, critic e orchestrator ja tem papel definido pelo dispatcher;
+        // nunca rerrotear.
         const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
         if (orchestrationRole) {
           event.metadata = {
@@ -1558,7 +1616,8 @@ export default Plugin.define({
         const sessionID = String(event?.sessionID ?? "");
 
         // Sessao interna de orchestration recebe instrucao especifica do papel.
-        // Worker executa; critic verifica read-only. Nenhum deles rerroteia.
+        // Worker executa; critic verifica read-only; orchestrator propoe contrato.
+        // Nenhum deles rerroteia nem consulta o Jev.
         const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
         if (orchestrationRole === "worker") {
           event.system.push({
@@ -1571,6 +1630,13 @@ export default Plugin.define({
           event.system.push({
             type: "text",
             text: buildCriticContextInstruction(),
+          });
+          return;
+        }
+        if (orchestrationRole === "orchestrator") {
+          event.system.push({
+            type: "text",
+            text: buildOrchestratorContextInstruction(),
           });
           return;
         }

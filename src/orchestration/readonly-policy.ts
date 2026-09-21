@@ -36,7 +36,13 @@ export const CRITIC_DENIED_ACTIONS = [
   "execute", // Code Mode / orchestration recursion
 ] as const;
 
-export function buildCriticPermissionRules(): readonly CriticPermissionRule[] {
+/**
+ * Envelope read-only compartilhado (#11): leitura + deny de segredos +
+ * deny HARD de toda superficie mutavel/interativa (inclui subagent e
+ * execute — sem spawn, sem recursao Code Mode). Critic e orchestrator usam
+ * EXATAMENTE a mesma policy (sem duplicacao); divergir exige teste.
+ */
+function readOnlySessionRules(): CriticPermissionRule[] {
   return [
     // 1. leitura dentro do workspace (paths location-relative => "**").
     ...CRITIC_ALLOWED_ACTIONS.map((action) => ({
@@ -55,4 +61,18 @@ export function buildCriticPermissionRules(): readonly CriticPermissionRule[] {
       effect: "deny" as const,
     })),
   ];
+}
+
+export function buildCriticPermissionRules(): readonly CriticPermissionRule[] {
+  return readOnlySessionRules();
+}
+
+/**
+ * Permissions do orchestrator (#11): planner generativo read-only, nunca
+ * executor. Mesmo envelope do critic (read/glob/grep + deny edit/shell/
+ * subagent/execute/...). Em especial execute=deny impede tools.jev.* e
+ * recursao de orchestration.
+ */
+export function buildOrchestratorPermissionRules(): readonly CriticPermissionRule[] {
+  return readOnlySessionRules();
 }
