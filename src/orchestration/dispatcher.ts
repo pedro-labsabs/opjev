@@ -220,6 +220,7 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         "jev-run-id": contract.runID,
         "jev-round": state.round,
         "jev-role": "worker",
+        "jev-router": "orchestration-internal",
       },
     });
     workerSessionID = created.sessionID;

@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin";
-import { FREE_POOL, isFreeModel, resolveOptions, splitModelRef, type FreeModel, type RouteKind } from "./src/config.ts";
+import { FREE_POOL, isFreeModel, resolveOptions, splitModelRef, type FreeModel, type RouteKind, type RouterOptions } from "./src/config.ts";
 import { resolveApiKey } from "./src/auth.ts";
 import {
   chainFor,
@@ -11,6 +11,20 @@ import {
 import { buildSnapshot, type DecisionSnapshot } from "./src/snapshot.ts";
 import { buildDecisionRecord, sanitizeState } from "./src/sanitize.ts";
 import { buildToolRecoverQuestions } from "./src/jev-client.ts";
+import {
+  runOrchestrationOnce,
+  type DispatcherDecisions,
+  type DispatcherDeps,
+  type OrchestrationRunResult,
+  type WorkerRuntime,
+  type WorkerSessionView,
+} from "./src/orchestration/dispatcher.ts";
+import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
+import {
+  buildWorkerContextInstruction,
+  hasInternalPromptMarker,
+  isInternalWorkerSession,
+} from "./src/worker-hooks.ts";
 
 // Jev como juiz-roteador (System One, nao-generativo) via OpenCode Zen,
 // para os free models do Zen. Endpoint: /zen/v1/systemone com a mesma
@@ -341,6 +355,178 @@ async function pruneKeys(ctx: any, sessionID: string, prefix: string, max: numbe
   } catch {
     // Best-effort only; non-fatal.
   }
+}
+
+// ───────────────────────── orchestration dispatcher (runtime real) ─────────────────────────
+//
+// Adaptadores do Dispatcher do Orchestration Kernel v1:
+//  - runtime: WorkerRuntime implementado com ctx.session.* (contratos reais);
+//  - decisions: DispatcherDecisions com decideRoute (selecao) + decideGeneric (julgamento);
+//  - persist: storage bounded em orchestration/run/<runID> (best-effort, nunca corrompe).
+// O dispatcher core NAO conhece ctx: aqui so se constroem os adaptadores.
+
+function orchestrationDirectory(ctx: any): string | undefined {
+  const loc = ctx?.location;
+  if (!loc) return undefined;
+  if (typeof loc === "string") return loc;
+  return typeof loc?.directory === "string" ? loc.directory : undefined;
+}
+
+function orchestrationAgentOf(info: any): string | undefined {
+  if (!info) return undefined;
+  const a = info?.agent;
+  if (typeof a === "string" && a.trim()) return a.trim();
+  if (a && typeof a?.id === "string" && a.id.trim()) return a.id.trim();
+  return undefined;
+}
+
+function orchestrationModelOf(info: any): string | undefined {
+  const m = info?.model;
+  if (!m) return undefined;
+  if (typeof m === "string" && m.trim()) return m.trim();
+  if (typeof m?.providerID === "string" && typeof m?.id === "string") return `${m.providerID}/${m.id}`;
+  return undefined;
+}
+
+/** Sessao e worker de orchestration? Marker confiavel: metadata da sessao OU do prompt. */
+async function isOrchestrationWorker(ctx: any, sessionID: string, event: any): Promise<boolean> {
+  if (hasInternalPromptMarker(event?.metadata) || hasInternalPromptMarker(event?.prompt?.metadata)) return true;
+  if (!sessionID) return false;
+  try {
+    const info: any = await ctx.session.get({ sessionID });
+    return isInternalWorkerSession(info?.metadata);
+  } catch {
+    return false;
+  }
+}
+
+function makeWorkerRuntime(ctx: any): WorkerRuntime {
+  return {
+    async createWorker(input) {
+      const info: any = await ctx.session.create({
+        agent: input.agent,
+        model: input.model,
+        location: input.location,
+        metadata: input.metadata,
+      });
+      const sessionID = String(info?.id ?? "");
+      if (!sessionID) {
+        throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
+      }
+      return { sessionID };
+    },
+    async prompt({ sessionID, text, metadata }) {
+      await ctx.session.prompt({ sessionID, text, metadata });
+    },
+    async wait({ sessionID }) {
+      await ctx.session.wait({ sessionID });
+    },
+    async get({ sessionID }): Promise<WorkerSessionView> {
+      const info: any = await ctx.session.get({ sessionID });
+      return {
+        agent: orchestrationAgentOf(info),
+        model: orchestrationModelOf(info),
+        outcome: info?.outcome,
+        metadata: info?.metadata,
+      };
+    },
+    async context({ sessionID }) {
+      const out: any = await ctx.session.context({ sessionID });
+      return Array.isArray(out) ? out : [];
+    },
+    async interrupt({ sessionID }) {
+      await ctx.session.interrupt?.({ sessionID });
+    },
+  };
+}
+
+function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDecisions {
+  return {
+    // dispatch(initial): Jev escolhe executor (agent + free model). Nunca
+    // inventado pelo dispatcher: decideRoute restringe aos candidatos validos
+    // e possui fallback deterministico (via = heuristic).
+    async selectExecutor({ contract }) {
+      const candidates = await freeCandidates(ctx);
+      const agents = await validAgents(ctx);
+      const d = await decideRoute({
+        prompt: contract.objective,
+        agent: undefined,
+        model: undefined,
+        validAgents: agents,
+        freeCandidates: candidates,
+        route: "unknown",
+        jevModel: opts.jevModel,
+        jevEndpoint: opts.jevEndpoint,
+        apiKey: await getKey(),
+        confidenceThreshold: opts.confidenceThreshold,
+        timeoutMs: opts.jevTimeoutMs,
+      });
+      // Guardrail pos-fallback (Blocker B): a saida FINAL do decideRoute e
+      // revalidada contra o catalogo runtime REAL. decideRoute() continua sendo
+      // a decision boundary; o adapter apenas aplica guardrails. Se o Jev
+      // falhou, heuristicRoute() pode ter escolhido modelo/agente fora do
+      // catalogo — nunca se deixa isso chegar ao createWorker. Nenhuma escolha
+      // alternativa e inventada aqui: selecao nao elegivel => erro bounded, o
+      // kernel falha a rodada antes de criar qualquer worker.
+      if (!isFreeModel(d.model) || !candidates.includes(d.model)) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `modelo selecionado nao elegivel no catalogo runtime: ${d.model}`,
+        );
+      }
+      if (agents.length > 0 && !agents.some((a) => a.toLowerCase() === d.agent.toLowerCase())) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `agente selecionado nao existe no catalogo runtime: ${d.agent}`,
+        );
+      }
+      return {
+        agent: d.agent,
+        model: d.model,
+        via: d.via,
+        route: d.route,
+        confidence: d.confidence,
+        ...(d.overridden !== undefined ? { overridden: d.overridden } : {}),
+        ...(d.error ? { error: d.error } : {}),
+      };
+    },
+    // judgeRound: o Jev julga a evidencia da rodada (SystemOne, nao-generativo).
+    async judgeRound({ state, questions }) {
+      return await decideGeneric({
+        state,
+        questions,
+        jevModel: opts.jevModel,
+        jevEndpoint: opts.jevEndpoint,
+        apiKey: await getKey(),
+        timeoutMs: opts.jevTimeoutMs,
+      });
+    },
+  };
+}
+
+/** Persistencia minima bounded: orchestration/run/<runID>. Best-effort. */
+async function persistOrchestrationRun(
+  ctx: any,
+  input: { kind: string; runID: string; workerSessionID?: string; state: any; at: number },
+): Promise<void> {
+  const key = `orchestration/run/${input.runID}`;
+  const prior: any = await safeStorageGet(ctx, key);
+  await ctx.storage.set(key, {
+    ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior : {}),
+    state: input.state,
+    workerSessionID: input.workerSessionID,
+    updatedAt: input.at,
+  });
+}
+
+function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDeps {
+  const dir = orchestrationDirectory(ctx);
+  return {
+    runtime: makeWorkerRuntime(ctx),
+    decisions: makeDispatcherDecisions(ctx, opts, getKey),
+    persist: (p) => persistOrchestrationRun(ctx, p),
+    ...(dir !== undefined ? { location: { directory: dir } } : {}),
+  };
 }
 
 function errorClassOf(s: string): string {
@@ -804,6 +990,83 @@ export default Plugin.define({
           }
         },
       });
+
+      editor.add({
+        name: "orchestrate_once",
+        description:
+          "Runtime entrypoint EXPLICITO do dispatcher de orquestracao (slice UMA rodada): o Jev seleciona o executor, " +
+          "cria uma worker session OpenCode real, executa o ExecutionContract, coleta EvidencePacket e o Jev julga a " +
+          "rodada (JevVerdict). Test seam explicito — NUNCA e chamada automaticamente pelo prompt hook. " +
+          "Contract invalido e rejeitado localmente (validateExecutionContract).",
+        input: {
+          type: "object",
+          properties: {
+            contract: {
+              type: "object",
+              description:
+                "ExecutionContract bounded da rodada: runID, objective, scope (include/exclude), constraints, " +
+                "acceptanceCriteria, requiredEvidence e maxRounds.",
+              properties: {
+                runID: { type: "string", description: "Identificador unico da execucao (max 200 chars)" },
+                objective: { type: "string", description: "Objetivo da rodada (max 2000 chars)" },
+                scope: {
+                  type: "object",
+                  description: "Escopo da tarefa",
+                  properties: {
+                    include: { type: "array", items: { type: "string" }, description: "Caminhos/areas incluidas" },
+                    exclude: { type: "array", items: { type: "string" }, description: "Caminhos/areas excluidas" },
+                  },
+                  additionalProperties: false,
+                },
+                constraints: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Restricoes da execucao (max 50 itens, 500 chars cada)",
+                },
+                acceptanceCriteria: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Criterios de aceite — obrigatorio, pelo menos 1",
+                },
+                requiredEvidence: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Evidencia exigida da rodada",
+                },
+                maxRounds: {
+                  type: "integer",
+                  minimum: 1,
+                  maximum: 100,
+                  description: "Limite de rodadas (este slice executa apenas a rodada 1)",
+                },
+              },
+              required: ["runID", "objective", "acceptanceCriteria", "maxRounds"],
+              additionalProperties: false,
+            },
+          },
+          required: ["contract"],
+          additionalProperties: false,
+        },
+        options: { namespace: "jev", codemode: true },
+        execute: async (input: any) => {
+          try {
+            validateExecutionContract(input?.contract);
+          } catch (err) {
+            return { content: `orchestrate_once: contract invalido: ${err instanceof Error ? err.message : String(err)}` };
+          }
+          try {
+            const result: OrchestrationRunResult = await runOrchestrationOnce(
+              input.contract as ExecutionContract,
+              makeOrchestrationDeps(ctx, opts, getKey),
+            );
+            return { content: JSON.stringify(result) };
+          } catch (err) {
+            return {
+              content: `orchestrate_once falhou: ${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
+        },
+      });
     });
 
     // Erros materiais de tools entram no loop de decisao (observeToolError).
@@ -917,6 +1180,20 @@ export default Plugin.define({
       await ctx.session.hook("prompt", async (event: any) => {
         const sessionID = String(event?.sessionID ?? "");
         const text = String(event?.prompt?.text ?? "");
+
+        // Worker interno de orchestration: bypass TOTAL do auto-routing. A
+        // decisao de executor (agent/model) ja foi tomada pelo dispatcher; uma
+        // segunda rota aqui violaria a arquitetura (Jev decide -> worker executa
+        // -> Jev julga). Nunca decidir, nunca trocar agent/model.
+        if (await isOrchestrationWorker(ctx, sessionID, event)) {
+          event.metadata = {
+            ...event.metadata,
+            "jev-router": "orchestration-internal",
+            "jev-role": "worker",
+          };
+          return;
+        }
+
         if (!text.trim()) {
           event.metadata = { ...event.metadata, "jev-router": "skipped-empty" };
           return;
@@ -1011,6 +1288,21 @@ export default Plugin.define({
       // Observacao: o hook `context` roda na montagem do contexto do agent
       // loop, inclusive em CONTINUACOES da sessao (nao so no turno do usuario).
       await ctx.session.hook("context", async (event: any) => {
+        const sessionID = String(event?.sessionID ?? "");
+
+        // Worker interno de orchestration: instrucao de TRABALHADOR (executa o
+        // contrato, nao decide executor, nao julga, nao consulta o Jev). O
+        // dispatcher ja decidiu; o worker so executa. Sem pending recovery.
+        if (await isOrchestrationWorker(ctx, sessionID, event)) {
+          event.system.push({
+            type: "text",
+            text: buildWorkerContextInstruction(),
+          });
+          return;
+        }
+
+        // Instrucao normal para sessoes de usuario (texto atual preservado):
+        // Jev em decision boundaries, via tool `execute` em Code Mode.
         event.system.push({
           type: "text",
           text:
@@ -1024,7 +1316,7 @@ export default Plugin.define({
         });
         // Recomendacao de recuperacao do Jev (erro material em tool): entregue
         // uma unica vez e removida logo em seguida (one-shot, sem loop).
-        await injectPendingRecovery(ctx, String(event?.sessionID ?? ""), event);
+        await injectPendingRecovery(ctx, sessionID, event);
       });
     }
   },

@@ -67,6 +67,15 @@ function evidence(over = {}) {
   };
 }
 
+// Evidence SEM hard failure: unica combinacao em que o gate deterministico
+// (Blocker A) permite um veredito accept -> completed.
+const GREEN = {
+  outcome: "succeeded",
+  deterministicChecks: [{ name: "typecheck", status: "pass", summary: "ok" }],
+  criticFindings: [],
+  resultSummary: "rodada OK",
+};
+
 function expectErr(fn, code) {
   assert.throws(fn, (err) => {
     assert.equal(err?.name, "OrchestrationError", `esperava OrchestrationError, recebeu ${String(err)}`);
@@ -516,7 +525,7 @@ describe("state machine: transicoes obrigatorias", () => {
     const r3 = step({ type: "EXECUTION_FINISHED", outcome: "succeeded" });
     assert.equal(s.phase, "evaluating");
     assert.deepEqual(r3.commands, [{ type: "evaluate" }]);
-    const r4 = step({ type: "EVIDENCE_READY", evidence: evidence({ round: 1, outcome: "succeeded" }) });
+    const r4 = step({ type: "EVIDENCE_READY", evidence: evidence({ round: 1, ...GREEN }) });
     assert.equal(s.evidence.outcome, "succeeded");
     assert.deepEqual(r4.commands, []);
     const r5 = step({ type: "VERDICT_RECEIVED", verdict: verdict({ done: true, failureClass: "none", sameExecutorCanRepair: false, nextAction: "accept", confidence: 0.95 }) });
@@ -557,8 +566,8 @@ describe("state machine: rotas de VERDICT_RECEIVED", () => {
     stop: verdict({ done: false, failureClass: "missing-context", sameExecutorCanRepair: false, nextAction: "stop" }),
   };
 
-  it("accept -> completed + complete", () => {
-    const r = transitionRun(evaluateState(contract()), { type: "VERDICT_RECEIVED", verdict: V.accept });
+  it("accept -> completed + complete (exige evidence verde; hard failure nunca vira completed)", () => {
+    const r = transitionRun(evaluateState(contract(), GREEN), { type: "VERDICT_RECEIVED", verdict: V.accept });
     assert.equal(r.state.phase, "completed");
     assert.deepEqual(r.commands, [{ type: "complete" }]);
   });
@@ -674,7 +683,7 @@ describe("bounded loop: maxRounds e enforcement real", () => {
 
   it("accept no limite encerra normalmente (sem escalada)", () => {
     const c = contract({ maxRounds: 1 });
-    const s = evaluateState(c, { outcome: "succeeded" });
+    const s = evaluateState(c, GREEN);
     const r = transitionRun(s, { type: "VERDICT_RECEIVED", verdict: verdict({ done: true, failureClass: "none", sameExecutorCanRepair: false, nextAction: "accept" }) });
     assert.equal(r.state.phase, "completed");
     assert.deepEqual(r.commands, [{ type: "complete" }]);
@@ -908,7 +917,7 @@ describe("state machine: replan instala contrato revisado", () => {
     assert.equal(s.round, 2);
     s = transitionRun(s, { type: "EXECUTION_STARTED", executor: EXECUTOR }).state;
     s = transitionRun(s, { type: "EXECUTION_FINISHED", outcome: "succeeded" }).state;
-    s = transitionRun(s, { type: "EVIDENCE_READY", evidence: evidence({ round: 2, outcome: "succeeded" }) }).state;
+    s = transitionRun(s, { type: "EVIDENCE_READY", evidence: evidence({ round: 2, ...GREEN }) }).state;
     const r = transitionRun(s, { type: "VERDICT_RECEIVED", verdict: ACCEPT });
     assert.equal(r.state.phase, "completed");
     assert.equal(r.state.history.length, 2, "history registra round 1 e round 2");
@@ -1047,10 +1056,10 @@ describe("state machine: verdict nunca julga no escuro (exige evidence da rodada
     }
   });
 
-  it("fluxo correto: EXECUTION_FINISHED -> EVIDENCE_READY -> VERDICT_RECEIVED permitido", () => {
+  it("fluxo correto: EXECUTION_FINISHED -> EVIDENCE_READY -> VERDICT_RECEIVED permitido (evidence verde)", () => {
     const c = contract();
     let s = evaluatingState(c);
-    s = transitionRun(s, { type: "EVIDENCE_READY", evidence: evidence({ round: 1 }) }).state;
+    s = transitionRun(s, { type: "EVIDENCE_READY", evidence: evidence({ round: 1, ...GREEN }) }).state;
     const r = transitionRun(s, {
       type: "VERDICT_RECEIVED",
       verdict: verdict({ done: true, failureClass: "none", sameExecutorCanRepair: false, nextAction: "accept" }),
@@ -1068,7 +1077,7 @@ describe("state machine: transicoes invalidas falham deterministicamente", () =>
 
   it("completed + VERDICT_RECEIVED falha", () => {
     const c = contract();
-    const accepted = transitionRun(evaluateState(c), { type: "VERDICT_RECEIVED", verdict: verdict({ done: true, failureClass: "none", sameExecutorCanRepair: false, nextAction: "accept" }) }).state;
+    const accepted = transitionRun(evaluateState(c, GREEN), { type: "VERDICT_RECEIVED", verdict: verdict({ done: true, failureClass: "none", sameExecutorCanRepair: false, nextAction: "accept" }) }).state;
     expectErr(() => transitionRun(accepted, { type: "VERDICT_RECEIVED", verdict: verdict({ done: false, failureClass: "implementation", sameExecutorCanRepair: true, nextAction: "repair-same" }) }), "invalid-transition");
   });
 

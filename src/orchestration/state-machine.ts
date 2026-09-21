@@ -158,8 +158,25 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
       const verdict = event.verdict;
       const history = recordRound(state, verdict);
       switch (verdict.nextAction) {
-        case "accept":
+        case "accept": {
+          // Gate deterministico (Blocker A): hard deterministic failure — qualquer
+          // deterministicChecks[].status === "fail" — NUNCA pode ser aprovado por
+          // um veredito accept do Jev. O Jev continua recebendo a evidencia
+          // negativa para classificar e escolher acao (repair/fresh/switch/replan/
+          // human/stop); apenas a combinacao accept + hard failure e rejeitada
+          // aqui, deterministicamente, no kernel. "unknown" NAO conta como fail
+          // neste slice. Nenhuma acao alternativa e escolhida localmente: o kernel
+          // apenas rejeita a transicao (OrchestrationError), o dispatcher falha
+          // bounded e o resultado jamais termina em completed.
+          const hardFailure = (state.evidence?.deterministicChecks ?? []).some((ck) => ck.status === "fail");
+          if (hardFailure) {
+            throw new OrchestrationError(
+              "verdict-rejected",
+              "VERDICT accept incompativel com evidencia deterministica: deterministicChecks contem hard failure",
+            );
+          }
           return next({ phase: "completed", lastVerdict: verdict, history }, [{ type: "complete" }]);
+        }
         case "repair-same":
           // Nova rodada bounded, SEMPRE: mesma sessionID/agent/model (o executor
           // permanece no estado) mas round++ — repair-same nunca vira loop.
