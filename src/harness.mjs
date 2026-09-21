@@ -30,10 +30,20 @@ export function makeStorage(seed = {}) {
 /**
  * Cria um fake ctx do OpenCode.
  * `models`: lista de modelos disponiveis (string "provider/id" ou objetos Model.Info).
- * `agents`: lista de agentes disponiveis (strings ou {id}).
+ * `agents`: lista de agentes disponiveis (strings ou descriptors {id, name?,
+ *   mode?, description?, native?, hidden?, permissions?} no formato Agent.Info
+ *   real do OpenCode 2.0.7). Strings sao shorthand do harness e viram
+ *   `{id, name, mode: "primary", hidden: false}` — default APENAS do test
+ *   double (o runtime real sempre envia mode/required por schema; o catalogo
+ *   de producao descarta entries sem mode valido em vez de inventar).
+ *   Objetos passam adiante com defaults so de exibicao (name/description) —
+ *   mode/hidden ausentes em objeto explicito NAO sao preenchidos, para que
+ *   testes de strictness observem o comportamento real do catalogo.
  * `session`: estado inicial da sessao: { agent, model: {providerID, id} }.
  * `switchBehavior`: { switchModelError?, switchAgentError? } para injetar falhas.
  * `location`: diretorio do ctx.location (contorno do dispatcher).
+ * `agentListError`: se definido, `ctx.agent.list()` lanca esse erro
+ *   (simula API de discovery indisponivel — fallback seguro).
  * `workerBehavior`: { outcome?, messages?, waitBlocks?, outcomes?, messagesByRound?,
  *   agentByRound?, modelByRound? } para o fake runtime de worker sessions.
  *   `outcomes`/`messagesByRound`/`agentByRound`/`modelByRound` sao sequencias
@@ -47,6 +57,7 @@ export function makeStorage(seed = {}) {
 export function makeCtx({
   models = [],
   agents = ["build", "plan"],
+  agentListError = undefined,
   session = { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
   storage,
   options = {},
@@ -157,8 +168,31 @@ export function makeCtx({
     storage,
     location: loc,
     agent: {
-      list: async () =>
-        agents.map((a) => (typeof a === "string" ? { id: a, name: a } : a)),
+      list: async () => {
+        // agentListError simula discovery indisponivel (fallback seguro).
+        if (agentListError) throw agentListError;
+        return agents.map((a) => {
+          if (typeof a === "string") {
+            // Shorthand do harness (test double): primary visivel. NUNCA
+            // usado pelo catalogo de producao como inferencia de mode.
+            return { id: a, name: a, mode: "primary", hidden: false, description: "", permissions: [] };
+          }
+          return {
+            id: a?.id,
+            name: a?.name ?? a?.id,
+            description: a?.description ?? "",
+            ...(a?.mode !== undefined ? { mode: a.mode } : {}),
+            ...(a?.hidden !== undefined ? { hidden: a.hidden } : {}),
+            ...(a?.native !== undefined ? { native: a.native } : {}),
+            ...(a?.permissions !== undefined ? { permissions: a.permissions } : {}),
+            ...(a?.model !== undefined ? { model: a.model } : {}),
+          };
+        });
+      },
+      get: async ({ agentID } = {}) => {
+        const all = await ctx.agent.list();
+        return all.find((a) => String(a?.id ?? "").toLowerCase() === String(agentID ?? "").toLowerCase());
+      },
     },
     model: {
       list: async () =>

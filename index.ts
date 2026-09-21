@@ -23,6 +23,14 @@ import {
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
 import { buildCriticPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
+  buildAgentCatalog,
+  primaryEligibleAgents,
+  resolvePrimaryAgent,
+  buildImplementerPermissionRules,
+  JEV_AGENT_ROLE,
+  type AgentCatalog,
+} from "./src/orchestration/agent-catalog.ts";
+import {
   buildCriticContextInstruction,
   buildWorkerContextInstruction,
   hasInternalCriticPromptMarker,
@@ -117,6 +125,30 @@ async function validAgents(ctx: any): Promise<string[]> {
 async function isAgentAvailable(ctx: any, agent: string): Promise<boolean> {
   const list = await validAgents(ctx);
   return list.some((a) => a.toLowerCase() === agent.toLowerCase());
+}
+
+/**
+ * Descobre o Agent Catalog do runtime (Agent.Info real 2.0.7) e normaliza via
+ * buildAgentCatalog (bounded, sem inferencia). Lista vazia => catalogo vazio
+ * (nunca inventa agents). API indisponivel (throw) => fallback seguro dos
+ * built-ins comprovados build/plan (primary) — nunca IDs arbitrarios.
+ * Usado SOMENTE pelo selectExecutor da orchestration; o roteamento dos hooks
+ * interativos continua em validAgents (fora do escopo da #9).
+ */
+async function discoverAgentCatalog(ctx: any): Promise<AgentCatalog> {
+  try {
+    const listed: any = await ctx.agent.list();
+    const items: any[] = Array.isArray(listed) ? listed : (listed?.agents ?? listed?.data ?? []);
+    return buildAgentCatalog(items, "discovery");
+  } catch {
+    return buildAgentCatalog(
+      [
+        { id: "build", name: "Build", mode: "primary", hidden: false, native: true },
+        { id: "plan", name: "Plan", mode: "primary", hidden: false, native: true },
+      ],
+      "fallback",
+    );
+  }
 }
 
 function isContextOverflow(error: any): boolean {
@@ -415,7 +447,12 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
         agent: input.agent,
         model: input.model,
         location: input.location,
-        metadata: input.metadata,
+        // Logical role separada de jev-role (session kind continua worker):
+        // toda worker do dispatcher atua como implementer do ExecutionContract.
+        metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "implementer" },
+        // Implementer executa, nao delega: nega spawn arbitrario de subagents
+        // sem tocar nas demais permissoes da sessao (V2: "subagent").
+        permissions: buildImplementerPermissionRules(),
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
@@ -462,7 +499,8 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
         agent: input.agent,
         model: input.model,
         location: input.location,
-        metadata: input.metadata,
+        // Critic logico: mesma sessao kind critic, papel auditavel separado.
+        metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "critic" },
         permissions: buildCriticPermissionRules(),
       });
       const sessionID = String(info?.id ?? "");
@@ -502,13 +540,23 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
     // inventado pelo dispatcher: decideRoute restringe aos candidatos validos
     // e possui fallback deterministico (via = heuristic).
     async selectExecutor({ contract }) {
+      // #9: o Jev escolhe SOMENTE entre primary-eligiveis do catalogo runtime
+      // (mode primary|all, nunca hidden/subagent-only). Catalogo vazio =>
+      // bounded failure antes do Jev (nunca inventa agents).
+      const catalog = await discoverAgentCatalog(ctx);
+      const primaryIds = primaryEligibleAgents(catalog).map((e) => e.id);
+      if (primaryIds.length === 0) {
+        throw new OrchestrationError(
+          "invalid-selection",
+          `nenhum agente primary elegivel no catalogo runtime (entries=${catalog.entries.length}, source=${catalog.source}): Jev nao e consultado e nenhum worker e criado`,
+        );
+      }
       const candidates = await freeCandidates(ctx);
-      const agents = await validAgents(ctx);
       const d = await decideRoute({
         prompt: contract.objective,
         agent: undefined,
         model: undefined,
-        validAgents: agents,
+        validAgents: primaryIds,
         freeCandidates: candidates,
         route: "unknown",
         jevModel: opts.jevModel,
@@ -530,14 +578,23 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
           `modelo selecionado nao elegivel no catalogo runtime: ${d.model}`,
         );
       }
-      if (agents.length > 0 && !agents.some((a) => a.toLowerCase() === d.agent.toLowerCase())) {
-        throw new OrchestrationError(
-          "invalid-selection",
-          `agente selecionado nao existe no catalogo runtime: ${d.agent}`,
-        );
+      // Catalogo como autoridade final (pos-fallback Blocker B + #9): o agent
+      // final precisa existir no catalogo E ser primary. Se o Jev tentou um
+      // candidato conhecido-mas-inelegivel (ex: subagent-only), rejeita A
+      // TENTATIVA com diagnostico preciso — nunca o lane-default que a
+      // substituiu. Retorna o ID canonico do runtime (case preservado). Sem
+      // switch-agent, sem escolha alternativa — inelegivel => erro bounded.
+      const attempted: unknown = (d as { attemptedAgent?: unknown }).attemptedAgent;
+      if (typeof attempted === "string" && attempted.trim()) {
+        // Caso A — escolha EXPLICITA do Jev rejeitada pelo router: valida A
+        // TENTATIVA contra o catalogo (unknown ou inelegivel => erro bounded).
+        // Nunca mascara com o lane-default que a substituiu. Sem attemptedAgent
+        // (Caso B — heuristic apos Jev indisponivel), valida-se o final abaixo.
+        resolvePrimaryAgent(catalog, attempted);
       }
+      const entry = resolvePrimaryAgent(catalog, d.agent);
       return {
-        agent: d.agent,
+        agent: entry.id,
         model: d.model,
         via: d.via,
         route: d.route,

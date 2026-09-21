@@ -26,6 +26,8 @@ export interface RouteDecision {
   via: "jev" | "heuristic";
   error?: string;
   overridden?: boolean;
+  /** Escolha bruta do Jev quando rejeitada pelos guardrails (auditoria). */
+  attemptedAgent?: string;
 }
 
 const ROUTES: RouteKind[] = ["fast-coding", "heavy-reasoning", "research-docs"];
@@ -155,7 +157,11 @@ export async function decideRoute(input: {
     // Se o Jev nao respondeu nem agente nem modelo validos, usamos o padrao da
     // lane (deterministico) e marcamos overridden — nunca deixamos modelo/agente
     // arbitrario passar.
+    let attemptedAgent: string | undefined;
     if (!agentChoice || agentChoice.type !== "choice" || !isAgent(agentChoice.choice, validAgents)) {
+      if (agentChoice && agentChoice.type === "choice" && typeof agentChoice.choice === "string") {
+        attemptedAgent = agentChoice.choice;
+      }
       agent = route === "fast-coding" ? "build" : "plan";
       overridden = true;
     }
@@ -183,6 +189,7 @@ export async function decideRoute(input: {
       complexity,
       via: "jev",
       overridden,
+      ...(attemptedAgent !== undefined ? { attemptedAgent } : {}),
     };
   } catch (err) {
     const fallback = heuristicRoute(input.prompt);
