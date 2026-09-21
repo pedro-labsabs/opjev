@@ -174,7 +174,7 @@ export interface DispatcherDeps {
   orchestratorTimeoutMs?: number;
   location?: { directory?: string };
   persist?(input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised";
+    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised" | "run-failed";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
@@ -375,21 +375,47 @@ async function failRun(
   runID: string,
   error: unknown,
   extra?: Partial<OrchestrationRunResult>,
+  persistFailure?: {
+    deps: DispatcherDeps;
+    kind: "run-failed";
+    workerSessionID?: string;
+    criticSessionID?: string;
+    orchestratorSessionID?: string;
+  },
 ): Promise<OrchestrationRunResult> {
+  // Blocker B (#11 fix): planning tambem transita (kernel aceita COMMAND_FAILED
+  // em planning — RP8). Sem transicao quando a phase nao suporta, exatamente
+  // como antes (outros fail paths inalterados sem o 5o argumento).
+  let failed: RunState = state;
+  let failedPhase: RunState["phase"] = "failed";
   try {
-    const allowed = ["ready", "evaluating", "repairing", "awaiting-human"];
+    const allowed = ["ready", "evaluating", "repairing", "awaiting-human", "planning"];
     if (allowed.includes(state.phase)) {
       const r = transitionRun(state, { type: "COMMAND_FAILED", error: bounded(error) });
-      return { runID, phase: r.state.phase, round: state.round, pendingCommands: [], error: bounded(error), ...extra };
+      failed = r.state;
+      failedPhase = r.state.phase;
     }
   } catch { /* kernel barrier */ }
-  return { runID, phase: "failed", round: state.round, pendingCommands: [], error: bounded(error), ...extra };
+  if (persistFailure) {
+    // Estado failed persistido explicitamente: store nunca fica em planning
+    // apos failure observavel. Best-effort como os demais checkpoints.
+    await persist(persistFailure.deps, {
+      kind: persistFailure.kind,
+      runID,
+      workerSessionID: persistFailure.workerSessionID,
+      criticSessionID: persistFailure.criticSessionID,
+      orchestratorSessionID: persistFailure.orchestratorSessionID,
+      state: failed,
+      at: Date.now(),
+    });
+  }
+  return { runID, phase: failedPhase, round: failed.round, pendingCommands: [], error: bounded(error), ...extra };
 }
 
 async function persist(
   deps: DispatcherDeps,
   input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised";
+    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised" | "run-failed";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
@@ -988,6 +1014,11 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           evidence: out.evidence,
           verdict: out.verdict,
           rounds,
+        }, {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last.worker.sessionID,
+          criticSessionID: last.critic.sessionID,
         });
       }
       // Orchestrator dedicado: sessao NOVA read-only (policy no adapter).
@@ -1017,6 +1048,11 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           evidence: out.evidence,
           verdict: out.verdict,
           rounds,
+        }, {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last.worker.sessionID,
+          criticSessionID: last.critic.sessionID,
         });
       }
       // Proposta bounded (contrato VIGENTE do estado) -> parse estrito ->
@@ -1039,6 +1075,19 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           orchestratorTimeoutMs,
           () => deps.orchestrator.interrupt?.({ sessionID: orchestratorSessionID }),
         );
+        // Blocker A (#11 fix): outcome da sessao real governa. failed/
+        // interrupted NUNCA instalam residual JSON — falha bounded antes de
+        // parse/CONTRACT_READY/worker. undefined preserva compat (runtimes sem
+        // outcome); succeeded segue. get() nao vira autoridade de mais nada:
+        // nao troca agent/model/executor, nao aprova, nao corrige output.
+        const orchView = await deps.orchestrator.get({ sessionID: orchestratorSessionID });
+        const orchOutcome = orchView?.outcome;
+        if (orchOutcome === "failed" || orchOutcome === "interrupted") {
+          throw new OrchestrationError(
+            "orchestrator-session-failed",
+            `orchestrator session ${orchOutcome} (${orchestratorSessionID}): revised contract nao instalado`,
+          );
+        }
         const orchMessages = await deps.orchestrator.context({ sessionID: orchestratorSessionID });
         const revised = parseRevisedContract(extractFinalAssistantText(orchMessages));
         state = transitionRun(state, { type: "CONTRACT_READY", contract: revised }).state;
@@ -1050,6 +1099,12 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           evidence: out.evidence,
           verdict: out.verdict,
           rounds,
+        }, {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last.worker.sessionID,
+          criticSessionID: last.critic.sessionID,
+          orchestratorSessionID,
         });
       }
       mode = "replan";

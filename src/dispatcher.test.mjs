@@ -1052,7 +1052,11 @@ function fakeDeps(over = {}) {
     interrupt: async () => { effects.push("orchestrator-interrupt"); },
     ...over.orchestrator,
   };
-  return { runtime, critic, decisions, effects, promptCalls, selectModelCalls, selectAgentCalls, orchestrator, orchestratorCalls, orchestratorPromptCalls };
+  const persistCalls = [];
+  const persist = async (input) => {
+    persistCalls.push(input);
+  };
+  return { runtime, critic, decisions, effects, promptCalls, selectModelCalls, selectAgentCalls, orchestrator, orchestratorCalls, orchestratorPromptCalls, persist, persistCalls };
 }
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
@@ -3796,6 +3800,104 @@ describe("dispatcher replan runtime (REPLAN1-REPLAN6)", () => {
     assert.equal(t.selectModelCalls[0].contract.objective, "revised objective", "switch usa contrato vigente");
   });
 });
+
+// ─────────────────────────── REPLAN failure lifecycle (REPLAN7/REPLAN8) ───────────────────────────
+
+describe("replan failure lifecycle: orchestrator outcome + persisted planning failure", () => {
+  const revisedResponse = (over = {}) => JSON.stringify({
+    runID: "test-run-1",
+    objective: "revised objective",
+    scope: { include: [], exclude: [] },
+    constraints: [],
+    acceptanceCriteria: ["done"],
+    requiredEvidence: ["worker-session-outcome"],
+    maxRounds: 2,
+    ...over,
+  });
+
+  for (const badOutcome of ["failed", "interrupted"]) {
+    it(`REPLAN7: orchestrator outcome=${badOutcome} nunca instala residual valid contract`, async () => {
+      const t = fakeDeps({
+        judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+        orchestratorView: { outcome: badOutcome },
+        orchestratorResponse: revisedResponse(),
+        workerSessionIDs: ["w1", "w2"],
+        criticSessionIDs: ["c1", "c2"],
+      });
+      const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+        runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+      });
+      assert.equal(result.phase, "failed", "session failed/interrupted nao instala contrato");
+      assert.equal(t.effects.filter((e) => e === "orchestrator-create").length, 1);
+      assert.equal(t.effects.filter((e) => e === "orchestrator-get").length, 1, "get() observado");
+      assert.equal(t.effects.filter((e) => e === "create").length, 1, "zero worker round2");
+      assert.equal(t.effects.filter((e) => e === "critic-create").length, 1, "zero critic round2");
+      assert.equal(t.promptCalls.length, 1, "revised objective nunca vira active contract");
+      assert.ok(result.error && result.error.includes(badOutcome), "erro menciona o outcome");
+      assert.ok(result.error.includes("orchestrator"), "erro menciona orchestrator");
+    });
+  }
+});
+
+  it("REPLAN8: planning failure persiste failed state (nunca planning)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+      orchestratorView: { outcome: "failed" },
+      orchestratorResponse: JSON.stringify({
+        runID: "test-run-1",
+        objective: "revised objective",
+        scope: { include: [], exclude: [] },
+        constraints: [],
+        acceptanceCriteria: ["done"],
+        requiredEvidence: ["worker-session-outcome"],
+        maxRounds: 2,
+      }),
+      workerSessionIDs: ["w1", "w2"],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator, persist: t.persist,
+    });
+    assert.equal(result.phase, "failed");
+    assert.ok(t.persistCalls.length > 0, "algum checkpoint persistido");
+    const last = t.persistCalls[t.persistCalls.length - 1];
+    assert.equal(last.runID, "test-run-1", "runID preservado");
+    assert.equal(last.state.phase, "failed", "ultimo estado persistido e failed");
+    assert.notEqual(last.state.phase, "planning", "nunca deixa planning no store");
+    assert.equal(last.state.round, 2, "round aberta pelo replan preservada");
+    assert.ok(!t.persistCalls.some((p) => p.kind === "contract-revised"), "nenhum contract-revised");
+    assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhum worker round2");
+    assert.deepEqual(
+      (last.state.history ?? []).map((h) => h.round),
+      [1],
+      "history persistida contem a round julgada (convencao: result.history vazio em falha, como demais fail paths)",
+    );
+  });
+
+  it("REPLAN7b: orchestrator outcome ausente funciona (compat runtimes sem outcome)", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [replanAnswers(), acceptAnswers()],
+      orchestratorView: {},
+      orchestratorResponse: JSON.stringify({
+        runID: "test-run-1",
+        objective: "revised objective",
+        scope: { include: [], exclude: [] },
+        constraints: [],
+        acceptanceCriteria: ["done"],
+        requiredEvidence: ["worker-session-outcome"],
+        maxRounds: 2,
+      }),
+      workerSessionIDs: ["w1", "w2"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+        { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" },
+      ],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+    });
+    assert.equal(result.phase, "completed", "outcome ausente nao bloqueia");
+    assert.equal(result.rounds[1].action, "replan");
+  });
 
 // ─────────────────────────── ARC15. unknown explicit Jev agent ───────────────────────────
 
