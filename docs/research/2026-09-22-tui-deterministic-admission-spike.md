@@ -93,6 +93,7 @@ REQUEST CHANGES, `#issuecomment-5777373135`)
 | "external plugin cannot own submit" (draft §5.1, v2.0.13) | **Not reproduced.** With this harness, submit ownership works on **both** runtimes (§6.2, §10). The draft's variant-matrix failure appears harness/registration-specific; root cause not established |
 | `resume`/`noReply` "not exercised" | Now exercised: `prompt { resume:false }` and `synthetic { resume:false }` persist without parent execution on both runtimes; `noReply` confirmed absent from both binaries and from `@opencode/protocol` (§6.7) |
 | TUI→server RPC "investigated, not exercised" | Now exercised end-to-end on both runtimes (§6.6) |
+| Evidence not independently re-executed at the reviewed head | All four runs (v2.0.11 ×2, v2.0.13 ×2) were **re-executed from scratch** during final verification; original logs archived at `<harness>/prev-20260922/`; every outcome reproduced (§13) |
 
 ---
 
@@ -112,10 +113,12 @@ submit }`, a `session_prompt` slot with `mode="replace"`, and (from PR #25's
   is this legacy package, not the runtime's contract.
 - `promptAsync` / `noReply` come from the legacy `@opencode-ai/sdk` typings
   cited by PR #25 (`SessionPromptAsync`, `TuiSubmitPrompt`).
-- Static probe of the **actual binaries**: `grep -c -a -F` gives
-  `TuiPromptRef: 0`, `noReply: 0`, `promptAsync: 0` on **both** v2.0.11 and
-  v2.0.13. `session_prompt` appears 3× in each binary — exclusively as the RPC
-  method key `session_prompt: "session/prompt"`, never as a UI slot.
+- Static probe of the **actual binaries** (re-run during final verification):
+  `grep -a -o -F <sym> | wc -l` gives `TuiPromptRef: 0`, `noReply: 0`,
+  `promptAsync: 0` on **both** v2.0.11 and v2.0.13. `session_prompt` appears on
+  3 lines (6 occurrences) in each binary — every occurrence is the RPC method
+  key `session_prompt: "session/prompt"` and its aliases/usages of that key
+  (`prompt: p.session_prompt`, `request(p.session_prompt, …)`), never a UI slot.
 - The current public typings `@opencode/plugin@2.0.7` (`dist/tui/context.d.ts`)
   match the runtime surface exactly on both versions (§5).
 
@@ -152,6 +155,11 @@ binary: `options:…, get location(){…}, app:{…}, renderer:…, client:…, 
 attention:…, get theme(){…}, get themeMode(){…}, markdown:{…}, keymap:{…},
 storage:{…}, ui:{dialog, toast, format, router, panel, tabs, slot}`). No
 `prompt` member exists on either runtime.
+
+(The member list is as built by the host — the binaries contain the minified
+construction expression `ui:{dialog:l,toast:p,format:{…},router:{register(y){…}}
+…` on both versions; the full runtime enumeration above confirms the complete
+member set.)
 
 `ctx.options` was `{}` in the throwaway project (no plugin options passed).
 
@@ -250,7 +258,8 @@ accepted, `CLEANUP` on exit. TUI-side version is asserted in-process
 
 ### 6.1 Submit ownership (capability: TUI owns submit) — **PASS on both**
 
-Evidence (run 1, each runtime):
+Evidence (fresh reproduction run of 2026-09-22, each runtime; the original run
+produced the same outcome and is archived at `<harness>/prev-20260922/`):
 
 | Observation | v2.0.11 | v2.0.13 |
 | --- | --- | --- |
@@ -259,9 +268,9 @@ Evidence (run 1, each runtime):
 | Control `ctrl+g` fired when pressed | `CTRLG_FIRED n=1` | `CTRLG_FIRED n=1` |
 | Owned Enter presses | `OWNED n=3` (one per Enter) | `OWNED n=3` |
 | `keymap.active()` on composer | first entry `{"key":"enter","title":"spike enter"}` — native `Submit input` displaced | same |
-| **Suppression (orchestrate Enter at t≈6.4s)** | zero UI-session events for ≈4.3 s (6.37 → 10.65 s); UI session first created at 10.65 s only after the next dispatch (10.39 s) | same pattern: suppressed at 6.40 s, created at 10.61 s (≈4.2 s later) after dispatch at 10.41 s |
-| Text survived suppression | yes — the UI session was later created with title `SPIKE211-ORCH-MARKER ticket work` from the still-held composer text | same (markers per run) |
-| **Pass-through (`normal`)** — `dispatch("prompt.submit")` | dispatches=2 → `session.inbox.enqueued` exactly ×2 (10.84 s, 18.49 s) | dispatches=2 → enqueued ×2 (10.75 s, 18.58 s) |
+| **Suppression (orchestrate Enter at t≈6.3–6.8 s)** | zero UI-session events for ≈4.2 s (6.32 → 10.50 s); UI session first created at 10.50 s only after the next dispatch (10.34 s) | same pattern: suppressed at 6.80 s, created at 11.03 s (≈4.2 s later) after dispatch at 10.81 s |
+| Text survived suppression | yes — the UI session was later created with title `SPIKE211-ORCH-MARKER reference` from the still-held composer text | same (markers per run) |
+| **Pass-through (`normal`)** — `dispatch("prompt.submit")` | dispatches=2 → `session.inbox.enqueued` exactly ×2 (10.70 s, 18.40 s) | dispatches=2 → enqueued ×2 (11.18 s, 18.87 s) |
 | Recursion | none: `CLEANUP {owned:3, dispatched:2, ctrlG:1}` — counts match inputs exactly | identical |
 | Shadow layer (§6.3) | reachable when allowed to run | reachable |
 
@@ -284,9 +293,9 @@ Layer A returns `false` → layer B (shadowing `input.submit`) runs → returns
 
 | Observation | v2.0.11 | v2.0.13 |
 | --- | --- | --- |
-| `SHADOW_INPUT_SUBMIT` fired | yes (t=6.26 s, same tick as OWNED) | yes (t=7.20 s) |
+| `SHADOW_INPUT_SUBMIT` fired | yes (t=7.74 s, same tick as OWNED) | yes (t=6.72 s) |
 | `input` argument | **`undefined`** — no composer text | **`undefined`** |
-| Native submit afterwards | session created 6.44 s, enqueued 6.63 s, `execution.started` 6.63 s | created 7.36 s, enqueued 7.53 s, `execution.started` 7.58 s |
+| Native submit afterwards | session created 7.93 s, enqueued 8.21 s, `execution.started` 8.25 s | created 6.87 s, enqueued 7.11 s, `execution.started` 7.11 s |
 
 Even the path that replaces the native submit command receives **no text**.
 Text only becomes publicly visible after native submit (the created session /
@@ -348,7 +357,7 @@ run**, not just a window.
 | P2 | `session.prompt({ text, resume:false })` | enqueued **only** — no delivery, no execution, ever | same |
 | P3 | `session.prompt({ text, delivery:"queue", resume:false })` | enqueued only — no execution | same |
 | P4 | `session.synthetic({ text, resume:false })` | enqueued only — no execution | same |
-| P5 ×3 | `session.prompt({ text })` then immediate `session.inbox.cancel(...)` | cancel call returned OK, but `execution.started` fired in **3/3**, 0–13 ms after enqueue (delivery in the same window; execution continued despite cancel) | same — 3/3 executions started (0–1 ms after enqueue) |
+| P5 ×3 | `session.prompt({ text })` then immediate `session.inbox.cancel(...)` | cancel call returned OK, but `execution.started` fired in **3/3**, 0–2 ms after enqueue (delivery in the same window; execution continued despite cancel) | same — 3/3 executions started (0–42 ms after enqueue) |
 
 Conclusions:
 
@@ -357,7 +366,7 @@ Conclusions:
   mechanism #22 asked about (`noReply` does not exist; this is what exists).
   It is accepted and deterministic on both runtimes.
 - `inbox.cancel` after a default prompt is **not** a withdraw path: enqueue →
-  delivery → execution happens within 0–13 ms in-process (usually ≤1 ms); the
+  delivery → execution happens within 0–42 ms in-process (usually ≤1 ms); the
   cancel loses 3/3 on both runtimes and does not stop an already-started
   execution.
 - Semantics beyond the observed window (e.g., whether a `resume:false` inbox
@@ -554,14 +563,17 @@ This PR modifies no issues, PRs, or roadmap state; #13's production code,
 | `git diff --check` | clean |
 | `git status --short` | only this document modified (the pre-existing untracked `opencode.jsonc` environment file is unrelated and was left untouched) |
 
-Runtime probes backing every claim above: `tui.log` / `server.log` / `pty.out`
-(JSONL + terminal capture) from four runs (v2.0.11 ×2 — full matrix + shadow;
+Runtime probes backing every claim above: `tui.log` / `server.log` / `pty*.out`
+(JSONL + terminal capture) from **four fresh runs re-executed from scratch
+during final verification on 2026-09-22** (v2.0.11 ×2 — full matrix + shadow;
 v2.0.13 ×2 — full matrix + shadow), plus binary `grep` probes of both exact
-binaries (§2, §4). A later v2.0.11 re-run of the same harness (matrix +
-shadow, appended to a fresh `tui.log`) reproduced the headline counts exactly:
+binaries (§2, §4); the original run logs are archived at
+`<harness>/prev-20260922/`. Every headline count reproduced exactly:
 `CLEANUP {owned:3, dispatched:2, ctrlG:1}` then `{owned:1, shadowCalled:1}`;
-the same 4 rendered slot claims; P1 executed while P2/P3/P4 stayed at 0
-executions for the whole run; P5 lost 3/3.
+the same 4 distinct rendered slot claims (5 render events per run); P1
+executed while P2/P3/P4 stayed at 0 executions for the whole run; P5 lost
+3/3. The gates in the table above were re-run against this head after the
+re-execution (typecheck exit 0; 446/446 tests).
 
 ---
 
