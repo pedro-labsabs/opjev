@@ -25,6 +25,19 @@ import {
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { withResumeLock } from "./src/orchestration/resume-lock.ts";
+import { withAutoDispatchLock } from "./src/auto-dispatch-lock.ts";
+import {
+  ADMISSION_RECORDS_MAX,
+  admissionRecordKey,
+  askJevAdmission,
+  bindingStatusFromPhase,
+  buildAdmissionState,
+  buildAutomaticExecutionContract,
+  buildAutomaticTrampolinePrompt,
+  resolveAdmissionMode,
+  sessionBindingKey,
+  type AdmissionModeDecision,
+} from "./src/orchestration/admission.ts";
 import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
   buildAgentCatalog,
@@ -487,6 +500,261 @@ async function orchestrationRoleOf(ctx: any, sessionID: string, event: any): Pro
   }
 }
 
+// ───────────────────────── admissao automatica bounded (#13) ─────────────────────────
+//
+// Roda dentro do prompt hook (antes do roteamento) e adota o turno quando
+// opts.enableAutoOrchestration esta ligado. Retorna:
+//   - "handled": o hook para aqui — trampoline aplicado (orchestrate), ou
+//     linked / linked-awaiting-human, ou modalidade normal sem roteamento;
+//   - "continue": segue o fluxo atual (roteamento / G1 continuacao), com a
+//     metadata de admissao ja aplicada — ou INTACTA quando a flag esta off
+//     (comportamento EXATO do router atual).
+//
+// Budget Jev por intencao: <=1 chamada de admission; trivial/linked/
+// idempotente/awaiting-human jamais consultam o Jev. Identidade de run =
+// sessionID + messageID reais; sem messageID nao ha admissao (nunca inventar
+// identidade por hash de texto).
+
+type AutoAdmissionAction = "handled" | "continue";
+
+async function runAutoAdmission(
+  ctx: any,
+  opts: Required<RouterOptions>,
+  getKey: () => Promise<string | undefined>,
+  input: { sessionID: string; text: string; event: any },
+): Promise<AutoAdmissionAction> {
+  const { sessionID, text, event } = input;
+  const messageID = String(event?.messageID ?? "");
+  const bindMeta = (extra: Record<string, unknown>) => {
+    event.metadata = { ...event.metadata, ...extra };
+  };
+
+  // Flag desligada: nada de admission — roteamento atual intacto.
+  if (!opts.enableAutoOrchestration) return "continue";
+
+  // Sem identidade de turno real: nenhuma admissao; roteamento atual segue.
+  if (!messageID) {
+    bindMeta({
+      "jev-admission": "normal",
+      "jev-admission-reason": "sem messageID: identidade de turno inexistente (sem admissao)",
+    });
+    return "continue";
+  }
+
+  const bindingKey = sessionBindingKey(sessionID);
+  const binding: any = await safeStorageGet(ctx, bindingKey);
+
+  // Gate humano ativo primeiro: ZERO auto-resume mesmo em re-submissao do
+  // mesmo turno (prevalece sobre a idempotencia por messageID).
+  if (binding && typeof binding === "object" && !Array.isArray(binding) && typeof binding.runID === "string" && binding.runID) {
+    if (bindingStatusFromPhase(binding.phase) === "awaiting-human") {
+      // Prompt segue resolvido na sessao.
+      bindMeta({
+        "jev-admission": "linked-awaiting-human",
+        "jev-run-id": binding.runID,
+        "jev-admission-reason": `run ${binding.runID} em andamento (awaiting-human): sem auto-resume`,
+      });
+      return "handled";
+    }
+  }
+
+  const recordKey = admissionRecordKey(sessionID, messageID);
+  const priorRecord: any = await safeStorageGet(ctx, recordKey);
+  if (priorRecord && typeof priorRecord === "object" && !Array.isArray(priorRecord) && priorRecord.runID) {
+    // Re-submissao do MESMO turno (mesmo messageID): idempotente, zero Jev.
+    const contract = buildAutomaticExecutionContract({
+      sessionID,
+      messageID,
+      objective: text,
+      maxRounds: opts.autoOrchestrationMaxRounds,
+    });
+    event.prompt.text = buildAutomaticTrampolinePrompt({ objective: text, contract });
+    bindMeta({
+      "jev-admission": "orchestrate",
+      "jev-admission-via": "idempotent",
+      "jev-run-id": priorRecord.runID,
+      "jev-admission-reason": `contrato auto: ${priorRecord.runID}`,
+    });
+    return "handled";
+  }
+
+  // Binding ativo (run ja despachado e nao-terminal) bloqueia nova admissao:
+  // apenas linked. Binding meramente `admitted` (pre-dispatch) NAO bloqueia
+  // um messageID DIFERENTE — o novo turno admite um run novo (overwrite);
+  // o mesmo messageID ja foi tratado acima (idempotente).
+  if (binding && typeof binding === "object" && !Array.isArray(binding) && typeof binding.runID === "string" && binding.runID) {
+    const status = bindingStatusFromPhase(binding.phase);
+    const isAdmitted = binding.status === "admitted" || binding.phase === "admitted";
+    if (status === "completed" || status === "stopped" || status === "failed") {
+      // Binding terminal: novo turno pode admitir um run NOVO abaixo.
+    } else if (isAdmitted) {
+      // Pre-dispatch: nao bloqueia messageID novo (overwrite abaixo).
+    } else {
+      // Run ativo na sessao: sem admissao/run novo — apenas linked.
+      bindMeta({
+        "jev-admission": "linked",
+        "jev-run-id": binding.runID,
+        "jev-admission-reason": `run ${binding.runID} em andamento (${String(binding.phase ?? "running")})`,
+      });
+      return "handled";
+    }
+  }
+
+  // Follow-up trivial sem binding: sem admissao nem run (G1 continua valido).
+  if (isTrivialFollowUp(text)) {
+    bindMeta({
+      "jev-admission": "skip",
+      "jev-admission-via": "heuristic",
+      "jev-admission-reason": "trivial-follow-up sem binding: sem admissao",
+    });
+    return "continue";
+  }
+
+  // Estado bounded e REAL da sessao (agente/modelo/rota atuais; nunca conversa).
+  let snapshot: DecisionSnapshot | undefined;
+  try {
+    snapshot = await buildSnapshot(ctx, sessionID);
+  } catch {
+    snapshot = undefined;
+  }
+  const state = buildAdmissionState({
+    text,
+    agent: snapshot?.agent ?? "unknown",
+    model: snapshot?.model ? snapshot.model : "unknown",
+    routed: snapshot?.route !== undefined && snapshot.route !== "unknown",
+    route: snapshot?.route !== undefined && snapshot.route !== "unknown" ? snapshot.route : undefined,
+    trivial: false,
+  });
+  const { choice, confidence, error } = await askJevAdmission({
+    state,
+    jevModel: opts.jevModel,
+    jevEndpoint: opts.jevEndpoint,
+    apiKey: await getKey(),
+    timeoutMs: opts.jevTimeoutMs,
+  });
+  const decision = resolveAdmissionMode({
+    choice,
+    confidence,
+    confidenceThreshold: opts.confidenceThreshold,
+    fallbackRoute: opts.enableAutoRoute,
+    ...(error !== undefined ? { error } : {}),
+  });
+
+  if (decision.mode === "orchestrate") {
+    const contract = buildAutomaticExecutionContract({
+      sessionID,
+      messageID,
+      objective: text,
+      maxRounds: opts.autoOrchestrationMaxRounds,
+    });
+    event.prompt.text = buildAutomaticTrampolinePrompt({ objective: text, contract });
+    const at = Date.now();
+    await ctx.storage.set(bindingKey, {
+      version: 1,
+      sessionID,
+      messageID,
+      runID: contract.runID,
+      status: "admitted",
+      phase: "admitted",
+      updatedAt: at,
+    });
+    await ctx.storage.set(recordKey, {
+      version: 1,
+      sessionID,
+      messageID,
+      runID: contract.runID,
+      mode: decision.mode,
+      via: decision.via,
+      ...(decision.confidence !== undefined ? { confidence: decision.confidence } : {}),
+      objective: contract.objective,
+      maxRounds: contract.maxRounds,
+      status: "pending",
+      at,
+    });
+    await pruneAdmissionRecords(ctx, sessionID);
+    bindMeta({
+      "jev-admission": "orchestrate",
+      "jev-admission-via": decision.via,
+      "jev-run-id": contract.runID,
+      "jev-admission-reason": `contrato auto: ${contract.runID}`,
+    });
+    return "handled";
+  }
+
+  // route / normal (inclui fail-closed): metadata da decisao; route continua
+  // no roteamento atual, normal encerra a admissao aqui.
+  const reason = decision.reason;
+  bindMeta({
+    "jev-admission": decision.mode,
+    "jev-admission-via": decision.via,
+    ...(reason !== undefined ? { "jev-admission-reason": reason } : {}),
+    ...(decision.confidence !== undefined ? { "jev-admission-confidence": decision.confidence } : {}),
+  });
+  return decision.mode === "route" ? "continue" : "handled";
+}
+
+/** Pruning bounded dos admission records da sessao (FIFO por criacao, max 100). Best-effort. */
+async function pruneAdmissionRecords(ctx: any, sessionID: string): Promise<void> {
+  try {
+    const prefix = `orchestration/admission/${sessionID}/`;
+    const records: Array<{ key: string; at: number }> = [];
+    let after: string | undefined;
+    for (;;) {
+      const page: any = await ctx.storage.scan({ prefix, after, limit: 100 });
+      const entries: any[] = page?.entries ?? [];
+      for (const e of entries) {
+        const rec: any = e?.value ?? (await safeStorageGet(ctx, e?.key ?? ""));
+        const at = rec && typeof rec === "object" && typeof rec.at === "number" ? rec.at : 0;
+        records.push({ key: e?.key ?? "", at });
+      }
+      after = page?.next;
+      if (!after) break;
+    }
+    if (records.length > ADMISSION_RECORDS_MAX) {
+      // FIFO pela criacao (at), ausentes = os mais antigos; empates estaveis
+      // por ordem de scan. Remove os mais VELHOS — o record do turno atual
+      // (at recente) nunca e derrubado.
+      records.sort((a, b) => a.at - b.at);
+      const toRemove = records.slice(0, records.length - ADMISSION_RECORDS_MAX);
+      for (const r of toRemove) {
+        await ctx.storage.remove(r.key);
+      }
+    }
+  } catch {
+    // Best-effort only; non-fatal.
+  }
+}
+
+/**
+ * Finaliza o ciclo da admissao automatica apos o dispatch (dentro do lock):
+ * binding e admission record espelham a fase terminal real do run. Best-effort
+ * e bounded — o kernel continua a autoridade.
+ */
+async function finalizeAutoAdmission(
+  ctx: any,
+  sessionID: string,
+  runID: string,
+  messageID: string,
+  phase: string,
+): Promise<void> {
+  try {
+    const status = bindingStatusFromPhase(phase);
+    const binding: any = await safeStorageGet(ctx, sessionBindingKey(sessionID));
+    if (binding && typeof binding === "object" && !Array.isArray(binding) && binding.runID === runID) {
+      await ctx.storage.set(sessionBindingKey(sessionID), { ...binding, status, phase, updatedAt: Date.now() });
+    }
+    if (messageID) {
+      const recordKey = admissionRecordKey(sessionID, messageID);
+      const record: any = await safeStorageGet(ctx, recordKey);
+      if (record && typeof record === "object" && !Array.isArray(record) && record.runID === runID) {
+        await ctx.storage.set(recordKey, { ...record, status, phase, updatedAt: Date.now() });
+      }
+    }
+  } catch {
+    // Best-effort only; non-fatal.
+  }
+}
+
 function makeWorkerRuntime(ctx: any): WorkerRuntime {
   return {
     async createWorker(input) {
@@ -844,6 +1112,44 @@ async function persistOrchestrationRun(
     orchestratorSessionID: input.orchestratorSessionID,
     updatedAt: input.at,
   });
+  // Binding session<>run espelha a fase real do kernel a cada checkpoint:
+  // o hook de admissao le o binding para decidir linked vs nova admissao.
+  await syncBindingFromRun(ctx, input.runID, input.state?.phase);
+}
+
+/**
+ * Sincroniza o binding session<>run com a fase corrente do kernel (scaneia
+ * orchestration/session/ em busca do binding deste runID). Best-effort e
+ * determinista: fases terminais e awaiting-human viram status proprio; todo o
+ * resto permanece "running" (recusa linked enquanto ativo).
+ */
+async function syncBindingFromRun(ctx: any, runID: string, phase: unknown): Promise<void> {
+  try {
+    const prefix = "orchestration/session/";
+    const keys: string[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page: any = await ctx.storage.scan({ prefix, after, limit: 100 });
+      const entries: any[] = page?.entries ?? [];
+      for (const e of entries) keys.push(e.key);
+      after = page?.next;
+      if (!after) break;
+    }
+    for (const key of keys) {
+      const b: any = await safeStorageGet(ctx, key);
+      if (b && typeof b === "object" && !Array.isArray(b) && b.runID === runID) {
+        await ctx.storage.set(key, {
+          ...b,
+          status: bindingStatusFromPhase(phase),
+          phase,
+          updatedAt: Date.now(),
+        });
+        return;
+      }
+    }
+  } catch {
+    // Best-effort only; non-fatal.
+  }
 }
 
 function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDeps {
@@ -1389,15 +1695,56 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: "jev", codemode: true },
-        execute: async (input: any) => {
+        // context = Tool.Context REAL (nao spoofavel via input, @opencode/plugin
+        // 2.0.7): { sessionID, agent, messageID, id }. Usado apenas pelo guard
+        // de admissao automatica (#13); o seam explicito manual segue intacto.
+        execute: async (input: any, context: any) => {
           try {
             validateExecutionContract(input?.contract);
           } catch (err) {
             return { content: `orchestrate_once: contract invalido: ${err instanceof Error ? err.message : String(err)}` };
           }
           try {
+            const contract = input.contract as ExecutionContract;
+            const callerSessionID = String(context?.sessionID ?? "");
+            const binding: any = callerSessionID
+              ? await safeStorageGet(ctx, sessionBindingKey(callerSessionID))
+              : undefined;
+            // Guard de admissao: somente quando a sessao do caller tem binding
+            // para ESTE runID (caminho admitido no prompt hook). Chamadas
+            // MANUAIS do seam explicito (sem binding) usam o fluxo anterior.
+            const isAutoAdmissionCall =
+              !!binding &&
+              typeof binding === "object" &&
+              !Array.isArray(binding) &&
+              binding.runID === contract.runID;
+            if (isAutoAdmissionCall) {
+              return await withAutoDispatchLock(contract.runID, async () => {
+                // RE-READ dentro do ownership (TOCTOU #13): so o primeiro
+                // caller encontra o binding `admitted`; os demais veem o status
+                // pos-dispatch (running/completed/...) e sao rejeitados bounded.
+                const fresh: any = await safeStorageGet(ctx, sessionBindingKey(callerSessionID));
+                if (!fresh || fresh.runID !== contract.runID || fresh.status !== "admitted") {
+                  return {
+                    content: `[auto-dispatch-already-executed] run ${contract.runID} ja foi despachado nesta sessao (${String(fresh?.status ?? "sem binding")})`,
+                  };
+                }
+                const result: OrchestrationRunResult = await runOrchestrationOnce(
+                  contract,
+                  makeOrchestrationDeps(ctx, opts, getKey),
+                );
+                await finalizeAutoAdmission(
+                  ctx,
+                  callerSessionID,
+                  contract.runID,
+                  String(fresh?.messageID ?? context?.messageID ?? ""),
+                  result.phase,
+                );
+                return { content: JSON.stringify(result) };
+              });
+            }
             const result: OrchestrationRunResult = await runOrchestrationOnce(
-              input.contract as ExecutionContract,
+              contract,
               makeOrchestrationDeps(ctx, opts, getKey),
             );
             return { content: JSON.stringify(result) };
@@ -1630,108 +1977,120 @@ export default Plugin.define({
     // do prompt, persiste intention/* (o que o usuario quis) + route/*
     // (o que o Jev decidiu) e distribui via switch + metadados.
     // Falhas nunca bloqueiam o prompt.
+    // #13: o prompt hook roda SEMPRE (admissao automatica bounded nao depende
+    // de enableAutoRoute); o roteamento propriamente dito segue atras de
+    // opts.enableAutoRoute — flag desligada => caminho atual intacto.
+    await ctx.session.hook("prompt", async (event: any) => {
+      const sessionID = String(event?.sessionID ?? "");
+      const text = String(event?.prompt?.text ?? "");
+
+      // Sessao interna de orchestration: bypass TOTAL (admissao + auto-routing).
+      // Worker, critic e orchestrator ja tem papel definido pelo dispatcher;
+      // nunca rerrotear nem admitir.
+      const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
+      if (orchestrationRole) {
+        event.metadata = {
+          ...event.metadata,
+          "jev-router": "orchestration-internal",
+          "jev-role": orchestrationRole,
+        };
+        return;
+      }
+
+      if (!text.trim()) {
+        event.metadata = { ...event.metadata, "jev-router": "skipped-empty" };
+        return;
+      }
+
+      // Admissao automatica bounded (#13): so age com a flag ligada.
+      // "handled" encerra o hook aqui (trampoline orchestrar/linked/awaiting-
+      // human/normal sem roteamento); "continue" segue o fluxo atual abaixo.
+      const admissionAction = await runAutoAdmission(ctx, opts, getKey, { sessionID, text, event });
+      if (admissionAction === "handled") return;
+
+      if (!opts.enableAutoRoute) return;
+
+      const prior: RouteState | undefined = await safeStorageGet(ctx, `route/${sessionID}`);
+
+      // G1: sessao ja roteada e prompt e follow-up trivial (ok, continua...)
+      // -> mantem rota e modelo, apenas cataloga a continuacao. Sem chamada
+      // ao Jev, sem troca de modelo no meio da tarefa.
+      if (prior && isTrivialFollowUp(text)) {
+        await ctx.storage.set(`intention/${sessionID}`, {
+          text: text.slice(0, 4000),
+          route: prior.route,
+          model: prior.model,
+          agent: prior.agent,
+          via: "continuation",
+          confidence: 0,
+          at: Date.now(),
+        });
+        event.metadata = {
+          ...event.metadata,
+          "jev-router": "continuation",
+          "jev-route": prior.route,
+          "jev-model": prior.model,
+          "jev-agent": prior.agent,
+          "jev-via": "continuation",
+        };
+        return;
+      }
+
+      try {
+        // Problema 1: agente/modelo reais da sessao (via ctx.session.get),
+        // nao event?.agent (que nao existe no contrato do prompt hook).
+        const snapshot = await buildSnapshot(ctx, sessionID);
+        const candidates = await freeCandidates(ctx);
+        const agents = await validAgents(ctx);
+        const d = await decideRoute({
+          prompt: text,
+          agent: snapshot.agent,
+          model: snapshot.model !== "unknown" ? snapshot.model : undefined,
+          validAgents: agents,
+          freeCandidates: candidates,
+          route: snapshot.route,
+          jevModel: opts.jevModel,
+          jevEndpoint: opts.jevEndpoint,
+          apiKey: await getKey(),
+          confidenceThreshold: opts.confidenceThreshold,
+          timeoutMs: opts.jevTimeoutMs,
+        });
+        const intention: IntentionRecord = {
+          text: text.slice(0, 4000),
+          route: d.route,
+          model: d.model,
+          agent: d.agent,
+          via: d.via,
+          confidence: d.confidence,
+          overridden: d.overridden,
+          at: Date.now(),
+        };
+        // Mesma rota+modelo+agente da sessao -> sem switch desnecessario.
+        if (prior && prior.route === d.route && prior.model === d.model && prior.agent === d.agent) {
+          await ctx.storage.set(`intention/${sessionID}`, intention);
+          event.metadata = {
+            ...event.metadata,
+            "jev-router": "routed",
+            "jev-route": d.route,
+            "jev-model": d.model,
+            "jev-agent": d.agent,
+            "jev-via": d.via,
+            "jev-confidence": d.confidence,
+            ...(d.overridden ? { "jev-overridden": true } : {}),
+          };
+          return;
+        }
+        await applySwitch(ctx, sessionID, d.route, d.model, d.agent, d.via, intention, event);
+      } catch (err) {
+        event.metadata = {
+          ...event.metadata,
+          "jev-router": "route-failed",
+          "jev-error": err instanceof Error ? err.message : String(err),
+        };
+      }
+    });
+
     if (opts.enableAutoRoute) {
-      await ctx.session.hook("prompt", async (event: any) => {
-        const sessionID = String(event?.sessionID ?? "");
-        const text = String(event?.prompt?.text ?? "");
-
-        // Sessao interna de orchestration: bypass TOTAL do auto-routing.
-        // Worker, critic e orchestrator ja tem papel definido pelo dispatcher;
-        // nunca rerrotear.
-        const orchestrationRole = await orchestrationRoleOf(ctx, sessionID, event);
-        if (orchestrationRole) {
-          event.metadata = {
-            ...event.metadata,
-            "jev-router": "orchestration-internal",
-            "jev-role": orchestrationRole,
-          };
-          return;
-        }
-
-        if (!text.trim()) {
-          event.metadata = { ...event.metadata, "jev-router": "skipped-empty" };
-          return;
-        }
-        const prior: RouteState | undefined = await safeStorageGet(ctx, `route/${sessionID}`);
-
-        // G1: sessao ja roteada e prompt e follow-up trivial (ok, continua...)
-        // -> mantem rota e modelo, apenas cataloga a continuacao. Sem chamada
-        // ao Jev, sem troca de modelo no meio da tarefa.
-        if (prior && isTrivialFollowUp(text)) {
-          await ctx.storage.set(`intention/${sessionID}`, {
-            text: text.slice(0, 4000),
-            route: prior.route,
-            model: prior.model,
-            agent: prior.agent,
-            via: "continuation",
-            confidence: 0,
-            at: Date.now(),
-          });
-          event.metadata = {
-            ...event.metadata,
-            "jev-router": "continuation",
-            "jev-route": prior.route,
-            "jev-model": prior.model,
-            "jev-agent": prior.agent,
-            "jev-via": "continuation",
-          };
-          return;
-        }
-
-        try {
-          // Problema 1: agente/modelo reais da sessao (via ctx.session.get),
-          // nao event?.agent (que nao existe no contrato do prompt hook).
-          const snapshot = await buildSnapshot(ctx, sessionID);
-          const candidates = await freeCandidates(ctx);
-          const agents = await validAgents(ctx);
-          const d = await decideRoute({
-            prompt: text,
-            agent: snapshot.agent,
-            model: snapshot.model !== "unknown" ? snapshot.model : undefined,
-            validAgents: agents,
-            freeCandidates: candidates,
-            route: snapshot.route,
-            jevModel: opts.jevModel,
-            jevEndpoint: opts.jevEndpoint,
-            apiKey: await getKey(),
-            confidenceThreshold: opts.confidenceThreshold,
-            timeoutMs: opts.jevTimeoutMs,
-          });
-          const intention: IntentionRecord = {
-            text: text.slice(0, 4000),
-            route: d.route,
-            model: d.model,
-            agent: d.agent,
-            via: d.via,
-            confidence: d.confidence,
-            overridden: d.overridden,
-            at: Date.now(),
-          };
-          // Mesma rota+modelo+agente da sessao -> sem switch desnecessario.
-          if (prior && prior.route === d.route && prior.model === d.model && prior.agent === d.agent) {
-            await ctx.storage.set(`intention/${sessionID}`, intention);
-            event.metadata = {
-              ...event.metadata,
-              "jev-router": "routed",
-              "jev-route": d.route,
-              "jev-model": d.model,
-              "jev-agent": d.agent,
-              "jev-via": d.via,
-              "jev-confidence": d.confidence,
-              ...(d.overridden ? { "jev-overridden": true } : {}),
-            };
-            return;
-          }
-          await applySwitch(ctx, sessionID, d.route, d.model, d.agent, d.via, intention, event);
-        } catch (err) {
-          event.metadata = {
-            ...event.metadata,
-            "jev-router": "route-failed",
-            "jev-error": err instanceof Error ? err.message : String(err),
-          };
-        }
-      });
-
       // Agentes chamam o Jev sozinhos: instrucao ENXUTA injetada no contexto.
       // As tools Jev vivem no namespace `jev` em Code Mode (codemode: true):
       // nao existem tools globais `jev_decide`/`jev_route`/`jev_escalate`.

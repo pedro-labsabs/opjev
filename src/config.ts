@@ -55,9 +55,25 @@ export interface RouterOptions {
   enableAutoRoute?: boolean;
   /** Timeout (ms) das chamadas ao Jev SystemOne. Default: 15000 */
   jevTimeoutMs?: number;
+  /** Admissao automatica bounded no prompt hook (#13): decide normal|route|orchestrate|linked por turno. Default: false */
+  enableAutoOrchestration?: boolean;
+  /** Limite de rodadas do contrato automatico (inteiro 1..100). Default: 3 */
+  autoOrchestrationMaxRounds?: number;
 }
 
 export function resolveOptions(raw: Record<string, unknown> = {}): Required<RouterOptions> {
+  // Validacao LOUD (nunca clamp silencioso): valor invalido quebra o setup.
+  const autoOrchestrationMaxRounds = raw.autoOrchestrationMaxRounds ?? 3;
+  if (
+    typeof autoOrchestrationMaxRounds !== "number" ||
+    !Number.isInteger(autoOrchestrationMaxRounds) ||
+    autoOrchestrationMaxRounds < 1 ||
+    autoOrchestrationMaxRounds > 100
+  ) {
+    throw new TypeError(
+      `opts.autoOrchestrationMaxRounds deve ser inteiro entre 1 e 100 (recebido: ${String(autoOrchestrationMaxRounds)})`,
+    );
+  }
   return {
     jevModel: (raw.jevModel as string) ?? "jev-1.13-free",
     jevEndpoint: (raw.jevEndpoint as string) ?? "https://opencode.ai/zen/v1/systemone",
@@ -65,6 +81,8 @@ export function resolveOptions(raw: Record<string, unknown> = {}): Required<Rout
     confidenceThreshold: (raw.confidenceThreshold as number) ?? 0.55,
     enableAutoRoute: (raw.enableAutoRoute as boolean) ?? true,
     jevTimeoutMs: (raw.jevTimeoutMs as number) ?? 15000,
+    enableAutoOrchestration: (raw.enableAutoOrchestration as boolean) ?? false,
+    autoOrchestrationMaxRounds,
   };
 }
 
