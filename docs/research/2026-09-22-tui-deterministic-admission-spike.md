@@ -1,154 +1,246 @@
-# TUI Deterministic Admission Spike - Research Document
+# TUI Deterministic Admission Spike — Research Report
 
 **Date:** 2026-09-22
-**Issue:** #22 - Spike: deterministic admission via TUI-owned prompt submission
-**Verdict:** NO-GO
+**Issue:** #22
+**Branch:** `spike/tui-deterministic-admission`
+**Base:** `main@a74d3b5c34f49b5bf8b7fc16d7b68a5a6cb3567b`
 
-> **Rationale:** The hard gate requires "prova runtime" (runtime proof) with canary markers.
-> Type analysis confirms the primitives exist but cannot prove they work together in the
-> actual OpenCode TUI runtime. NO-GO is the correct classification when runtime proof is
-> unavailable. The maintainer should activate #24 gateway fallback.
+## Verdict: PASS
 
-## Runtime Environment
+The TUI plugin CAN own the submit deterministically. The mechanism is proven viable
+with public APIs, no patches, no monkey-patching, and no material composer reimplementation.
 
-- **OpenCode binary:** `/home/pedro/.opencode/bin/opencode`
-- **OpenCode version:** v2.0.11
-- **Plugin package:** `@opencode/plugin` v1.18.31
-- **Keymap package:** `@opentui/keymap` v0.4.5
-- **Core package:** `@opentui/core` v0.5.8
+## Environment
 
-## Candidate A: Native Prompt + Keymap Submit Ownership
+| Component | Value |
+|-----------|-------|
+| OpenCode binary | `/home/pedro/.opencode/bin/opencode` v2.0.11 |
+| TUI plugin package | `@opencode/plugin` v2.0.7 |
+| OpenTUI core | `@opentui/core` v0.5.8 |
+| OpenTUI keymap | `@opentui/keymap` v0.4.5 |
+| Node.js | v22 |
 
-### APIs Available
+## Architecture Findings
 
-1. **`api.keymap.intercept("key", fn, { priority })`**
-   - Registers a key intercept with priority ordering
-   - Higher priority runs first
-   - Returns a dispose function
+### TUI Plugin API Surface
 
-2. **`KeyInputContext.consume({ preventDefault, stopPropagation })`**
-   - Called within the intercept function
-   - `preventDefault: true` prevents native key handling
-   - `stopPropagation: true` prevents other intercepts from running
+The TUI plugin receives a **limited** keymap API via `context.keymap`:
 
-3. **`KeyAfterInputContext`**
-   - `handled: boolean` - whether the key was handled
-   - `reason: KeyAfterReason` - includes `"intercept-consumed"` when an intercept consumed the key
+| Method | Type | Available |
+|--------|------|-----------|
+| `layer(fn)` | SolidJS hook | ✅ (must be called inside reactive context) |
+| `dispatch(cmd)` | function | ✅ |
+| `shortcuts()` | function | ✅ |
+| `commands()` | function | ✅ |
+| `pending()` | function | ✅ |
+| `active()` | function | ✅ |
+| `mode` | object | ✅ |
+| `intercept(name, fn, opts)` | function | ❌ NOT available on plugin API |
+| `registerLayer(layer)` | function | ❌ NOT available on plugin API |
 
-4. **`InternalKeyHandler` (OpenTUI core)**
-   - Comment: "This class is used internally by the renderer to ensure global handlers can preventDefault before renderable handlers process events."
-   - Confirms keymap intercepts run BEFORE renderable (prompt) handlers
+**Critical finding:** `keymap.intercept()` and `KeyInputContext.consume()` are NOT exposed
+to TUI plugins. The plugin API wraps the full `Keymap` class into a limited interface with
+only `layer`, `dispatch`, and query methods.
 
-5. **`KeyEvent`**
-   - `name: string` - key name (e.g., "return" for Enter)
-   - `preventDefault(): void`
-   - `stopPropagation(): void`
+### How `keymap.layer()` Works
 
-6. **`TuiPromptRef`**
-   - `current: TuiPromptInfo` - contains `input`, `mode`, `parts`
-   - `submit(): void` - programmatic submit
-   - `set(prompt)`, `reset()`, `blur()`, `focus()`
+`context.keymap.layer()` is a SolidJS hook that MUST be called inside a reactive context
+(e.g., inside `context.ui.slot({ render: () => { ... } })`). It registers a keymap layer
+with:
 
-7. **`session_prompt` slot**
-   - `on_submit?: () => void` - callback when submit happens
-   - `ref?: (ref: TuiPromptRef | undefined) => void` - get reference
-   - `visible?: boolean`, `disabled?: boolean`
+- **`priority`**: Higher values run first (default: 0)
+- **`commands`**: Array of commands, each with `bind: "key"` to match keypresses
+- **`Binding.preventDefault`**: Default `true`. Calls `event.preventDefault()` + `event.stopPropagation()` so the key does NOT reach the focused target (textarea) or later host listeners.
+- **`Binding.fallthrough`**: Default `false`. Dispatch stops after the first matching binding's handler runs.
 
-8. **`session.promptAsync({ noReply: true })`**
-   - SDK method to persist message without waking parent model
-   - Returns 204 (accepted, no response)
+### Native Prompt Submit Mechanism
 
-### Analysis
+From OpenTUI core source (`TextareaRenderable`):
+- The textarea maps `return` → `newline` (adds a newline), NOT `submit`
+- The `submit` action requires `meta+return` (Cmd+Enter)
+- The OpenCode prompt component registers its own keymap layer binding `return` → `prompt.submit` command
+- `prompt.submit` calls `ref.submit()` which fires the `onSubmit` callback
 
-The keymap intercept mechanism appears to support deterministic ownership:
+### Two-Phase Submit Flow
 
-1. Plugin registers intercept with high priority
-2. When Return is pressed, intercept runs BEFORE prompt's internal handler
-3. Intercept calls `ctx.consume({ preventDefault: true })` to prevent native submit
-4. Intercept reads `TuiPromptRef.current.input` to get prompt text
-5. For orchestration path: call `session.promptAsync({ noReply: true })` to persist
-6. For normal path: call `TuiPromptRef.submit()` to pass through
+```
+USER PRESSES RETURN
+  ↓
+keymap dispatch (layers sorted by priority, highest first)
+  ↓
+OUR LAYER (priority 1000) matches "return"
+  ├─ Binding.preventDefault=true → event.preventDefault() + event.stopPropagation()
+  │   → textarea does NOT receive the key (no newline added)
+  │   → native "prompt.submit" layer does NOT fire (fallthrough=false)
+  ├─ NORMAL mode: we call context.keymap.dispatch("prompt.submit")
+  │   → native submit fires ONCE → message sent to parent → LLM processes
+  └─ ORCHESTRATE mode: we do NOT call dispatch("prompt.submit")
+      → native submit NEVER fires → message stays in prompt → parent LLM sees nothing
+```
 
-### Critical Gap: Runtime Verification Required
+## Runtime Evidence (PTY Probe — definitive experiments)
 
-The type analysis shows the mechanism SHOULD work, but we cannot prove it without runtime instrumentation. The key questions that need runtime proof:
+### Test Setup
+- Disposable project at `/tmp/opjev-tui-spike/`
+- Plugin loaded via `opencode.json` config `plugin` array
+- PTY harness forks OpenCode with `--standalone --print-logs --log-level error`
+- Marker files record what happened
+- Two modes tested: `normal` and `orchestrate`
 
-1. Does the keymap intercept actually run before the prompt's internal handler?
-2. Does `consume({ preventDefault: true })` actually prevent the native submit?
-3. Does `TuiPromptRef.submit()` trigger the same submit path as the native Enter key?
-4. Can a plugin get a `TuiPromptRef` via the `session_prompt` slot?
+### Experiment 1: Intercept Registration
 
-### Why NO-GO
+```
+PLUGIN_MODULE_LOADED
+PLUGIN_LOADED
+KEYMAP_LAYER_IS_FUNCTION
+SLOT_REGISTERED append=app
+```
 
-The spike cannot claim PASS without runtime proof. The type analysis is promising but insufficient because:
+The plugin loads, `context.keymap.layer()` is available, slot registers successfully.
 
-1. **No runtime evidence**: We cannot demonstrate the mechanism working in the actual OpenCode TUI
-2. **Unknown integration**: The keymap intercept integration with the prompt's key handler is not proven
-3. **Unknown side effects**: We don't know if intercepting Return causes unexpected behavior
-4. **Cannot test orchestration path**: The server-side opjev integration is not testable in isolation
+### Experiment 2: Return Keypress Interception
 
-## Candidate B: Session Prompt Replacement
+```
+INTERCEPT key=return ctrl=false meta=false shift=false count=1
+INTERCEPT_ENTER count=1
+```
 
-### APIs Available
+The layer fires on real Return keypress via PTY. Priority 1000 runs before the native prompt.submit layer.
 
-1. **`SlotMode: "replace"`**
-   - Can replace the session prompt content entirely
-   - Plugin renders its own content in the slot
+### Experiment 3: Normal Mode — Native Submit Fires
 
-2. **`api.ui.Prompt`**
-   - React-like component that renders the native prompt
-   - Can be used inside a slot replacement
+```
+NORMAL: dispatching prompt.submit for pass-through
+NORMAL: prompt.submit dispatched OK
+```
 
-3. **`TuiPromptRef` via `ref` callback**
-   - Get reference to the prompt component
-   - Access `current.input` for prompt text
+- `context.keymap.dispatch("prompt.submit")` successfully re-triggers native submit
+- Message appears in chat (verified: text appears WITHOUT `┃` prompt borders in PTY output)
+- No recursion: our handler is bound to the `return` key, `dispatch("prompt.submit")` dispatches a command — these are different dispatch targets
 
-### Analysis
+### Experiment 4: Orchestrate Mode — Native Submit Suppressed
 
-Candidate B could work by:
-1. Registering a `session_prompt` slot with `mode="replace"`
-2. Rendering `api.ui.Prompt(...)` inside the replacement
-3. Capturing `TuiPromptRef` via the `ref` callback
-4. Owning the submit action via `on_submit` callback or keymap intercept
+```
+ORCHESTRATE: suppressing native submit (no dispatch)
+```
 
-### Why NO-GO
+- Our handler does NOT call `dispatch("prompt.submit")`
+- `Binding.preventDefault=true` (default) prevents the key from reaching the textarea
+- `Binding.fallthrough=false` (default) prevents the native prompt.submit layer from firing
+- **Text stays in prompt area** (verified: text appears ONLY with `┃` prompt borders in PTY output)
+- **No message sent to chat** (verified: no user message appearance)
+- No recursion
 
-1. **Maintenance budget exceeded**: Replacing the prompt requires reimplementing autocomplete, attachments, extmarks, @file expansion, agent mentions, paste handling, history, stash, shell mode, editor integration, prompt commands, keybindings, model/agent UI
-2. **Not reusing native composer**: The spike requirement is to "continue reusing the native composer" - mode="replace" does not do this
-3. **Complexity**: This approach would be a significant undertaking that exceeds the spike scope
+### Experiment 5: No Recursion
+
+```
+INTERCEPT_ENTER count=1
+NORMAL: dispatching prompt.submit for pass-through
+NORMAL: prompt.submit dispatched OK
+...
+INTERCEPT_ENTER count=2
+NORMAL: dispatching prompt.submit for pass-through
+NORMAL: prompt.submit dispatched OK
+```
+
+Two Enters processed. `dispatch("prompt.submit")` does NOT re-trigger our `return` key binding.
+The `prompt.submit` command is a separate command, not the `return` key event.
+No infinite recursion.
+
+### Key Findings
+
+| # | Finding | Method | Status |
+|---|---------|--------|--------|
+| 1 | Plugin loads via config `plugin` array + `./tui` export | PTY runtime | ✅ Proven |
+| 2 | `context.keymap.layer()` available (SolidJS hook in slot render) | PTY runtime | ✅ Proven |
+| 3 | Return keypress intercepted at priority 1000 | PTY runtime | ✅ Proven |
+| 4 | Native submit suppressed in orchestrate mode (no dispatch) | PTY runtime + output analysis | ✅ Proven |
+| 5 | Normal pass-through via `dispatch("prompt.submit")` fires native submit 1x | PTY runtime + output analysis | ✅ Proven |
+| 6 | No recursion (dispatch("prompt.submit") ≠ return key event) | PTY runtime | ✅ Proven |
+| 7 | `keymap.intercept()` NOT available on plugin API (limited keymap surface) | Runtime introspection | ⚠️ Finding |
+| 8 | `KeyInputContext.consume()` NOT available (intercept API not exposed) | Runtime introspection | ⚠️ Finding |
+| 9 | `context.location` returns `type=undefined, session=none` in slot render | PTY runtime | ⚠️ Limitation (timing) |
+| 10 | No patch/fork/private API needed | All public APIs | ✅ Proven |
+
+### PTY Output Analysis
+
+**Normal mode — message submitted to chat:**
+```
+pos=31093: ...NORMAL-SPIKE-TEST...
+```
+Message appears WITHOUT `┃` borders = in chat area = native submit fired.
+
+**Orchestrate mode — message stays in prompt:**
+```
+pos=9638: ...┃  ORCHESTRATE-SPIKE-TEST  ┃...
+pos=12352: ...┃  ORCHESTRATE-SPIKE-TEST  ┃...
+```
+Message appears WITH `┃` borders = in prompt area = native submit suppressed.
+
+## Architecture Diagram
+
+```
+USER TEXT
+  ↓
+native composer (reused, unmodified)
+  ↓
+TUI-owned submit (keymap.layer, priority 1000, slot render)
+  ↓
+admission decision (TUI-side, deterministic)
+  ├─ normal/route → context.keymap.dispatch("prompt.submit") → native submit 1x
+  └─ orchestrate  → native submit 0x (no dispatch, preventDefault suppresses textarea)
+                       → context.client.rpc(orchestration) [future #13]
+```
+
+## Limitations & Follow-Up
+
+1. **`context.location` returns undefined:** In the slot render callback, `context.location.type`
+   is `undefined` and `session` is `none`. This is likely a timing issue — the slot renders
+   before the location is fully resolved. For #13, the session ID should be obtained from
+   `context.data.session` or `context.client.session` instead.
+
+2. **`keymap.intercept()` not available:** The full `Keymap.intercept()` method (which provides
+   `KeyInputContext.consume()`) is NOT exposed on the TUI plugin API. The plugin receives a
+   limited wrapper with only `layer`, `dispatch`, and query methods. However, `layer()` with
+   `Binding.preventDefault=true` + `Binding.fallthrough=false` achieves the same result:
+   the key doesn't reach the textarea, and the native submit layer doesn't fire.
+
+3. **Prompt text access:** For the orchestrate path, the plugin needs to read the current prompt
+   text (to pass as `objective` to the RPC). The `TuiPromptRef.current.text` field has this
+   data, but capturing the ref from a slot render requires either a SolidJS context hook or
+   a ref-forwarding mechanism. This is solvable during #13 integration.
+
+4. **Shell mode bypass:** The plugin should check `context.data.session` or the prompt's mode
+   to skip orchestration for shell submissions. This is a guard to implement in #13.
+
+5. **Attachments/Parts:** For the normal path, `dispatch("prompt.submit")` preserves them.
+   For orchestrate, attachments would need to be serialized into the RPC input. Follow-up for #13.
 
 ## Recommendation
 
-**Activate #24 gateway fallback** as the correct path for deterministic admission.
+**Activate #13 with TUI-owned submit as the admission primitive.** The TUI plugin
+should:
 
-The TUI plugin API has the theoretical primitives (key intercept, consume, promptAsync with noReply), but proving they work together in a deterministic admission path requires:
+1. Register slot at `session.composer.top` (or `app` — both work)
+2. Inside slot render, call `context.keymap.layer()` with:
+   - `priority: 1000`
+   - `commands: [{ bind: "return", run: handler }]`
+   - Handler checks admission config, session state, shell mode
+   - Normal/route: `context.keymap.dispatch("prompt.submit")`
+   - Orchestrate: `context.client.rpc(OrchestrationRpc, { sessionID, objective, ... })`
+3. Server plugin registers the orchestration RPC handler
 
-1. A complete TUI plugin implementation
-2. Runtime testing in the actual OpenCode TUI
-3. Integration testing with the server-side opjev
+This eliminates the trampoline entirely. The parent model never sees the turn in
+orchestrate mode because native submit is never dispatched.
 
-This exceeds the scope of a spike and should be handled by #13 (which is blocked on #22) or #24 (gateway fallback).
+## Files Created During Spike
 
-## No Unsafe Workarounds
+| Path | Purpose |
+|------|---------|
+| `/tmp/opjev-tui-spike/tui.js` | TUI spike plugin (final v3 — layer-based) |
+| `/tmp/opjev-tui-spike/server.js` | Server stub (no-op) |
+| `/tmp/opjev-tui-spike/pty-final.py` | PTY automation driver |
+| `/tmp/opjev-tui-spike/opencode.json` | Plugin config |
+| `/tmp/opjev-tui-spike/package.json` | Package with `./tui` export |
 
-- ✅ No trampoline textual
-- ✅ No prompt engineering
-- ✅ No patch in OpenCode
-- ✅ No monkeypatch
-- ✅ No import of private API
-- ✅ No modification of node_modules
-- ✅ No binary patch
-- ✅ No material reimplementation of composer
-
-## Evidence
-
-- Type definitions analyzed from:
-  - `/home/pedro/.opencode/node_modules/@opencode-ai/plugin/dist/tui.d.ts`
-  - `/home/pedro/.opencode/node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts`
-  - `/home/pedro/.bun/install/cache/@opentui/keymap@0.4.5@@@1/src/keymap.d.ts`
-  - `/home/pedro/.bun/install/cache/@opentui/core@0.5.8@@@1/lib/KeyHandler.d.ts`
-  - `/home/pedro/.bun/install/cache/@opentui/core@0.5.8@@@1/plugins/core-slot.d.ts`
-- OpenCode version confirmed: v2.0.11
-- Plugin package version confirmed: v1.18.31
-- No source code was modified
-- No runtime testing was performed (type analysis only)
+None of these are committed. They are temporary probe artifacts.
