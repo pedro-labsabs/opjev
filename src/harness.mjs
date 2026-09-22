@@ -4,10 +4,15 @@
 
 export function makeStorage(seed = {}) {
   const map = new Map(Object.entries(seed));
+  // Historico de escritas (append-only): preserva TODOS os valores por chave,
+  // inclusive sobrescritas (Map mantem apenas o ultimo). Usado pelos testes
+  // para observar a verdade sequencial do storage (checkpoints por etapa).
+  const log = [];
   return {
     get: async (k) => (map.has(k) ? map.get(k) : undefined),
     set: async (k, v) => {
       map.set(k, v);
+      log.push({ key: k, value: v });
     },
     remove: async (k) => {
       map.delete(k);
@@ -24,6 +29,7 @@ export function makeStorage(seed = {}) {
       };
     },
     _map: map,
+    _log: log,
   };
 }
 

@@ -323,6 +323,57 @@ export function validateVerdict(verdict: unknown): asserts verdict is JevVerdict
   }
 }
 
+// ───────────────────────── Human gate (#12) ─────────────────────────
+
+/**
+ * Pedido de decisao humana emitido no boundary `awaiting-human` (verdict
+ * `human` do Jev OU esgotamento de maxRounds). Puro e deterministico:
+ * requestID = `human:<round>:<historyLength>:<kind>` (nada de random/UUID).
+ * O Jev PODE setar nextAction=human; NUNCA fabrica aprovacao — apenas o
+ * campo `action` de um HumanDecision vindo de sessao humana autoriza.
+ */
+export interface HumanRequest {
+  requestID: string;
+  kind: "jev-human" | "max-rounds";
+  round: number;
+  /** Razao bounded (<=500) da pausa. */
+  reason: string;
+  /** Autoridade verdadeira exigida para retomar (baseada no orcamento atual). */
+  requiredAuthority: "resume-or-stop" | "increase-budget-or-stop";
+  currentMaxRounds: number;
+  /** Orcamento minimo para abrir round+1 (= round + 1). */
+  minimumMaxRounds: number;
+}
+
+export const HUMAN_LIMITS = {
+  reason: 500,
+  instruction: 1000,
+  requestID: 200,
+} as const;
+
+/**
+ * Decisao humana: EXATAMENTE 4 chaves. Sem agent/model/sessionID/approved/
+ * revisedContract/toolPermissions/chain-of-thought — chave desconhecida e
+ * rejeitada explicitamente (nunca coercao, nunca clamp, nunca inferencia).
+ */
+export interface HumanDecision {
+  requestID: string;
+  action: "resume" | "stop";
+  /** So em resume: instrucao bounded que entra na prompt da rodada retomada. */
+  instruction?: string;
+  /** So em resume: novo contract.maxRounds (>= atual, >= round+1, <= 100). */
+  newMaxRounds?: number;
+}
+
+/** Auditoria da decisao humana na entry da rodada pausada (nao cresce history). */
+export interface HumanDecisionAudit {
+  requestID: string;
+  action: "resume" | "stop";
+  instruction?: string;
+  maxRoundsBefore: number;
+  maxRoundsAfter: number;
+}
+
 // ───────────────────────── RunState ─────────────────────────
 
 export type RunPhase =
@@ -354,6 +405,8 @@ export interface RoundHistoryEntry {
   verdict?: JevVerdict;
   outcome?: EvidencePacket["outcome"];
   resultSummary?: string;
+  /** Decisao humana que autorizou/encerrou o boundary (anexada na decisao). */
+  humanDecision?: HumanDecisionAudit;
   /** Timestamp externo opcional (preenchido pelo dispatcher, nao pelo kernel). */
   at?: number;
 }
@@ -371,6 +424,8 @@ export interface RunState {
   evidence?: EvidencePacket;
   lastVerdict?: JevVerdict;
   history: RoundHistoryEntry[];
+  /** Pedido humano pendente quando phase === "awaiting-human" (consumido na decisao). */
+  pendingHuman?: HumanRequest;
   /** Erro bounded da ultima falha de comando (diagnostico), quando houver. */
   lastError?: string;
 }
@@ -389,6 +444,7 @@ export type OrchestrationEvent =
   | { type: "EXECUTION_FINISHED"; outcome: ExecutionOutcome }
   | { type: "EVIDENCE_READY"; evidence: EvidencePacket }
   | { type: "VERDICT_RECEIVED"; verdict: JevVerdict }
+  | { type: "HUMAN_DECISION_RECEIVED"; decision: HumanDecision }
   | { type: "COMMAND_FAILED"; command?: OrchestrationCommand["type"]; error?: string };
 
 /**
@@ -399,7 +455,7 @@ export type OrchestrationEvent =
  * select-agent (proximo slice consulta o Jev com candidatos validos).
  */
 export type OrchestrationCommand =
-  | { type: "dispatch"; mode: "initial" | "replan" }
+  | { type: "dispatch"; mode: "initial" | "replan" | "human-resume" }
   | { type: "evaluate" }
   | { type: "repair-same" }
   | { type: "fresh-same" }

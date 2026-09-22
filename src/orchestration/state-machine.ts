@@ -18,6 +18,7 @@ import {
   type EvidencePacket,
   type ExecutorRef,
   type ExecutionContract,
+  type HumanDecisionAudit,
   type OrchestrationCommand,
   type OrchestrationEvent,
   type RoundHistoryEntry,
@@ -25,6 +26,7 @@ import {
   type RunState,
   type TransitionResult,
 } from "./types.ts";
+import { buildHumanRequest, validateHumanDecision } from "./human-gate.ts";
 
 // ───────────────────────── politica de rodadas ─────────────────────────
 //
@@ -267,7 +269,24 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
               ),
           );
         case "human":
-          return next({ phase: "awaiting-human", lastVerdict: verdict, history }, [{ type: "request-human" }]);
+          // Boundary humano (#12): o Jev PODE pedir pausa (nextAction=human),
+          // mas a retomada exige um HumanDecision humano validado — nunca
+          // auto-resume. O HumanRequest e deterministico (sem random/UUID).
+          return next(
+            {
+              phase: "awaiting-human",
+              lastVerdict: verdict,
+              history,
+              pendingHuman: buildHumanRequest({
+                round: state.round,
+                historyLength: history.length,
+                kind: "jev-human",
+                currentMaxRounds: state.contract.maxRounds,
+                failureClass: verdict.failureClass,
+              }),
+            },
+            [{ type: "request-human" }],
+          );
         case "stop":
           return next({ phase: "stopped", lastVerdict: verdict, history }, [{ type: "stop" }]);
         default: {
@@ -276,6 +295,57 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
           return invalid(`nextAction inesperada: ${String(_exhaustive)}`);
         }
       }
+    }
+
+    case "HUMAN_DECISION_RECEIVED": {
+      // Fase checada ANTES da validacao da decisao (#12): um run que ja nao
+      // esta mais pausado (resume/stop ja aplicado, completed, failed, …)
+      // recebe invalid-transition — retomada duplicada nunca reabre rodada.
+      if (src !== "awaiting-human") invalid(`HUMAN_DECISION_RECEIVED nao permitido na fase ${src}`);
+      validateHumanDecision(event.decision, state);
+      const decision = event.decision;
+      const maxRoundsBefore = state.contract.maxRounds;
+      const maxRoundsAfter =
+        decision.action === "resume" && decision.newMaxRounds !== undefined
+          ? decision.newMaxRounds
+          : maxRoundsBefore;
+      // Auditoria na entry da rodada pausada (padrao contractRevision:
+      // associacao, NUNCA crescimento de history).
+      const audit: HumanDecisionAudit = {
+        requestID: decision.requestID,
+        action: decision.action,
+        ...(decision.instruction !== undefined ? { instruction: decision.instruction } : {}),
+        maxRoundsBefore,
+        maxRoundsAfter,
+      };
+      const history =
+        state.history.length > 0
+          ? [...state.history.slice(0, -1), { ...state.history[state.history.length - 1], humanDecision: audit }]
+          : state.history;
+      if (decision.action === "stop") {
+        // Encerra sem trabalho novo: round inalterado, pendingHuman consumido.
+        return next({ phase: "stopped", history, pendingHuman: undefined }, [{ type: "stop" }]);
+      }
+      // Resume: abre EXATAMENTE uma rodada (round+1 uma unica vez), phase
+      // ready, executor canonico sem sessionID (worker fresca no dispatcher),
+      // dispatch mode human-resume. Apenas contract.maxRounds pode mudar —
+      // CONTRACT_READY continua proibindo aumento de orcamento.
+      return next(
+        {
+          phase: "ready",
+          round: state.round + 1,
+          contract:
+            maxRoundsAfter !== maxRoundsBefore
+              ? { ...state.contract, maxRounds: maxRoundsAfter }
+              : state.contract,
+          history,
+          pendingHuman: undefined,
+          ...(state.executor
+            ? { executor: { agent: state.executor.agent, model: state.executor.model } }
+            : {}),
+        },
+        [{ type: "dispatch", mode: "human-resume" }],
+      );
     }
 
     case "COMMAND_FAILED": {
@@ -303,8 +373,23 @@ function beginNextRound(
 ): TransitionResult {
   const nextRound = state.round + 1;
   if (nextRound > state.contract.maxRounds) {
+    // Esgotamento de orcamento (#12): pausa com pedido humano de autoridade
+    // de budget — retomada exige newMaxRounds >= round+1 (ou stop). O kernel
+    // nunca aumenta orcamento sozinho e nunca executa round+1 sem decisao.
     return {
-      state: { ...state, phase: "awaiting-human", lastVerdict: verdict, history },
+      state: {
+        ...state,
+        phase: "awaiting-human",
+        lastVerdict: verdict,
+        history,
+        pendingHuman: buildHumanRequest({
+          round: state.round,
+          historyLength: history.length,
+          kind: "max-rounds",
+          currentMaxRounds: state.contract.maxRounds,
+          ...(verdict?.failureClass ? { failureClass: verdict.failureClass } : {}),
+        }),
+      },
       commands: [{ type: "request-human" }],
     };
   }

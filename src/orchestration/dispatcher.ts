@@ -21,11 +21,14 @@ import {
   type EvidencePacket,
   type ExecutionContract,
   type ExecutionOutcome,
+  type HumanDecision,
+  type HumanRequest,
   type JevVerdict,
   type NextAction,
   type RunState,
 } from "./types.ts";
 import { createRunState, transitionRun } from "./state-machine.ts";
+import { validateResumableRunState } from "./human-gate.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
@@ -148,7 +151,14 @@ export interface SwitchSelectInput {
   attempts: Array<{ agent: string; model: string }>;
 }
 
-export type RoundAction = "initial" | "repair-same" | "fresh-same" | "switch-model" | "switch-agent" | "replan";
+export type RoundAction =
+  | "initial"
+  | "repair-same"
+  | "fresh-same"
+  | "switch-model"
+  | "switch-agent"
+  | "replan"
+  | "human-resume";
 
 /** Projecao bounded de UMA rodada executada (auditoria minima do resultado). */
 export interface RoundProjection {
@@ -174,7 +184,14 @@ export interface DispatcherDeps {
   orchestratorTimeoutMs?: number;
   location?: { directory?: string };
   persist?(input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised" | "run-failed";
+    kind:
+      | "worker-created"
+      | "evidence-ready"
+      | "verdict-applied"
+      | "contract-revised"
+      | "human-awaiting"
+      | "human-decision"
+      | "run-failed";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
@@ -197,6 +214,8 @@ export interface OrchestrationRunResult {
   verdict?: JevVerdict;
   pendingCommands: string[];
   error?: string;
+  /** Pedido humano pendente quando o run encerra em awaiting-human (undefined caso contrario). */
+  pendingHuman?: HumanRequest;
   /** Projecao bounded de TODAS as rodadas executadas (source of truth fechada: RunState.history). */
   rounds?: RoundProjection[];
   /** Projecao bounded do RunState.history final (kernel e canonico). */
@@ -397,8 +416,9 @@ async function failRun(
     }
   } catch { /* kernel barrier */ }
   if (persistFailure) {
-    // Estado failed persistido explicitamente: store nunca fica em planning
-    // apos failure observavel. Best-effort como os demais checkpoints.
+    // Estado failed persistido explicitamente: store nunca fica em planning/
+    // ready apos failure observavel. Clock injetado (deps.now ?? Date.now).
+    const at = persistFailure.deps.now?.() ?? Date.now();
     await persist(persistFailure.deps, {
       kind: persistFailure.kind,
       runID,
@@ -406,7 +426,7 @@ async function failRun(
       criticSessionID: persistFailure.criticSessionID,
       orchestratorSessionID: persistFailure.orchestratorSessionID,
       state: failed,
-      at: Date.now(),
+      at,
     });
   }
   return { runID, phase: failedPhase, round: failed.round, pendingCommands: [], error: bounded(error), ...extra };
@@ -415,7 +435,14 @@ async function failRun(
 async function persist(
   deps: DispatcherDeps,
   input: {
-    kind: "worker-created" | "evidence-ready" | "verdict-applied" | "contract-revised" | "run-failed";
+    kind:
+      | "worker-created"
+      | "evidence-ready"
+      | "verdict-applied"
+      | "contract-revised"
+      | "human-awaiting"
+      | "human-decision"
+      | "run-failed";
     runID: string;
     workerSessionID?: string;
     criticSessionID?: string;
@@ -440,10 +467,11 @@ function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["hi
     ...(h.outcome ? { outcome: h.outcome } : {}),
     ...(h.resultSummary ? { resultSummary: h.resultSummary } : {}),
     ...(h.contractRevision ? { contractRevision: h.contractRevision } : {}),
+    ...(h.humanDecision ? { humanDecision: h.humanDecision } : {}),
   }));
 }
 
-// ───────────────────────── core: runOrchestrationOnce (scheduler loop) ─────────────────────────
+// ───────────────────────── core: scheduler compartilhado (initial + human-resume) ─────────────────────────
 
 /**
  * Uma execucao explicita de orchestration. O Jev seleciona o executor na rodada
@@ -455,14 +483,13 @@ function projectHistory(state: RunState): NonNullable<OrchestrationRunResult["hi
  *     worker session, com pipeline integral e critic novo;
  *   - replan: orchestrator propoe revised contract e a proxima rodada e
  *     EXECUTADA com o executor canonico vigente em sessao nova;
- *   - human: permanece boundary/pending (accept/stop sao terminais).
+ *   - human: boundary persistido (checkpoint human-awaiting); retomada so via
+ *     orchestrate_resume (issue #12) — nunca auto-resume (accept/stop sao
+ *     terminais).
  * Toda rodada roda pipeline integral: worker -> evidence -> critic novo -> Jev.
  * Nunca ha recovery automatica sem um JevVerdict valido.
  */
 export async function runOrchestrationOnce(contract: ExecutionContract, deps: DispatcherDeps): Promise<OrchestrationRunResult> {
-  const timeoutMs = deps.workerTimeoutMs ?? WORKER_TIMEOUT_MS;
-  const criticTimeoutMs = deps.criticTimeoutMs ?? CRITIC_TIMEOUT_MS;
-  const orchestratorTimeoutMs = deps.orchestratorTimeoutMs ?? WORKER_TIMEOUT_MS;
   const now = deps.now ?? Date.now;
 
   // 1. kernel aceita o contrato
@@ -483,8 +510,56 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     return await failRun(state, contract.runID, err, { phase: "failed", rounds: [] });
   }
 
+  return await executeSchedule(deps, {
+    contract,
+    state,
+    mode: "initial",
+    selection,
+    now,
+    timeouts: {
+      worker: deps.workerTimeoutMs ?? WORKER_TIMEOUT_MS,
+      critic: deps.criticTimeoutMs ?? CRITIC_TIMEOUT_MS,
+      orchestrator: deps.orchestratorTimeoutMs ?? WORKER_TIMEOUT_MS,
+    },
+  });
+}
+
+interface ExecuteScheduleInput {
+  contract: ExecutionContract;
+  /** Estado de partida (ja autorizado pelo kernel): ready (initial) ou o
+   *  estado transicionado pela decisao humana (human-resume). O scheduler
+   *  NUNCA chama createRunState/selectExecutor em retomada. */
+  state: RunState;
+  mode: RoundAction;
+  selection?: ExecutorSelection;
+  prev?: { verdict: JevVerdict; evidence: EvidencePacket; switchTo?: { agent: string; model: string } };
+  /** Instrucao bounded do humano (apenas human-resume), injetada no prompt. */
+  humanInstruction?: string;
+  /** Sessoes worker ja utilizadas (fresh-check): o resume sela a pausada. */
+  seededSessions?: Iterable<string>;
+  now: () => number;
+  timeouts: { worker: number; critic: number; orchestrator: number };
+}
+
+/**
+ * Loop multi-round compartilhado (modos initial e human-resume). Roda pipeline
+ * integral por rodada, aplica as transicoes do kernel e persiste checkpoints.
+ * Em paths de abort a rodada ja persistiu run-failed; o resultado carrega
+ * selection (undefined na retomada), rounds, history e pendingHuman (quando
+ * re-pausado).
+ */
+async function executeSchedule(
+  deps: DispatcherDeps,
+  input: ExecuteScheduleInput,
+): Promise<OrchestrationRunResult> {
+  const contract = input.contract;
+  const now = input.now;
+  const { worker: timeoutMs, critic: criticTimeoutMs, orchestrator: orchestratorTimeoutMs } = input.timeouts;
+  const selection = input.selection;
+  let state = input.state;
+
   const rounds: RoundProjection[] = [];
-  const usedWorkerSessions = new Set<string>();
+  const usedWorkerSessions = new Set<string>(input.seededSessions ?? []);
 
   // Executa a rodada atual. mode=initial cria a primeira sessao; repair-same
   // reutiliza EXATAMENTE a sessionID preservada pelo kernel; fresh-same cria
@@ -524,10 +599,10 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         recoveryModel = rec.model;
         recoverySessionID = rec.sessionID;
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
       if (mode === "repair-same" && !recoverySessionID) {
-        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado")) };
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("repair-no-session", "repair-same sem sessionID preservada no estado"), undefined, { deps, kind: "run-failed" }) };
       }
     }
 
@@ -537,6 +612,18 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     let roundAgent: string;
     let roundModel: string;
     if (mode === "initial") {
+      if (!selection) {
+        return {
+          abort: true,
+          result: await failRun(
+            state,
+            contract.runID,
+            new OrchestrationError("initial-no-selection", "mode initial exige selection do Jev"),
+            undefined,
+            { deps, kind: "run-failed" },
+          ),
+        };
+      }
       roundAgent = selection.agent;
       roundModel = selection.model;
     } else if (mode === "repair-same" || mode === "fresh-same") {
@@ -551,12 +638,24 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         roundAgent = rec.agent;
         roundModel = rec.model;
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
+      }
+    } else if (mode === "human-resume") {
+      // Retomada por decisao humana (#12): EXCLUSIVAMENTE o executor canonico
+      // preservado pelo kernel (agent/model, sem sessionID). Ausente/invalido
+      // ou fora do FREE_POOL => bounded, sem fallback e sem reselecao (o Jev
+      // nunca escolhe o executor no resume).
+      try {
+        const rec = requireRecoveryExecutor(state);
+        roundAgent = rec.agent;
+        roundModel = rec.model;
+      } catch (err) {
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
     } else {
       const target = prev?.switchTo;
       if (!target || typeof target.agent !== "string" || !target.agent.trim() || typeof target.model !== "string" || !target.model.trim()) {
-        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("switch-no-selection", `round ${mode} sem executor selecionado pelo Jev`)) };
+        return { abort: true, result: await failRun(state, contract.runID, new OrchestrationError("switch-no-selection", `round ${mode} sem executor selecionado pelo Jev`), undefined, { deps, kind: "run-failed" }) };
       }
       roundAgent = target.agent;
       roundModel = target.model;
@@ -588,23 +687,32 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
         workerSessionID = created.sessionID;
         if (!workerSessionID) throw new OrchestrationError("worker-create-failed", "createWorker nao retornou sessionID");
       } catch (err) {
-        return { abort: true, result: await failRun(state, contract.runID, err) };
+        return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
       }
       if (mode !== "initial" && usedWorkerSessions.has(workerSessionID)) {
-        // fresh-same / switch-* / replan: sessao precisa ser realmente nova.
-        // Erro de integracao bounded — nunca executa fingindo ser nova.
-        const code = mode === "fresh-same" ? "fresh-not-fresh" : mode === "replan" ? "replan-not-fresh" : "switch-not-fresh";
+        // fresh-same / switch-* / replan / human-resume: sessao precisa ser
+        // realmente nova. Erro de integracao bounded — nunca executa fingindo
+        // ser nova. Persiste run-failed: storage nunca fica em ready.
+        const code =
+          mode === "fresh-same"
+            ? "fresh-not-fresh"
+            : mode === "replan"
+              ? "replan-not-fresh"
+              : mode === "human-resume"
+                ? "human-resume-not-fresh"
+                : "switch-not-fresh";
         return {
           abort: true,
           result: await failRun(
             state,
             contract.runID,
             new OrchestrationError(code, `createWorker retornou sessionID ja utilizada (${workerSessionID}): ${mode} exige sessao realmente nova`),
+            undefined,
+            { deps, kind: "run-failed", workerSessionID },
           ),
         };
       }
       usedWorkerSessions.add(workerSessionID);
-      await persist(deps, { kind: "worker-created", runID: contract.runID, workerSessionID, state, at: now() });
     }
 
     // 4. EXECUTION_STARTED + prompt (initial ou correction) + wait/get/context
@@ -614,10 +722,14 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       state = transitionRun(state, {
         type: "EXECUTION_STARTED",
         // Identidade da rodada (2c): initial <- selection; repair/fresh <-
-        // canonico validado; switch-* <- Jev via scheduler. Para repair-same,
-        // workerSessionID == recoverySessionID (reuso); demais, sessao nova.
+        // canonico validado; switch-* <- Jev via scheduler; human-resume <-
+        // canonico preservado. Para repair-same, workerSessionID ==
+        // recoverySessionID (reuso); demais, sessao nova.
         executor: { agent: roundAgent, model: roundModel, sessionID: workerSessionID },
       }).state;
+      // worker-created apos STARTED (phase running): o store nunca mostra
+      // ready quando a rodada ja comecou a executar (RESUME4/RESUME6).
+      await persist(deps, { kind: "worker-created", runID: contract.runID, workerSessionID, state, at: now() });
       const promptMeta = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-round": state.round };
       let promptText: string;
       if (mode === "initial") {
@@ -632,6 +744,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           previousResultSummary: prev?.evidence?.resultSummary ?? "",
           failedChecks: prev?.evidence?.deterministicChecks.filter((ck) => ck.status !== "pass") ?? [],
           criticFindings: prev?.evidence?.criticFindings ?? [],
+          // Instrucao bounded do humano (#12): so e injetada na rodada retomada.
+          ...(mode === "human-resume" && input.humanInstruction ? { humanInstruction: input.humanInstruction } : {}),
         });
       }
       await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
@@ -639,7 +753,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
-      // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed
+      // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed.
+      // Persiste run-failed: storage nunca fica em ready quando a API falha.
       let interrupted = false;
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "interrupted" }).state;
@@ -650,15 +765,16 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       }
       return {
         abort: true,
-        result: {
-          runID: contract.runID,
-          phase: "failed",
-          round: state.round,
-          pendingCommands: [],
-          error: bounded(err),
-          worker: { sessionID: workerSessionID, agent: roundAgent, model: roundModel, outcome: "interrupted", finalText: "" },
-          rounds,
-        },
+        result: await failRun(
+          state,
+          contract.runID,
+          err,
+          {
+            worker: { sessionID: workerSessionID, agent: roundAgent, model: roundModel, outcome: "interrupted", finalText: "" },
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID },
+        ),
       };
     }
 
@@ -679,10 +795,16 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       } catch { /* kernel barrier */ }
       return {
         abort: true,
-        result: await failRun(state, contract.runID, new OrchestrationError("executor-not-free", `modelo observado fora do FREE_POOL: ${model}`), {
-          worker: { sessionID: workerSessionID, agent, model, outcome: "failed", finalText },
-          rounds,
-        }),
+        result: await failRun(
+          state,
+          contract.runID,
+          new OrchestrationError("executor-not-free", `modelo observado fora do FREE_POOL: ${model}`),
+          {
+            worker: { sessionID: workerSessionID, agent, model, outcome: "failed", finalText },
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID },
+        ),
       };
     }
 
@@ -820,9 +942,18 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } catch (err) {
       return {
         abort: true,
-        result: await failRun(state, contract.runID, err, {
-          evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, rounds,
-        }),
+        result: await failRun(
+          state,
+          contract.runID,
+          err,
+          {
+            evidence,
+            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+            critic: criticProj,
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID, criticSessionID },
+        ),
       };
     }
     await persist(deps, { kind: "evidence-ready", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
@@ -836,9 +967,18 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } catch (err) {
       return {
         abort: true,
-        result: await failRun(state, contract.runID, err, {
-          evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, rounds,
-        }),
+        result: await failRun(
+          state,
+          contract.runID,
+          err,
+          {
+            evidence,
+            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+            critic: criticProj,
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID, criticSessionID },
+        ),
       };
     }
 
@@ -849,9 +989,18 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } catch (err) {
       return {
         abort: true,
-        result: await failRun(state, contract.runID, err, {
-          evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, rounds,
-        }),
+        result: await failRun(
+          state,
+          contract.runID,
+          err,
+          {
+            evidence,
+            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+            critic: criticProj,
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID, criticSessionID },
+        ),
       };
     }
 
@@ -863,9 +1012,19 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     } catch (err) {
       return {
         abort: true,
-        result: await failRun(state, contract.runID, err, {
-          evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, verdict, rounds,
-        }),
+        result: await failRun(
+          state,
+          contract.runID,
+          err,
+          {
+            evidence,
+            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+            critic: criticProj,
+            verdict,
+            rounds,
+          },
+          { deps, kind: "run-failed", workerSessionID, criticSessionID },
+        ),
       };
     }
     await persist(deps, { kind: "verdict-applied", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
@@ -882,8 +1041,8 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
   }
 
   // ───────────────────────── scheduler loop ─────────────────────────
-  let prev: { verdict: JevVerdict; evidence: EvidencePacket; switchTo?: { agent: string; model: string } } | undefined;
-  let mode: RoundAction = "initial";
+  let prev: { verdict: JevVerdict; evidence: EvidencePacket; switchTo?: { agent: string; model: string } } | undefined = input.prev;
+  let mode: RoundAction = input.mode;
   let last: Awaited<ReturnType<typeof runRoundOnce>> & { abort: false } | undefined;
   let pendingCommands: string[] = [];
 
@@ -934,6 +1093,12 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
             `verdict ${firstCommand} sob throttle global observavel — nenhuma nova worker, sem storm (evidencia: ${out.evidence.resultSummary.slice(0, 160)})`,
           ),
           { worker: last.worker, critic: last.critic, evidence: out.evidence, verdict: out.verdict, rounds },
+          {
+            deps,
+            kind: "run-failed",
+            workerSessionID: last.worker.sessionID,
+            criticSessionID: last.critic.sessionID,
+          },
         );
       }
       // Attempt history canonica (item #8/#10): a rodada que falhou ja entrou
@@ -989,6 +1154,11 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
           evidence: out.evidence,
           verdict: out.verdict,
           rounds,
+        }, {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last.worker.sessionID,
+          criticSessionID: last.critic.sessionID,
         });
       }
     }
@@ -1111,8 +1281,20 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
       continue;
     }
     // Terminal / boundary: accept => completed; stop => stopped; human
-    // => pending command mapeado pelo kernel.
+    // => pending command mapeado pelo kernel + checkpoint human-awaiting.
     pendingCommands = out.state.phase === "completed" ? [] : out.transition.commands.map((c) => c.type);
+    if (out.state.phase === "awaiting-human") {
+      // Boundary humano persistido explicitamente (PAUSE1): requestID
+      // deterministico + sessoes da rodada pausada para a retomada explicita.
+      await persist(deps, {
+        kind: "human-awaiting",
+        runID: contract.runID,
+        workerSessionID: last.worker.sessionID,
+        criticSessionID: last.critic.sessionID,
+        state: out.state,
+        at: now(),
+      });
+    }
     break;
   }
 
@@ -1126,7 +1308,91 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     evidence: last.evidence,
     verdict: last.verdict,
     pendingCommands,
+    pendingHuman: last.state.pendingHuman,
     rounds,
     history: projectHistory(last.state),
   };
+}
+
+/**
+ * Retomada EXPLICITA de um run pausado em awaiting-human (issue #12): o
+ * estado persistido e a unica fonte (validateResumableRunState estrita) e a
+ * decisao e aplicada pelo kernel (HUMAN_DECISION_RECEIVED). REJEITA (lanca)
+ * em decisao/estado invalidos — nunca silencioso, nunca coercio; o adapter
+ * formata [code]. stop nao executa trabalho novo; resume abre EXATAMENTE uma
+ * rodada com o executor canonico preservado (sem sessionID, sem reselecao),
+ * sela a sessao pausada (fresh-check) e roda o scheduler compartilhado.
+ * NUNCA usa createRunState/selectExecutor/muda runID/reescreve contract.
+ */
+export async function runOrchestrationResume(
+  input: {
+    runID?: string;
+    state: RunState;
+    decision: HumanDecision;
+    /** Sessoes da rodada pausada (carregadas no checkpoint human-decision). */
+    workerSessionID?: string;
+    criticSessionID?: string;
+  },
+  deps: DispatcherDeps,
+): Promise<OrchestrationRunResult> {
+  const runID = input.runID ?? input.state.contract.runID;
+  const now = deps.now ?? Date.now;
+
+  // Estado persistido validado ANTES de qualquer efeito: phase awaiting-human,
+  // pendingHuman coerente, executor canonico, evidence+verdict da pausa.
+  validateResumableRunState(input.state, runID);
+
+  // O kernel aplica a decisao (autoridade final de fase/round/budget/executor)
+  // e lanca invalid-human-decision em decisao invalida (stale/forma/budget).
+  const applied = transitionRun(input.state, { type: "HUMAN_DECISION_RECEIVED", decision: input.decision });
+  const decidedState = applied.state;
+
+  // Storage-truth da autoridade aplicada ANTES de qualquer worker nova/efeito
+  // (ordem exigida: human-decision vem depois da pausa e antes de worker).
+  const pausedWorker = input.workerSessionID ?? input.state.executor?.sessionID;
+  await persist(deps, {
+    kind: "human-decision",
+    runID,
+    workerSessionID: pausedWorker,
+    criticSessionID: input.criticSessionID,
+    state: decidedState,
+    at: now(),
+  });
+
+  if (applied.commands.some((c) => c.type === "stop")) {
+    // stop: nenhum trabalho novo; auditoria na entry da rodada pausada.
+    return {
+      runID,
+      phase: decidedState.phase,
+      round: decidedState.round,
+      pendingCommands: applied.commands.map((c) => c.type),
+      pendingHuman: undefined,
+      rounds: [],
+      history: projectHistory(decidedState),
+    };
+  }
+
+  return await executeSchedule(deps, {
+    contract: decidedState.contract,
+    state: decidedState,
+    mode: "human-resume",
+    // A pausa preserva evidence + lastVerdict: viram o prev do recovery prompt.
+    prev: { verdict: input.state.lastVerdict as JevVerdict, evidence: input.state.evidence as EvidencePacket },
+    humanInstruction: input.decision.instruction,
+    // Sela TODAS as sessoes ja usadas no run (executor canonico, executor da
+    // evidence da pausa e worker/critic do checkpoint): a worker do resume
+    // precisa ser realmente fresca (human-resume-not-fresh).
+    seededSessions: [
+      ...(input.state.executor?.sessionID ? [input.state.executor.sessionID] : []),
+      ...(input.state.evidence?.executor?.sessionID ? [input.state.evidence.executor.sessionID] : []),
+      ...(input.workerSessionID ? [input.workerSessionID] : []),
+      ...(input.criticSessionID ? [input.criticSessionID] : []),
+    ],
+    now,
+    timeouts: {
+      worker: deps.workerTimeoutMs ?? WORKER_TIMEOUT_MS,
+      critic: deps.criticTimeoutMs ?? CRITIC_TIMEOUT_MS,
+      orchestrator: deps.orchestratorTimeoutMs ?? WORKER_TIMEOUT_MS,
+    },
+  });
 }
