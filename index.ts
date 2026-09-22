@@ -24,6 +24,7 @@ import {
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
+import { withResumeLock } from "./src/orchestration/resume-lock.ts";
 import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
 import {
   buildAgentCatalog,
@@ -1418,7 +1419,9 @@ export default Plugin.define({
           "(worker/critic/orchestrator) e rejeitada; input.callerRole e proibido no schema e na execucao. resume abre " +
           "exatamente uma rodada em mode human-resume com o executor canonico (sem reselecao); sem newMaxRounds o " +
           "orcamento nao muda e resume sem budget suficiente e rejeitado. stop encerra sem trabalho novo. Nunca ha " +
-          "auto-resume: o run permanece pausado ate a decisao humana explicita chegar por esta tool.",
+          "auto-resume: o run permanece pausado ate a decisao humana explicita chegar por esta tool. Chamadas " +
+          "simultaneas para o mesmo runID sao serializadas com ownership process-local: o segundo caller re-le o " +
+          "storage pos-winner e e rejeitado bounded, sem worker/critic novos.",
         input: {
           type: "object",
           properties: {
@@ -1486,24 +1489,30 @@ export default Plugin.define({
             }
             const runID = String(inputObj.runID ?? "");
             if (!runID) return { content: "orchestrate_resume: runID obrigatorio" };
-            // 4. O run persistido deve estar exatamente em awaiting-human
-            //    (nunca createRunState/selectExecutor/restart de history).
-            const stored: any = await safeStorageGet(ctx, `orchestration/run/${runID}`);
-            if (!stored || typeof stored !== "object" || Array.isArray(stored) || !stored.state) {
-              return { content: `[invalid-resumable-run] RunState nao retomavel: run ${runID} inexistente` };
-            }
-            validateResumableRunState(stored.state, runID);
-            const result = await runOrchestrationResume(
-              {
-                runID,
-                state: stored.state,
-                decision: inputObj.decision,
-                workerSessionID: stored.workerSessionID,
-                criticSessionID: stored.criticSessionID,
-              },
-              makeOrchestrationDeps(ctx, opts, getKey),
-            );
-            return { content: JSON.stringify(result) };
+            // 4. Serializacao por runID + RE-READ dentro do ownership (TOCTOU
+            //    #5769360749): o primeiro caller consome o pendingHuman; o
+            //    segundo espera, re-le o estado pos-winner e e rejeitado
+            //    bounded (nunca alcanca runOrchestrationResume, zero
+            //    worker/critic novos). O lock cobre toda a retomada do run e
+            //    libera em finally (sucesso, rejeicao ou throw).
+            return await withResumeLock(runID, async () => {
+              const stored: any = await safeStorageGet(ctx, `orchestration/run/${runID}`);
+              if (!stored || typeof stored !== "object" || Array.isArray(stored) || !stored.state) {
+                return { content: `[invalid-resumable-run] RunState nao retomavel: run ${runID} inexistente` };
+              }
+              validateResumableRunState(stored.state, runID);
+              const result = await runOrchestrationResume(
+                {
+                  runID,
+                  state: stored.state,
+                  decision: inputObj.decision,
+                  workerSessionID: stored.workerSessionID,
+                  criticSessionID: stored.criticSessionID,
+                },
+                makeOrchestrationDeps(ctx, opts, getKey),
+              );
+              return { content: JSON.stringify(result) };
+            });
           } catch (err) {
             if (err instanceof OrchestrationError) {
               return { content: `[${err.code}] ${err.message}` };

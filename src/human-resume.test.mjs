@@ -24,6 +24,7 @@ import { readFileSync } from "node:fs";
 
 import { createRunState, transitionRun } from "./orchestration/state-machine.ts";
 import { OrchestrationError } from "./orchestration/types.ts";
+import { resumeLockCount } from "./orchestration/resume-lock.ts";
 import {
   buildHumanRequest,
   validateHumanDecision,
@@ -1261,4 +1262,253 @@ describe("E2E: orchestrate_once -> orchestrate_resume no entrypoint real do plug
       stub.restore();
     }
   });
+});
+
+// ═══════════════════════════ RESUME13+: concurrent resume serialization (blocker #5769360749) ═══════════════════════════
+//
+// TOCTOU no seam publico: duas orchestrate_resume simultaneas (mesmo runID +
+// mesmo requestID) liam o mesmo awaiting-human antes de qualquer uma consumir
+// o pendingHuman, e ambas aplicavam HUMAN_DECISION_RECEIVED + criavam worker
+// round N+1. Estes testes exigem serializacao por runID com re-read dentro do
+// ownership: UM pendingHuman -> no maximo UMA retomada efetiva.
+
+/**
+ * Pausa um run via entrypoint real e instala a instrumentacao de concorrencia:
+ * - barrier: segura a PRIMEIRA prompt de worker round 2 dentro da execucao
+ *   (deferred explicito — sem sleep como sincronizacao);
+ * - events: log de entrada/saida de cada execute (prova de overlap real);
+ * - entered: resolve quando o winner esta segurado na secao critica.
+ */
+async function raceHarness(over = {}) {
+  const { m, stub, out, runID } = await pausedTool({
+    runID: over.runID ?? "race-13",
+    maxRounds: 1,
+    judgeSeq: [humanAnswers(), acceptAnswers()],
+    ...(over.judgeThrowAt !== undefined ? { judgeThrowAt: over.judgeThrowAt } : {}),
+  });
+  const requestID = out.pendingHuman.requestID;
+  let releaseGate;
+  const gate = new Promise((res) => { releaseGate = res; });
+  let enteredResolve;
+  const entered = new Promise((res) => { enteredResolve = res; });
+  let gated = false;
+  const gateRound = over.gateRound ?? 2;
+  const origPrompt = m.ctx.session.prompt;
+  m.ctx.session.prompt = async (args) => {
+    if (!gated && args?.metadata?.["jev-role"] === "worker" && args?.metadata?.["jev-round"] === gateRound) {
+      gated = true;
+      enteredResolve();
+      await gate;
+    }
+    return origPrompt(args);
+  };
+  const tool = m.tools.orchestrate_resume;
+  const origExecute = tool.execute;
+  const events = [];
+  let seq = 0;
+  tool.execute = async function (input, context) {
+    const id = events.filter((e) => e.t === "enter").length;
+    events.push({ t: "enter", id, s: seq++ });
+    try {
+      return await origExecute.call(this, input, context);
+    } finally {
+      events.push({ t: "exit", id, s: seq++ });
+    }
+  };
+  return { m, stub, out, runID, requestID, events, entered, releaseGate };
+}
+
+function parseResumeOut(res) {
+  try {
+    return { ok: true, body: JSON.parse(res.content) };
+  } catch {
+    return { ok: false, content: String(res.content) };
+  }
+}
+
+/** Overlap real: a segunda call entrou antes da primeira sair (contecao, nao sequencial). */
+function assertContended(events) {
+  const enters = events.filter((e) => e.t === "enter").map((e) => e.s).sort((a, b) => a - b);
+  const exits = events.filter((e) => e.t === "exit").map((e) => e.s).sort((a, b) => a - b);
+  assert.equal(enters.length, 2, "duas invocacoes entraram");
+  assert.equal(exits.length, 2, "duas invocacoes sairam");
+  assert.ok(enters[1] < exits[0], "segunda call comecou ANTES da primeira terminar (contecao real)");
+}
+
+function hdWritesFor(m, runID) {
+  return m.ctx.storage._log.filter(
+    (w) => w.key === `orchestration/run/${runID}` && w.value?.checkpoint === "human-decision",
+  );
+}
+
+function roundCreates(m, role, round) {
+  return m.workerCalls.create.filter(
+    (c) => c.metadata?.["jev-role"] === role && c.metadata?.["jev-round"] === round,
+  );
+}
+
+describe("RESUME13: concurrent duplicate resume consome pendingHuman exatamente uma vez", () => {
+  it(
+    "RESUME13: duas orchestrate_resume simultaneas (mesmo runID+requestID) -> UMA vitoria + UMA rejeicao bounded",
+    { timeout: 8000 },
+    async () => {
+      const { m, stub, runID, requestID, events, entered, releaseGate } = await raceHarness({ runID: "race-13" });
+      try {
+        const decision = { requestID, action: "resume", newMaxRounds: 2 };
+        const both = Promise.all([
+          m.tools.orchestrate_resume.execute({ runID, decision }, HUMAN_CALLER),
+          m.tools.orchestrate_resume.execute({ runID, decision }, HUMAN_CALLER),
+        ]);
+        // Winner segurado DENTRO da execucao round 2: o loser esta em voo.
+        await entered;
+        releaseGate();
+        const [r1, r2] = await both;
+        const parsed = [parseResumeOut(r1), parseResumeOut(r2)];
+        const wins = parsed.filter((p) => p.ok);
+        const losses = parsed.filter((p) => !p.ok);
+        assert.equal(wins.length, 1, `exatamente UMA retomada efetiva (fases: ${parsed.map((p) => (p.ok ? p.body.phase : p.content.slice(0, 60))).join(" | ")})`);
+        assert.equal(losses.length, 1, "exatamente UMA rejeicao bounded");
+        assert.equal(wins[0].body.phase, "completed", "winner completa a rodada retomada");
+        assert.equal(wins[0].body.round, 2, "round N+1 unica");
+        assert.match(losses[0].content, /invalid-resumable-run|invalid-human-decision/, "loser rejeitado bounded (nunca sucesso falso)");
+        assertContended(events);
+
+        // UM pendingHuman -> UMA human-decision efetiva para este request.
+        assert.equal(hdWritesFor(m, runID).length, 1, "uma unica human-decision para o requestID");
+        // UMA worker round 2 + UM critic round 2 (nunca duplicados).
+        assert.equal(roundCreates(m, "worker", 2).length, 1, "uma unica worker da nova rodada");
+        assert.equal(roundCreates(m, "critic", 2).length, 1, "um unico critic da nova rodada");
+        // Budget aplicado UMA vez: 1 -> 2, round 1 -> 2 (nunca round3).
+        const stored = m.storage._map.get(`orchestration/run/${runID}`);
+        assert.equal(stored.state.phase, "completed", "storage final = vitoria");
+        assert.equal(stored.state.round, 2);
+        assert.equal(stored.state.contract.maxRounds, 2, "orcamento 1->2 uma unica vez");
+        // Sem reselecao no resume: mesma canonical agent/model, sem route extra.
+        assert.equal(wins[0].body.selection, undefined, "sem selectExecutor na retomada");
+        const routes = stub.calls.filter((c) => c.body?.questions?.route);
+        assert.equal(routes.length, 1, "nenhum selectModel/selectAgent adicional");
+        assert.equal(resumeLockCount(), 0, "map keyed limpo apos o race");
+      } finally {
+        stub.restore();
+      }
+    },
+  );
+});
+
+describe("RESUME14: lock libera apos falha da retomada vencedora (sem deadlock/obrao)", () => {
+  it(
+    "RESUME14: winner falha (run-failed) -> lock liberado; chamada seguinte responde bounded",
+    { timeout: 8000 },
+    async () => {
+      const { m, stub, runID, requestID, entered, releaseGate } = await raceHarness({
+        runID: "race-14",
+        judgeThrowAt: 1, // julgamento da rodada retomada falha
+      });
+      try {
+        const first = m.tools.orchestrate_resume.execute(
+          { runID, decision: { requestID, action: "resume", newMaxRounds: 2 } },
+          HUMAN_CALLER,
+        );
+        await entered;
+        releaseGate();
+        const failed = parseResumeOut(await first);
+        assert.ok(failed.ok, "winner responde (falha bounded, nunca hang)");
+        assert.equal(failed.body.phase, "failed", "falha pos-resume persiste run-failed");
+        // Chamada subsequente ao MESMO run: lock foi liberado (timeout acima
+        // detectaria deadlock); responde bounded conforme o estado novo.
+        const second = parseResumeOut(
+          await m.tools.orchestrate_resume.execute(
+            { runID, decision: { requestID, action: "resume", newMaxRounds: 2 } },
+            HUMAN_CALLER,
+          ),
+        );
+        assert.ok(!second.ok, "segunda chamada rejeitada (run saiu de awaiting-human)");
+        assert.match(second.content, /invalid-resumable-run/, "bounded conforme persisted state");
+        const stored = m.storage._map.get(`orchestration/run/${runID}`);
+        assert.equal(stored.state.phase, "failed", "verdade do winner preservada");
+        assert.equal(resumeLockCount(), 0, "nenhuma fila keyed orfa apos falha");
+      } finally {
+        stub.restore();
+      }
+    },
+  );
+});
+
+describe("RESUME15: runIDs diferentes nao compartilham o lock de resume", () => {
+  it(
+    "RESUME15: resume de B completa enquanto resume de A esta segurado na secao critica",
+    { timeout: 8000 },
+    async () => {
+      const a = await raceHarness({ runID: "race-15a" });
+      const b = await raceHarness({ runID: "race-15b", gateRound: 99 }); // B nunca segura
+      try {
+        const decisionA = { requestID: a.requestID, action: "resume", newMaxRounds: 2 };
+        const decisionB = { requestID: b.requestID, action: "resume", newMaxRounds: 2 };
+        const pa = a.m.tools.orchestrate_resume.execute({ runID: a.runID, decision: decisionA }, HUMAN_CALLER);
+        const pb = b.m.tools.orchestrate_resume.execute({ runID: b.runID, decision: decisionB }, HUMAN_CALLER);
+        await a.entered; // A segurado DENTRO da execucao
+        // B completa ENQUANTO A esta segurado: independencia real (lock global
+        // travaria aqui ate o timeout).
+        const rb = parseResumeOut(await pb);
+        assert.ok(rb.ok && rb.body.phase === "completed", "B completa sem esperar A");
+        a.releaseGate();
+        const ra = parseResumeOut(await pa);
+        assert.ok(ra.ok && ra.body.phase === "completed", "A completa apos release");
+        assert.equal(roundCreates(a.m, "worker", 2).length, 1, "A: uma worker round 2");
+        assert.equal(roundCreates(b.m, "worker", 2).length, 1, "B: uma worker round 2");
+        assert.equal(hdWritesFor(a.m, a.runID).length, 1, "A: uma human-decision");
+        assert.equal(hdWritesFor(b.m, b.runID).length, 1, "B: uma human-decision");
+        assert.equal(resumeLockCount(), 0, "map keyed limpo apos ambos");
+      } finally {
+        a.stub.restore();
+        b.stub.restore();
+      }
+    },
+  );
+});
+
+describe("RESUME16: resume vs stop concorrentes tem um unico vencedor", () => {
+  it(
+    "RESUME16: mesmo requestID, resume+stop simultaneos -> UMA autoridade vence, outra e stale bounded",
+    { timeout: 8000 },
+    async () => {
+      const { m, stub, runID, requestID, events, entered, releaseGate } = await raceHarness({ runID: "race-16" });
+      try {
+        const both = Promise.all([
+          m.tools.orchestrate_resume.execute(
+            { runID, decision: { requestID, action: "resume", newMaxRounds: 2 } },
+            HUMAN_CALLER,
+          ),
+          m.tools.orchestrate_resume.execute({ runID, decision: { requestID, action: "stop" } }, HUMAN_CALLER),
+        ]);
+        // Se o resume estiver em voo, segura-o para garantir contecao; se o
+        // stop vencer direto, ambas assentam sem passar pela barrier.
+        const outcome = await Promise.race([entered.then(() => "held"), both.then(() => "settled")]);
+        if (outcome === "held") releaseGate();
+        const [rr, sr] = await both;
+        const parsed = [parseResumeOut(rr), parseResumeOut(sr)];
+        const wins = parsed.filter((p) => p.ok);
+        const losses = parsed.filter((p) => !p.ok);
+        assert.equal(wins.length, 1, "somente UMA decisao vence");
+        assert.equal(losses.length, 1, "a outra e stale bounded");
+        assert.match(losses[0].content, /invalid-resumable-run/, "perdedor nunca aplica segunda authority");
+        assert.ok(
+          wins[0].body.phase === "completed" || wins[0].body.phase === "stopped",
+          `vencedor terminal (fase: ${wins[0].body.phase})`,
+        );
+        assertContended(events);
+        // UMA unica human-decision para o request, qualquer que seja o vencedor.
+        assert.equal(hdWritesFor(m, runID).length, 1, "uma unica authority aplicada");
+        if (wins[0].body.phase === "completed") {
+          assert.equal(roundCreates(m, "worker", 2).length, 1, "resume venceu: uma worker round 2");
+        } else {
+          assert.equal(roundCreates(m, "worker", 2).length, 0, "stop venceu: nenhuma worker nova");
+          assert.deepEqual(wins[0].body.pendingCommands, ["stop"]);
+        }
+        assert.equal(resumeLockCount(), 0, "map keyed limpo apos o race");
+      } finally {
+        stub.restore();
+      }
+    },
+  );
 });
