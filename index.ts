@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import { AdmissionRpc, createAdmissionOrchestrateHandler } from "./src/orchestration/admission-rpc.ts";
 import { FREE_POOL, isFreeModel, resolveOptions, splitModelRef, type FreeModel, type RouteKind, type RouterOptions } from "./src/config.ts";
 import { resolveApiKey } from "./src/auth.ts";
 import {
@@ -1085,6 +1086,35 @@ export default Plugin.define({
     // Resolve por chamada (nao so no setup) para captar `export` ou
     // `/connect` feitos apos o load. resolveApiKey le a env primeiro.
     const getKey = () => resolveApiKey(ctx, opts.apiKeyEnv);
+
+    // Seam RPC PUBLICO bounded (#24): o gateway de admission deterministico
+    // persiste o prompt (resume:false) e dispara runOrchestrationOnce EXATAMENTE
+    // uma vez por identidade de turno, por aqui — sem parent/model trampoline.
+    // Server-side apenas; ctx sem rpc.register (ex.: lado TUI) = no-op.
+    if (ctx?.rpc && typeof ctx.rpc.register === "function") {
+      try {
+        await ctx.rpc.register(AdmissionRpc, {
+          orchestrate: createAdmissionOrchestrateHandler({
+            storage: {
+              get: (key: string) => safeStorageGet(ctx, key),
+              set: async (key: string, value: unknown) => {
+                await ctx.storage.set(key, value);
+              },
+            },
+            runner: (contract: ExecutionContract) =>
+              runOrchestrationOnce(contract, makeOrchestrationDeps(ctx, opts, getKey)),
+            publish: async (sessionID: string, text: string) => {
+              // resultado voltando a experiencia OpenCode SEM wake do parent:
+              // synthetic duravel (resume:false), API publica suportada.
+              await ctx.session.synthetic({ sessionID, text, resume: false });
+            },
+          }),
+        });
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err).split("\n")[0] ?? "erro";
+        console.error(`[opjev] rpc de admission indisponivel nesta superficie: ${msg.slice(0, 200)}`);
+      }
+    }
 
     await ctx.tool.transform((editor: any) => {
       editor.namespace({
