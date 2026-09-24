@@ -449,7 +449,10 @@ async function main() {
       execStartedCount(normal.sid) >= 1,
       `execStarted=${execStartedCount(normal.sid)}`,
     );
-    const msgs = await api("GET", `/api/session/${normal.sid}/message`);
+    const msgs = await waitFor(async () => {
+      const res = await api("GET", `/api/session/${normal.sid}/message`);
+      return /"role"\s*:\s*"assistant"/.test(res.text) ? res : null;
+    }, T.exec, "resposta nativa no transcript");
     assert(
       "normal: resposta nativa chega ao transcript",
       /"role"\s*:\s*"assistant"/.test(msgs.text),
@@ -605,6 +608,8 @@ async function main() {
   }
 
   // ---------------------------------------- 9. fase DUAS SESSOES (isolamento)
+  // IDs de mensagem sao GLOBAIS por upstream (runtime real: mesmo id em outra
+  // sessao => 409 ConflictError); isolamento usa MESMO texto com ids distintos.
   try {
     const mark = gwEvents.length;
     const [sa, sb] = await Promise.all([
@@ -614,10 +619,10 @@ async function main() {
     const sidA = parseDataId(sa.text);
     const sidB = parseDataId(sb.text);
     if (!sidA || !sidB) throw new Error("criacao de sessoes falhou");
-    const body = { text: "ORCH: mesmo texto nas duas sessoes", id: "msg_e2esame00000001" };
+    const text = "ORCH: mesmo texto nas duas sessoes";
     const [ra, rb] = await Promise.all([
-      api("POST", `/api/session/${sidA}/prompt`, body),
-      api("POST", `/api/session/${sidB}/prompt`, body),
+      api("POST", `/api/session/${sidA}/prompt`, { text, id: "msg_e2esame000000A1" }),
+      api("POST", `/api/session/${sidB}/prompt`, { text, id: "msg_e2esame000000B1" }),
     ]);
     assert("duas sessoes: ambas 200", ra.status === 200 && rb.status === 200, `a=${ra.status} b=${rb.status}`);
     await waitFor(() => since(mark).filter((e) => e.type === "rpc-dispatched").length === 2, 25000, "dispatch x2");
@@ -678,6 +683,39 @@ async function main() {
     assert("fase route", false, err.message);
   }
 
+  // ------------------------------------- 10b. fase INTERNA (anti-recursao real)
+  try {
+    const mark = gwEvents.length;
+    const admittedBefore = gwCount("admitted");
+    const rpcBefore = gwCount("rpc-dispatched");
+    const mk = await api("POST", "/api/session", {});
+    const sid = parseDataId(mk.text);
+    if (sid === null) throw new Error("criacao de sessao falhou");
+    const r = await api("POST", `/api/session/${sid}/prompt`, {
+      text: "ORCH: ataque recursivo com marcador interno",
+      metadata: { "jev-router": "orchestration-internal", "jev-role": "worker" },
+    });
+    assert("interna: prompt com marcador 200 (nativo preservado)", r.status === 200, `status=${r.status}`);
+    await waitFor(
+      () => since(mark).some((e) => e.type === "intercept" && e.mode === "normal"),
+      15000,
+      "intercept mode=normal (bypass)",
+    );
+    assert(
+      "interna: bypass sem admissao nem dispatch (zero recursao)",
+      gwCount("admitted") === admittedBefore && gwCount("rpc-dispatched") === rpcBefore,
+      `admitted=${gwCount("admitted") - admittedBefore} rpc=${gwCount("rpc-dispatched") - rpcBefore}`,
+    );
+    await waitFor(() => execStartedCount(sid) >= 1, T.exec, "execucao nativa do bypass");
+    assert(
+      "interna: bypass executa via caminho nativo (sem orchestration)",
+      execStartedCount(sid) >= 1,
+      `exec=${execStartedCount(sid)}`,
+    );
+  } catch (err) {
+    assert("fase interna", false, err.message);
+  }
+
   // ------------------------------------------------- 11. fase TUI REAL
   try {
     const gwMark = gwEvents.length;
@@ -688,7 +726,7 @@ async function main() {
       args: ["--server", gwOrigin],
       cwd: projectDir,
       env: { OPENCODE_PASSWORD: pw, HOME: homeDir, PATH: process.env.PATH ?? "" },
-      boot_ms: 12000,
+      boot_ms: 20000,
       steps: [
         { type: "ping normal pelo tui atraves do gateway", enter: true, after_enter_ms: 500 },
         {
@@ -696,12 +734,12 @@ async function main() {
             file: gwLogPath,
             regex: '"type":"intercept","sessionID":"[^"]+","mode":"normal"',
             min_extra: 1,
-            timeout_ms: 40000,
+            timeout_ms: 120000,
           },
         },
         { sleep_ms: 8000 },
         { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
-        { wait_log: { file: gwLogPath, regex: '"type":"rpc-dispatched"', min_extra: 1, timeout_ms: 90000 } },
+        { wait_log: { file: gwLogPath, regex: '"type":"rpc-dispatched"', min_extra: 1, timeout_ms: 180000 } },
         { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
         { sleep_ms: 12000 },
       ],
@@ -812,7 +850,11 @@ async function main() {
     );
     assert(
       "TUI orchestrate: parent=0 (nenhuma execucao nova do parent apos admission)",
-      tuiSid !== null && execAtOrch !== null && execStartedCount(tuiSid) === execAtOrch,
+      tuiSid !== null &&
+        execAtOrch !== null &&
+        execAtOrch === 0 &&
+        execStartedCount(tuiSid) === 0 &&
+        execStartedCount(tuiSid) === execAtOrch,
       `execAtOrch=${execAtOrch} final=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
     );
     assert(

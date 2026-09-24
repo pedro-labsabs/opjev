@@ -57,6 +57,11 @@ usada no design; tudo abaixo é endpoint/definição pública observada em runti
   - replay **pós-entrega** com o mesmo `id` pode devolver `time.created` novo —
     semântica de re-submissão após execução, por isso o gateway usa identidade
     **antes** de qualquer wake.
+  - **ESCOPO GLOBAL provado**: mesmo `id` em OUTRA sessão (sequencial) →
+    `409 {"_tag":"ConflictError","message":"Prompt message ID conflicts with
+    an existing durable record: ..."}`. Ids fornecidos pelo cliente são únicos
+    por upstream, não por sessão; isolamento cross-session usa mesmo texto com
+    ids distintos (I9/I9b + fase E2E "duas sessões").
 - **Não existe header de idempotência** no contrato e **não** existe wake genérico
   além do PATCH de inbox; não há WebSocket/upgrade no contrato público (somente
   endpoints PTY próprios). Event stream = SSE `GET /api/event`
@@ -232,3 +237,55 @@ Achados falsificados contra runtime v2.0.11 e corrigidos com TDD
    (overlap real = 4 modelos); o guardrail os exclui corretamente (route cai em
    fallback quando o router os sugere). Atualizar o pool é escopo do produto,
    não deste slice (sem mudança aqui).
+
+## 9. Segunda rodada de revisão + E2E real v2.0.11 (pós-correções)
+
+Revisão adversarial independente (todas com teste RED→GREEN salvo nota):
+
+- **C1 — assert TUI `parent=0` fraco**: amostrávamos `execAtOrch` após o
+  intercept e comparávamos só igualdade (parent=1 desde o início passaria).
+  Agora exige `execAtOrch === 0 && final === 0`.
+- **I1 — guarda de papel só no prompt-metadata**: POST com metadata limpa
+  endereçado a uma worker-session iniciaria orchestration aninhada. Agora em
+  duas camadas: gateway verifica a sessão (`GET`, best-effort, bypass para
+  normal) e o handler tem guarda autoritativa in-process (`internal-bypass`,
+  zero run/record; `index.ts` conectado ao ctx real). Cobertura: A12b + R-ROLE
+  + fase E2E "interna".
+- **I2 — fake mais rico que o real no GET de sessão**: modo `sessionBare`
+  (`{data:{id}}`) prova o caminho degradado (`rollback:false` + `route-partial`
+  contabilizado, A10c). (No runtime real, o GET de sessão expõe `model`
+  — fase E2E route logou `model:{id,providerID,...}` — então o rollback opera.)
+- **I3 — I7c provava re-dispatch, não dedupe**: modo `rpcDedupe` emula o record
+  durável (2ª RPC ⇒ `duplicate-ignored`); `rpcRuns === 1` com 2 RPCs no wire.
+- **I6 — gate humano corria entre check e dispatch**: lock de sessão externo +
+  re-check autoritativo dentro (ordem fixa sessão→turno, sem deadlock). R-GATE-RACE.
+- **M1 — truncamento de runID podia aliar identidades longas**: sufixo sha1-12
+  da identidade completa (nunca cortado pelo cap); R-IDENTIDADE estendido.
+- **M3 — timeout de request matava SSE ocioso**: `GET /api/event` isento
+  (fechamento segue por close/error); P17b com gap 900ms > timeout 300ms.
+- **I4 — chaves de admission sem prune: DOCUMENTADO, sem código**. Prune por
+  contagem reabriria turnos (replay de identidade podada iniciaria 2º run —
+  viola o hard gate). Retenção = mecanismo de durabilidade do run≤1
+  (~2 chaves pequenas/turno); limpeza pelo operador com a semântica explícita
+  de que replay de identidade limpa inicia um run novo.
+- **I5 — janela de crash microtask (started sem runner): ACEITO como
+  limitação**. Expiração de record reabriria double-run (indistinguível de
+  runner lento); consequência é run=0 fail-closed, nunca run=2 nem parent=1.
+- **M2/M4/M5/M6 — documentados**: retries em normal/route são turnos novos
+  (igual ao nativo); route do gateway usa defaults do router (guardrails
+  idênticos, decisão pode divergir do plugin); sniffer registra corpos
+  (artefato local em $E2E_ROOT, nunca commitar sem redigir); evicção FIFO de
+  records do gateway (500) afeta só diagnóstico (dedupe real vive no plugin).
+
+E2E real v2.0.11 (primeira execução completa, `OPENCODE_BIN` isolado):
+`intercept=1, admitted=1, rpc=1, parent=0, run=1 (K1=2, execs=2), notice
+publicado sem wake, duplicata→1 run, route aplicada (model visível na sessão),
+wire com ZERO PATCH de inbox, RPC sniffer==gateway, sem vazamento de
+credencial`. Falhas APENAS de harness, corrigidas: transcript lido sem espera
+(agora `waitFor`), mesma id em duas sessões (agora ids distintos — escopo
+global provado acima), timeouts do driver TUI curtos para o ambiente
+(boot 20s, waits 120s/180s). Observação fora do escopo: o run real terminou
+`phase: failed` por veredicto do dispatcher (`VERDICT accept incompatível`),
+com worker `succeeded` — admission/orquestração ocorreram 1×; o veredicto é
+assunto do kernel, não deste slice. Rodada final do E2E reexecutada no HEAD
+de entrega.
