@@ -197,3 +197,38 @@ intercept=1, admission=1, parent=0, RPC=1, run=1, worker=1, publicação sem wak
   replay = novo turno (idêntico ao nativo). Hash de texto nunca é usado.
 - Records de gateway são process-local (bounded, ≤500 entradas); o record
   durável de admission vive no storage do plugin.
+
+## 8. Revisão independente pós-implementação (branch `feat/deterministic-admission-gateway`)
+
+Achados falsificados contra runtime v2.0.11 e corrigidos com TDD
+(testes `src/gateway-*.test.mjs`, `src/admission-rpc.test.mjs`):
+
+1. **E2E travava na fase 5** — `await startSseObserver(...)` nunca resolve
+   (SSE fica aberto); nenhuma fase executava. Observer agora roda em background.
+2. **Tunel de upgrade corrompido** — `proxyUpgrade` escrevia o head cru como
+   corpo de um `http.request` (head duplicado; upstream respondia 404).
+   Trocado por túnel TCP bruto (`net`/`tls`), provado por P18 (101 + eco).
+   O sniffer do E2E destruía upgrades no meio da cadeia; agora tunela também.
+3. **Route parcial silenciosa** — `decideAndApplyRoute` aplicava model e, se o
+   agent falhasse depois, caía em "fallback normal" com a sessão mutada.
+   Agora: captura o modelo anterior (`GET /api/session/:sid`, best-effort),
+   rollback best-effort do model, contador/evento próprios `route-partial`
+   (A10b). Switch para o mesmo modelo = no-op semântico (fallback limpo).
+4. **Record mentiroso em falha de persistência** — falha no `set` do binding
+   (pré-run) deixava record `started` sem runner (replay bloqueado p/ sempre).
+   Agora: marca `binding-failed` + erro explícito; replay retoma com run≤1
+   (R-PERSIST). Janela residual honesta: crash do processo no gap de microtask
+   entre o `set` do record e a invocação do runner deixa `started` sem runner;
+   replay então ignora (fail-closed, run≤1; recuperação por limpeza de record).
+5. **Semântica de restart em duas camadas** — restart do gateway perde records
+   locais: replay readmite e re-dispara a RPC; o record durável do plugin
+   responde `duplicate-ignored` (run≤1). Provado em I7c (gateway) + R7b (handler
+   novo sobre o mesmo storage). Idempotência concorrente provada até 5× (I7b).
+6. **Deadline de teardown de socket** — P17 falhava em 2s; o fechamento
+   server-side após cancelamento segue o teardown keep-alive da plataforma
+   (~4s observados; upstream já via o close). Deadline 8s, sem leak real.
+7. **FREE_POOL parcialmente fora do catálogo real** — `opencode/big-pickle` e
+   `opencode/mimo-v2.5-free` não existem no catálogo v2.0.11 observado
+   (overlap real = 4 modelos); o guardrail os exclui corretamente (route cai em
+   fallback quando o router os sugere). Atualizar o pool é escopo do produto,
+   não deste slice (sem mudança aqui).

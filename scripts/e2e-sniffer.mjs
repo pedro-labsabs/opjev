@@ -13,6 +13,7 @@
 //      E2E_SNIFF_LOG (JSONL de saida).
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 
 const upstreamRaw = process.env.E2E_SNIFF_UPSTREAM ?? "";
@@ -123,10 +124,51 @@ const server = http.createServer((req, res) => {
   req.on("error", () => res.destroy());
 });
 
-// Contrato publico v2.0.11 nao tem WS; registramos upgrade como anomalia.
-server.on("upgrade", (req, socket) => {
+// Contrato publico v2.0.11 nao tem WS; tunelamos upgrade bruto (bytes verbatim)
+// para nao quebrar nada que o runtime venha a usar — e registramos a ocorrencia.
+server.on("upgrade", (req, socket, head) => {
   record({ dir: "upgrade", path: req.url });
-  socket.destroy();
+  const up = net.connect(Number(upstream.port), upstream.hostname, () => {
+    const lines = [];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i];
+      if (String(name).toLowerCase() === "host") continue;
+      lines.push(`${name}: ${req.rawHeaders[i + 1]}`);
+    }
+    lines.push(`Host: ${upstream.host}`);
+    up.write(`${req.method} ${req.url} HTTP/1.1\r\n${lines.join("\r\n")}\r\n\r\n`);
+    if (head && head.length > 0) up.write(head);
+    up.pipe(socket);
+    socket.pipe(up);
+  });
+  const destroy = () => {
+    try {
+      up.destroy();
+    } catch {
+      // ja fechado
+    }
+    try {
+      socket.destroy();
+    } catch {
+      // ja fechado
+    }
+  };
+  up.on("error", destroy);
+  socket.on("error", destroy);
+  up.on("close", () => {
+    try {
+      socket.destroy();
+    } catch {
+      // ja fechado
+    }
+  });
+  socket.on("close", () => {
+    try {
+      up.destroy();
+    } catch {
+      // ja fechado
+    }
+  });
 });
 
 server.listen(listenPort, "127.0.0.1", () => {

@@ -414,7 +414,12 @@ async function main() {
   );
 
   // ------------------------------------------------------ 5. observer SSE
-  await startSseObserver(gwOrigin, auth);
+  // Roda em BACKGROUND por design: a conexao SSE permanece aberta durante
+  // todo o E2E, entao aguardar sua conclusao travaria todas as fases
+  // seguintes (falsificavel: com `await`, nenhuma sessao jamais e criada).
+  startSseObserver(gwOrigin, auth).catch((err) => {
+    log(`observer SSE encerrado: ${err.message.slice(0, 200)}`);
+  });
 
   // ---------------------------------------------- 6. fase NORMAL (API)
   const normal = { sid: null };
