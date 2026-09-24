@@ -148,6 +148,27 @@ test("R7: duplicata sequencial e CONCORRENTE -> UM run efetivo", async () => {
   assert.equal(state.runs.length, 1, "EXATAMENTE um run para a identidade");
 });
 
+test("R7b: novo handler sobre o MESMO storage (restart de processo) -> replay continua idempotente", async () => {
+  const first = fakeDeps();
+  const out1 = await first.handler(VALID);
+  assert.equal(out1.status, "started");
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(first.state.runs.length, 1);
+
+  // "Restart": handler novo, storage duravel compartilhado, runner novo contavel.
+  const second = fakeDeps();
+  second.deps.storage.get = async (key) => first.store.get(key);
+  second.deps.storage.set = async (key, value) => {
+    first.store.set(key, value);
+  };
+  const revived = createAdmissionOrchestrateHandler(second.deps);
+  const out2 = await revived(VALID);
+  assert.equal(out2.status, "duplicate-ignored", "record duravel sobrevive ao restart");
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(second.state.runs.length, 0, "nenhum run novo apos restart");
+  assert.equal(first.state.runs.length, 1, "exatamente 1 run no total");
+});
+
 test("R13: binding em awaiting-human -> ZERO auto-resume, zero run", async () => {
   const { store, state, handler } = fakeDeps();
   store.set(sessionBindingKey(VALID.sessionID), {
@@ -185,6 +206,29 @@ test("R-FALHA: run que falha -> record failed, notice de erro publicado, replay 
   assert.equal(state.runs.length, 0, "zero execucoes (todas falharam, nenhuma nova)");
   const runsAfterFail = state.runs.length;
   assert.equal(runsAfterFail, state.runs.length);
+});
+
+test("R-PERSIST: falha de persistencia pre-run NAO mente 'started' e permite retry sem duplicar", async () => {
+  const { deps, store, state, handler } = fakeDeps();
+  const realSet = deps.storage.set.bind(deps.storage);
+  // Falha apenas na escrita do binding (record ja gravado): o runner NUNCA rodou.
+  deps.storage.set = async (key, value) => {
+    if (key === sessionBindingKey(VALID.sessionID)) throw new Error("storage do binding fora do ar");
+    return realSet(key, value);
+  };
+  await assert.rejects(() => handler(VALID), /binding|persistencia/i, "erro explicito bounded ao cliente");
+  assert.equal(state.runs.length, 0, "runner nunca executou");
+  const record = store.get(admissionRecordKey(VALID.sessionID, VALID.messageID));
+  assert.notEqual(record?.state, "started", "record nao pode mentir 'started' sem runner");
+  assert.equal(record?.state, "binding-failed", "falha pre-run registrada com diagnostico");
+
+  // storage volta: replay da mesma identidade retoma (runner ainda nunca rodou => run<=1)
+  deps.storage.set = realSet;
+  const retry = await handler(VALID);
+  assert.equal(retry.status, "started", "retry apos falha pre-run e admitido");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(state.runs.length, 1, "EXATAMENTE um run no total (nunca dois)");
+  assert.equal(store.get(admissionRecordKey(VALID.sessionID, VALID.messageID)).state, "completed");
 });
 
 test("R12: input invalido -> rejeicao bounded; superficie RPC = so `orchestrate`", async () => {

@@ -170,9 +170,12 @@ export function createAdmissionOrchestrateHandler(
     const recordKey = admissionRecordKey(sessionID, messageID);
 
     return await withKeyedLock(runID, async () => {
-      // 2. idempotencia por record: mesma identidade => nunca um run extra
+      // 2. idempotencia por record: mesma identidade => nunca um run extra.
+      // Excecao: "binding-failed" significa que a persistencia pre-run falhou
+      // ANTES de qualquer runner (provado abaixo: o runner so e invocado apos
+      // os dois sets); nesse caso o retry e seguro e continua com run<=1.
       const prior = asRecord(await deps.storage.get(recordKey));
-      if (prior && prior.runID === runID) {
+      if (prior && prior.runID === runID && prior.state !== "binding-failed") {
         return { runID, status: "duplicate-ignored" };
       }
 
@@ -184,8 +187,28 @@ export function createAdmissionOrchestrateHandler(
         ...(maxRounds !== undefined ? { maxRounds } : {}),
       });
 
-      await deps.storage.set(recordKey, { runID, state: "started" });
-      await deps.storage.set(sessionBindingKey(sessionID), { runID, phase: "running" });
+      // 4. persistencia pre-run: se QUALQUER set falhar, o runner NUNCA rodou.
+      // Nao deixar "started" mentiroso: marca diagnostico retryable e propaga
+      // erro explicito (o gateway responde 502 fail-closed; o replay retoma).
+      // Janela residual honesta: crash do processo entre o set do record e a
+      // invocacao do runner (gap de microtask) deixa "started" sem runner;
+      // replay entao ignora (fail-closed, run<=1 preservado; recuperacao via
+      // expiracao/limpeza de record pelo operador — ver limitacao documentada).
+      try {
+        await deps.storage.set(recordKey, { runID, state: "started", at: Date.now() });
+        await deps.storage.set(sessionBindingKey(sessionID), { runID, phase: "running", at: Date.now() });
+      } catch (err) {
+        const error = boundedError(err);
+        try {
+          await deps.storage.set(recordKey, { runID, state: "binding-failed", error, at: Date.now() });
+        } catch {
+          // storage totalmente fora do ar: o erro propagado preserva o diagnostico
+        }
+        throw new OrchestrationError(
+          "admission-persistence-failed",
+          `persistencia pre-run falhou (runner nao executado): ${error}`,
+        );
+      }
 
       // 4. EXATAMENTE uma execucao; conclusao assincrona => record + notice
       void (async () => {
