@@ -170,6 +170,29 @@ test("P18: upgrade tunela bytes brutos sem corromper (sem head duplicado)", asyn
   }
 });
 
+test("P17b: SSE ocioso alem do proxyTimeoutMs NAO e morto pelo gateway", async () => {
+  const up = await startFakeUpstream({ sseGapMs: 900 });
+  const gw = await startGateway(up.url, testConfig({ proxyTimeoutMs: 300 }));
+  try {
+    const res = await fetch(`${gw.url}/api/event`);
+    assert.equal(res.status, 200);
+    const reader = res.body.getReader();
+    async function nextChunk() {
+      const { value, done } = await reader.read();
+      assert.ok(!done, "stream morto pelo timeout do gateway");
+      return Buffer.from(value).toString("utf8");
+    }
+    const c1 = await nextChunk();
+    assert.match(c1, /"first"/);
+    const c2 = await nextChunk();
+    assert.match(c2, /"second"/, "segundo chunk apos gap > timeout chega intacto");
+    await reader.cancel();
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("P17: SSE streama progressivo pelo gateway e cancelamento do cliente fecha upstream sem leak", async () => {
   const up = await startFakeUpstream();
   const gw = await startGateway(up.url, testConfig());

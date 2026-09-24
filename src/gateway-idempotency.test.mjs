@@ -100,14 +100,12 @@ test("I7b: CINCO duplicatas concorrentes com id real -> UM run efetivo", async (
   }
 });
 
-test("I7c: restart do gateway -> replay readmite e re-RPC, mas o record DURAVEL do plugin continua unico", async () => {
-  // Semantica honesta em duas camadas: records do gateway sao process-local
-  // (bounded, diagnostico); a unicidade cross-processo vive no record duravel
-  // do plugin (storage). Apos restart, o gateway readmite (mesmo msg_) e
-  // re-dispara a RPC; o handler duravel responde duplicate-ignored (run<=1).
-  // Aqui: o fake upstream conta a segunda RPC; o teste documenta o re-dispatch
-  // do gateway e a ausencia de segundo run *no nivel do gateway*.
-  const up = await startFakeUpstream();
+test("I7c: restart do gateway -> record DURAVEL do plugin mantem run<=1", async () => {
+  // Semantica em duas camadas: records do gateway sao process-local (o
+  // gateway readmite e re-dispara a RPC apos restart); a unicidade
+  // cross-processo vive no record duravel do plugin (aqui emulado por
+  // rpcDedupe: segunda RPC da mesma identidade => duplicate-ignored).
+  const up = await startFakeUpstream({ rpcDedupe: true });
   const payload = { id: "msg_restart1", text: "ORCH: restart" };
   const gw1 = await startGateway(up.url, testConfig({ rules: RULES }));
   try {
@@ -122,11 +120,11 @@ test("I7c: restart do gateway -> replay readmite e re-RPC, mas o record DURAVEL 
     const r2 = await orch(gw2, "ses_restart", payload);
     assert.equal(r2.status, 200, "replay apos restart responde nativo");
     assert.equal(r2.body.data.id, "msg_restart1", "mesma identidade duravel readmitida");
-    assert.equal(up.state.rpcs.length, 2, "gateway sem memoria re-dispara a RPC (record process-local)");
+    assert.equal(up.state.rpcs.length, 2, "gateway sem memoria re-dispara a RPC no wire");
     assert.equal(up.state.patches.length, 0, "nenhum wake em nenhum momento");
-    // Nota: contra o plugin REAL, a segunda RPC retorna duplicate-ignored
-    // (record duravel orchestration/admission/<sid>/<mid>) — run efetivo <=1.
-    // O E2E real (fase duplicata + notices) prova a ponta do handler.
+    assert.equal(up.state.rpcRuns, 1, "record DURAVEL: UM run efetivo apesar de 2 RPCs no wire");
+    assert.equal(gw2.counters().rpcDispatched, 1, "gateway registra o re-dispatch como diagnostico");
+    assert.equal(gw2.counters().rpcSkippedDuplicate, 0, "skip local nao se aplica pos-restart (memoria perdida)");
   } finally {
     await gw2.close();
     await up.close();
@@ -155,14 +153,15 @@ test("I8: duas mensagens IDENTICAS sem id -> DUAS admissions (turnos distintos p
   }
 });
 
-test("I9: duas sessoes -> isolamento de locks/records (mesmo id/texto nunca cruza)", async () => {
+test("I9: duas sessoes -> isolamento de locks/records (mesmo texto nunca cruza)", async () => {
   const up = await startFakeUpstream();
   const gw = await startGateway(up.url, testConfig({ rules: RULES }));
   try {
-    const payload = { id: "msg_shared", text: "ORCH: mesmo id em sessoes distintas" };
+    // Mesmo texto, identidades DISTINTAS (ids sao globais por upstream: o
+    // mesmo id em outra sessao e 409 — ver I9b). Turnos distintos => 2 runs.
     const [a, b] = await Promise.all([
-      orch(gw, "ses_left", payload),
-      orch(gw, "ses_right", payload),
+      orch(gw, "ses_left", { id: "msg_shared_left", text: "ORCH: mesmo texto em sessoes distintas" }),
+      orch(gw, "ses_right", { id: "msg_shared_right", text: "ORCH: mesmo texto em sessoes distintas" }),
     ]);
     assert.equal(a.status, 200);
     assert.equal(b.status, 200);
@@ -172,6 +171,24 @@ test("I9: duas sessoes -> isolamento de locks/records (mesmo id/texto nunca cruz
     assert.equal(gw.counters().rpcDispatched, 2);
     const keys = gw.counters().records.map((r) => `${r.sessionID}|${r.runID}`);
     assert.equal(new Set(keys).size, 2, "records isolados por sessao");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
+test("I9b: mesmo id em OUTRA sessao -> 409 nativo passthrough, zero RPC, zero wake", async () => {
+  const up = await startFakeUpstream();
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const first = await orch(gw, "ses_one", { id: "msg_global1", text: "ORCH: primeira" });
+    assert.equal(first.status, 200);
+    assert.equal(up.state.rpcs.length, 1);
+    const clash = await orch(gw, "ses_two", { id: "msg_global1", text: "ORCH: colisao global de id" });
+    assert.equal(clash.status, 409, "conflito global repassado verbatim (pre-admissao)");
+    assert.equal(up.state.rpcs.length, 1, "sem admissao -> sem RPC nova");
+    assert.equal(up.state.patches.length, 0, "nunca wake");
+    assert.equal(gw.counters().admitted, 1, "segunda sessao nao e admitida");
   } finally {
     await gw.close();
     await up.close();

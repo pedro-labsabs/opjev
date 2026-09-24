@@ -16,9 +16,9 @@ import {
   validateExecutionContract,
   type ExecutionContract,
 } from "./types.ts";
+import { createHash } from "node:crypto";
 
 export const ADMISSION_RUN_ID_CAP = 200;
-export const ADMISSION_RUN_ID_SLUG = 80;
 
 // ───────────────────────── chaves de persistencia ─────────────────────────
 
@@ -51,12 +51,18 @@ export function bindingStatusFromPhase(phase: unknown): string {
  * (sessionID + messageID) — NUNCA de hash(texto). Duas mensagens
  * legitimamente identicas com messageID distinto permanecem turnos
  * distintos. Sanitizado para chaves de storage e capped em 200 chars.
+ * O sufixo e um hash curto da identidade COMPLETA (nao truncada): sem ele,
+ * duas identidades longas differing so alem do corte colidiriam.
  */
 export function autoAdmissionRunID(sessionID: string, messageID: string): string {
   const slug = (v: unknown): string => String(v ?? "").replace(/[^A-Za-z0-9._-]/g, "_");
-  const s = slug(sessionID).slice(0, ADMISSION_RUN_ID_SLUG) || "anon";
-  const m = slug(messageID).slice(0, ADMISSION_RUN_ID_SLUG) || "anon";
-  const raw = `auto-${s}-${m}`;
+  const s = slug(sessionID).slice(0, 60) || "anon";
+  const m = slug(messageID).slice(0, 60) || "anon";
+  const digest = createHash("sha1")
+    .update(`${String(sessionID ?? "")}\0${String(messageID ?? "")}`, "utf8")
+    .digest("hex")
+    .slice(0, 12);
+  const raw = `auto-${s}-${m}-${digest}`;
   return raw.length > ADMISSION_RUN_ID_CAP ? raw.slice(0, ADMISSION_RUN_ID_CAP) : raw;
 }
 

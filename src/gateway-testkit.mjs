@@ -18,11 +18,20 @@ export async function startFakeUpstream(opts = {}) {
       { id: "build", name: "Build", mode: "primary" },
       { id: "plan", name: "Plan", mode: "primary" },
     ],
+    // gap entre chunks do SSE fake (prova que o gateway nao mata stream
+    // ocioso com timeout de request; default 150ms como antes)
+    sseGapMs: opts.sseGapMs ?? 150,
+    // sessionBare: GET de sessao sem model/agent (forma degradada — o parser
+    // do gateway trata como estado desconhecido, nunca como erro)
+    sessionBare: opts.sessionBare ?? false,
     // ok | fail500 | hang (nunca responde = ambiguo)
     promptMode: opts.promptMode ?? "ok",
     // ok | fail500 | invalid-shape (200 sem output.runID)
     rpcMode: opts.rpcMode ?? "ok",
     rpcDelayMs: opts.rpcDelayMs ?? 0,
+    // rpcDedupe: emula o record DURAVEL do plugin (segunda RPC da mesma
+    // identidade retorna duplicate-ignored, sem novo run — run<=1 cross-restart)
+    rpcDedupe: opts.rpcDedupe ?? false,
     modelSwitchFail: opts.modelSwitchFail ?? false,
     agentSwitchFail: opts.agentSwitchFail ?? false,
     catalogFail: opts.catalogFail ?? false,
@@ -35,19 +44,28 @@ export async function startFakeUpstream(opts = {}) {
     models: [],
     agents: [],
     rpcs: [],
+    rpcRuns: 0,     // runs EFETIVOS criados no modo rpcDedupe (segunda RPC nao cria)
     upgrades: [],   // upgrade attempts (tunel bruto do proxy)
     sse: { connections: 0, closedEarly: 0, completed: 0 },
   };
 
   let msgSeq = 0;
-  const idem = new Map(); // `${sid}\0${id}` -> msgID (idempotencia por id real)
-  const sessions = new Map(); // sid -> {model: {providerID,id}, agent} (estado p/ rollback)
+  const rpcAdmissions = new Map(); // `${sid}\0${mid}` -> {runID, runs} (record duravel p/ rpcDedupe)
+  // Identidade GLOBAL do upstream (runtime real v2.0.11 provado): ids de
+  // mensagem fornecidos pelo cliente sao unicos por upstream, NAO por sessao
+  // (mesmo id em outra sessao => 409 ConflictError). Replay na MESMA sessao
+  // com o mesmo id => 200 idempotente com o mesmo item.
+  const idem = new Map(); // clientID -> {sid, msgID}
+  const sessions = new Map(); // sid -> {model: {providerID,id}, agent, metadata} (estado p/ rollback)
+  const sessionMetadata = opts.sessionMetadata ?? {};
   function sessionState(sid) {
     let s = sessions.get(sid);
     if (!s) {
       // Default DIFERENTE do lane fast-coding: garante que um switch de route
       // real muda o estado (exercicio honesto do rollback parcial).
       s = { model: { providerID: "opencode", id: "muse-spark-1.3-contributor-free" }, agent: "build" };
+      const meta = sessionMetadata[sid];
+      if (meta !== null && typeof meta === "object" && !Array.isArray(meta)) s.metadata = meta;
       sessions.set(sid, s);
     }
     return s;
@@ -82,13 +100,13 @@ export async function startFakeUpstream(opts = {}) {
         res.write('data: {"type":"first"}\n\n');
         setTimeout(() => {
           if (!closed && !res.writableEnded && !res.destroyed) res.write('data: {"type":"second"}\n\n');
-        }, 150);
+        }, cfg.sseGapMs);
         setTimeout(() => {
           if (!closed && !res.destroyed) {
             res.end();
             state.sse.completed += 1;
           }
-        }, 320);
+        }, cfg.sseGapMs + 200);
         return;
       }
 
@@ -154,13 +172,27 @@ export async function startFakeUpstream(opts = {}) {
         let msgID;
         let createdItem = true;
         if (clientId !== undefined) {
-          const key = `${sid}\0${clientId}`;
-          if (idem.has(key)) {
-            msgID = idem.get(key);
+          const known = idem.get(clientId);
+          if (known !== undefined) {
+            if (known.sid !== sid) {
+              // Conflito global de identidade (runtime real: 409 ConflictError):
+              // o item pertence a outra sessao; nada e criado aqui.
+              state.prompts.push({ path, raw, parsed, createdItem: false, sid, conflict: true });
+              res.writeHead(409, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  _tag: "ConflictError",
+                  message: `Prompt message ID conflicts with an existing durable record: ${clientId}`,
+                  resource: clientId,
+                }),
+              );
+              return;
+            }
+            msgID = known.msgID;
             createdItem = false; // replay idempotente: MESMO item, count=1
           } else {
             msgID = clientId;
-            idem.set(key, msgID);
+            idem.set(clientId, { sid, msgID });
           }
         } else {
           msgSeq += 1;
@@ -200,7 +232,20 @@ export async function startFakeUpstream(opts = {}) {
         const sid = decodeURIComponent(sessionGetMatch[1]);
         const st = sessionState(sid);
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: { id: sid, model: st.model, agent: st.agent } }));
+        if (cfg.sessionBare) {
+          res.end(JSON.stringify({ data: { id: sid } }));
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            data: {
+              id: sid,
+              model: st.model,
+              agent: st.agent,
+              ...(st.metadata !== undefined ? { metadata: st.metadata } : {}),
+            },
+          }),
+        );
         return;
       }
 
@@ -274,6 +319,21 @@ export async function startFakeUpstream(opts = {}) {
           }
           const sid = String(input?.sessionID ?? "ses_x");
           const mid = String(input?.messageID ?? "msg_x");
+          if (cfg.rpcDedupe) {
+            const key = `${sid}\0${mid}`;
+            const known = rpcAdmissions.get(key);
+            if (known !== undefined) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ output: { runID: known.runID, status: "duplicate-ignored" } }));
+              return;
+            }
+            const runID = `auto-${sid}-${mid}`;
+            rpcAdmissions.set(key, { runID, runs: 1 });
+            state.rpcRuns += 1;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ output: { runID, status: "started" } }));
+            return;
+          }
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ output: { runID: `auto-${sid}-${mid}`, status: "started" } }));
         };

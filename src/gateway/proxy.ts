@@ -66,6 +66,16 @@ export function proxyRequest(
   }
 
   const lib = opts.protocol === "https:" ? https : http;
+  // SSE (/api/event) e stream de vida longa: timeout de request o mataria em
+  // gaps ociosos (churn de reconexao imposto pelo gateway). Isento por path
+  // exato; o fechamento continua observado (close/error destroem o upstream).
+  let isEventStream = false;
+  try {
+    isEventStream =
+      clientReq.method === "GET" && new URL(clientReq.url ?? "/", "http://gateway").pathname === "/api/event";
+  } catch {
+    isEventStream = false;
+  }
   const upReq = lib.request(
     {
       protocol: opts.protocol,
@@ -84,9 +94,11 @@ export function proxyRequest(
     },
   );
 
-  upReq.setTimeout(opts.timeoutMs, () => {
-    upReq.destroy(new Error("timeout de inatividade do upstream"));
-  });
+  if (!isEventStream) {
+    upReq.setTimeout(opts.timeoutMs, () => {
+      upReq.destroy(new Error("timeout de inatividade do upstream"));
+    });
+  }
 
   upReq.on("error", (err) => {
     if (!clientRes.headersSent) {
