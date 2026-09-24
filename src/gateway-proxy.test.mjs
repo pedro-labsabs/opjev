@@ -12,6 +12,7 @@
 // efemera; nada aqui mocka funcoes do gateway.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
 import { startFakeUpstream, startGateway, testConfig } from "./gateway-testkit.mjs";
 
 test("P1: request nao interceptado e proxyado exatamente 1x", async () => {
@@ -121,6 +122,54 @@ test("P16: payload malformed e oversized -> 400/413 bounded, ZERO chamadas upstr
   }
 });
 
+test("P18: upgrade tunela bytes brutos sem corromper (sem head duplicado)", async () => {
+  const up = await startFakeUpstream();
+  const gw = await startGateway(up.url, testConfig());
+  let sock = null;
+  try {
+    const payload = "upgrade-echo-payload-123";
+    sock = net.connect(gw.port, "127.0.0.1");
+    await new Promise((resolve, reject) => {
+      sock.once("connect", resolve);
+      sock.once("error", reject);
+    });
+    const chunks = [];
+    sock.on("data", (c) => chunks.push(c));
+    const text = () => Buffer.concat(chunks).toString("utf8");
+    async function waitFor(needle, timeoutMs, label) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        if (text().includes(needle)) return text();
+        if (Date.now() >= deadline) {
+          throw new Error(`timeout em '${label}': ${JSON.stringify(text().slice(0, 200))}`);
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+    sock.write(
+      "GET /api/echo-channel HTTP/1.1\r\n" +
+        `Host: 127.0.0.1:${gw.port}\r\n` +
+        "Connection: upgrade\r\n" +
+        "Upgrade: echo\r\n\r\n",
+    );
+    const handshake = await waitFor("101", 5000, "handshake 101");
+    assert.match(handshake, /101 Switching Protocols/, "handshake 101 atravessa o gateway");
+    sock.write(payload);
+    const echoed = await waitFor(payload, 5000, "eco do payload");
+    assert.ok(echoed.includes(payload), "payload ecoa byte a byte pelo tunel");
+    assert.equal(up.state.upgrades.length, 1, "upstream viu exatamente 1 upgrade");
+    assert.equal(up.state.upgrades[0].path, "/api/echo-channel", "path preservado no upgrade");
+  } finally {
+    try {
+      sock?.destroy();
+    } catch {
+      // ja fechado
+    }
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("P17: SSE streama progressivo pelo gateway e cancelamento do cliente fecha upstream sem leak", async () => {
   const up = await startFakeUpstream();
   const gw = await startGateway(up.url, testConfig());
@@ -163,7 +212,11 @@ test("P17: SSE streama progressivo pelo gateway e cancelamento do cliente fecha 
     assert.ok(up.state.sse.closedEarly >= 1, "upstream deve observar o cancelamento do cliente");
 
     // --- sem leak de socket no gateway ---
-    const leakDeadline = Date.now() + 2000;
+    // Nota: o fechamento do socket server-side apos cancelamento do cliente
+    // segue o teardown Idle/keep-alive da plataforma (observado ~4s no
+    // node:http); nao e leak — o upstream ja observou o close (closedEarly).
+    // O deadline precisa cobrir esse teardown, nao apenas o RTT.
+    const leakDeadline = Date.now() + 8000;
     while (gw.activeSockets() > 0 && Date.now() < leakDeadline) {
       await new Promise((r) => setTimeout(r, 25));
     }

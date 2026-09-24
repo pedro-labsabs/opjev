@@ -8,11 +8,14 @@
 //   - timeout por INATIVIDADE de socket (nao mata stream longo com trafego);
 //   - headers hop-by-hop retirados; Authorization do cliente preservado;
 //     Authorization proprio SO quando o cliente nao enviou (nunca logado);
-//   - upgrade/WS: tunel TCP bruto (o contrato publico nao declara WS, mas o
-//     proxy nao pode quebrar eventos de upgrade que um runtime venha a usar).
+//   - upgrade: tunel TCP bruto (bytes do handshake reescritos so no Host e
+//     repassados verbatim; nunca via http.request, que emitiria um segundo
+//     head e corromperia o handshake).
 
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
+import tls from "node:tls";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 const HOP_BY_HOP = new Set([
@@ -107,7 +110,11 @@ export function proxyRequest(
   }
 }
 
-/** Tunel de upgrade/WS: repassa o request bruto e faz pipe bidirecional. */
+/**
+ * Tunel de upgrade: TCP bruto ate o upstream (tal qual o cliente enviou, com
+ * Host reescrito). Usar http.request aqui corromperia o handshake (o client
+ * HTTP emitiria o proprio head ANTES dos bytes crus do upgrade).
+ */
 export function proxyUpgrade(
   req: IncomingMessage,
   clientSocket: import("node:stream").Duplex,
@@ -125,45 +132,60 @@ export function proxyUpgrade(
   headLines.push(`Host: ${opts.host}`);
   const requestHead = `${req.method} ${req.url} HTTP/1.1\r\n${headLines.join("\r\n")}\r\n\r\n`;
 
-  const lib = opts.protocol === "https:" ? https : http;
-  const upReq = lib.request({
-    protocol: opts.protocol,
-    hostname: opts.hostname,
-    port: opts.port,
-    method: req.method,
-    path: req.url,
-    headers: { host: opts.host },
-  });
-
-  upReq.on("upgrade", (upRes, upSocket, upHead) => {
-    const responseLines = [
-      `HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage ?? "Switching Protocols"}`,
-    ];
-    for (let i = 0; i < upRes.rawHeaders.length; i += 2) {
-      responseLines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
+  const destroyBoth = (upSocket: import("node:stream").Duplex): void => {
+    try {
+      upSocket.destroy();
+    } catch {
+      // melhor esforco
     }
-    clientSocket.write(`${responseLines.join("\r\n")}\r\n\r\n`);
-    if (upHead && upHead.length > 0) clientSocket.write(upHead);
+    try {
+      clientSocket.destroy();
+    } catch {
+      // melhor esforco
+    }
+  };
+
+  const onConnect = (upSocket: import("node:stream").Duplex): void => {
+    upSocket.write(requestHead);
+    if (head && head.length > 0) upSocket.write(head);
     upSocket.pipe(clientSocket);
     clientSocket.pipe(upSocket);
-    const destroy = () => {
-      upSocket.destroy();
-      clientSocket.destroy();
-    };
-    upSocket.on("close", destroy);
-    clientSocket.on("close", destroy);
-  });
-  upReq.on("response", (upRes) => {
-    // upstream respondeu HTTP simples em vez de upgrade: repassa e fecha
-    clientSocket.end(
-      `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage ?? ""}\r\nConnection: close\r\n\r\n`,
+    upSocket.on("close", () => {
+      try {
+        clientSocket.destroy();
+      } catch {
+        // ja fechado
+      }
+    });
+    clientSocket.on("close", () => {
+      try {
+        upSocket.destroy();
+      } catch {
+        // ja fechado
+      }
+    });
+  };
+
+  const onError = (upSocket: import("node:stream").Duplex): void => {
+    destroyBoth(upSocket);
+  };
+
+  let upSocket: import("node:net").Socket | import("node:tls").TLSSocket;
+  if (opts.protocol === "https:") {
+    upSocket = tls.connect(
+      { host: opts.hostname, port: opts.port, servername: opts.hostname },
+      () => onConnect(upSocket),
     );
-    upRes.resume();
+  } else {
+    upSocket = net.connect({ host: opts.hostname, port: opts.port }, () => onConnect(upSocket));
+  }
+  upSocket.setTimeout(opts.timeoutMs, () => destroyBoth(upSocket));
+  upSocket.on("error", () => onError(upSocket));
+  clientSocket.on("error", () => {
+    try {
+      upSocket.destroy();
+    } catch {
+      // ja fechado
+    }
   });
-  upReq.on("error", () => clientSocket.destroy());
-  clientSocket.on("error", () => upReq.destroy());
-  upReq.setTimeout(opts.timeoutMs, () => upReq.destroy());
-  upReq.write(requestHead);
-  if (head && head.length > 0) upReq.write(head);
-  upReq.end();
 }
