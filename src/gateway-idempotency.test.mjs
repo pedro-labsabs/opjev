@@ -78,6 +78,61 @@ test("I7: duplicata CONCORRENTE com id real + replay -> UM run efetivo", async (
   }
 });
 
+test("I7b: CINCO duplicatas concorrentes com id real -> UM run efetivo", async () => {
+  const up = await startFakeUpstream({ rpcDelayMs: 60 });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const payload = { id: "msg_dup5", text: "ORCH: cinco concorrentes" };
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => orch(gw, "ses_i7b", payload)),
+    );
+    for (const r of results) assert.equal(r.status, 200);
+    const ids = results.map((r) => r.body.data.id);
+    assert.ok(ids.every((id) => id === "msg_dup5"), "todas devolvem a mesma identidade");
+    const dispatched = gw.counters().records.filter((r) => r.state === "started").length;
+    assert.equal(up.state.rpcs.length, 1, "UM run efetivo entre 5 concorrentes");
+    assert.equal(dispatched, 1);
+    assert.equal(gw.counters().rpcSkippedDuplicate, 4, "4 duplicatas suprimidas e registradas");
+    assert.equal(up.state.patches.length, 0, "nunca wake");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
+test("I7c: restart do gateway -> replay readmite e re-RPC, mas o record DURAVEL do plugin continua unico", async () => {
+  // Semantica honesta em duas camadas: records do gateway sao process-local
+  // (bounded, diagnostico); a unicidade cross-processo vive no record duravel
+  // do plugin (storage). Apos restart, o gateway readmite (mesmo msg_) e
+  // re-dispara a RPC; o handler duravel responde duplicate-ignored (run<=1).
+  // Aqui: o fake upstream conta a segunda RPC; o teste documenta o re-dispatch
+  // do gateway e a ausencia de segundo run *no nivel do gateway*.
+  const up = await startFakeUpstream();
+  const payload = { id: "msg_restart1", text: "ORCH: restart" };
+  const gw1 = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const r1 = await orch(gw1, "ses_restart", payload);
+    assert.equal(r1.status, 200);
+  } finally {
+    await gw1.close();
+  }
+  assert.equal(up.state.rpcs.length, 1, "primeiro dispatch antes do restart");
+  const gw2 = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const r2 = await orch(gw2, "ses_restart", payload);
+    assert.equal(r2.status, 200, "replay apos restart responde nativo");
+    assert.equal(r2.body.data.id, "msg_restart1", "mesma identidade duravel readmitida");
+    assert.equal(up.state.rpcs.length, 2, "gateway sem memoria re-dispara a RPC (record process-local)");
+    assert.equal(up.state.patches.length, 0, "nenhum wake em nenhum momento");
+    // Nota: contra o plugin REAL, a segunda RPC retorna duplicate-ignored
+    // (record duravel orchestration/admission/<sid>/<mid>) — run efetivo <=1.
+    // O E2E real (fase duplicata + notices) prova a ponta do handler.
+  } finally {
+    await gw2.close();
+    await up.close();
+  }
+});
+
 test("I8: duas mensagens IDENTICAS sem id -> DUAS admissions (turnos distintos preservados)", async () => {
   const up = await startFakeUpstream();
   const gw = await startGateway(up.url, testConfig({ rules: RULES }));

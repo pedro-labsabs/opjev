@@ -35,11 +35,23 @@ export async function startFakeUpstream(opts = {}) {
     models: [],
     agents: [],
     rpcs: [],
+    upgrades: [],   // upgrade attempts (tunel bruto do proxy)
     sse: { connections: 0, closedEarly: 0, completed: 0 },
   };
 
   let msgSeq = 0;
   const idem = new Map(); // `${sid}\0${id}` -> msgID (idempotencia por id real)
+  const sessions = new Map(); // sid -> {model: {providerID,id}, agent} (estado p/ rollback)
+  function sessionState(sid) {
+    let s = sessions.get(sid);
+    if (!s) {
+      // Default DIFERENTE do lane fast-coding: garante que um switch de route
+      // real muda o estado (exercicio honesto do rollback parcial).
+      s = { model: { providerID: "opencode", id: "muse-spark-1.3-contributor-free" }, agent: "build" };
+      sessions.set(sid, s);
+    }
+    return s;
+  }
 
   function readBody(req) {
     return new Promise((resolve, reject) => {
@@ -182,6 +194,16 @@ export async function startFakeUpstream(opts = {}) {
         return;
       }
 
+      // ---- sessao (leitura de estado p/ rollback de route) -------------------
+      const sessionGetMatch = req.method === "GET" && /^\/api\/session\/([^/]+)$/.exec(path);
+      if (sessionGetMatch) {
+        const sid = decodeURIComponent(sessionGetMatch[1]);
+        const st = sessionState(sid);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { id: sid, model: st.model, agent: st.agent } }));
+        return;
+      }
+
       // ---- switches de route ----------------------------------------------
       const modelMatch = req.method === "POST" && /^\/api\/session\/([^/]+)\/model$/.exec(path);
       if (modelMatch) {
@@ -191,6 +213,14 @@ export async function startFakeUpstream(opts = {}) {
           res.writeHead(500, { "content-type": "application/json" });
           res.end('{"error":"switch-model-down"}');
           return;
+        }
+        try {
+          const m = JSON.parse(raw.toString("utf8"))?.model;
+          if (m && typeof m.providerID === "string" && typeof m.id === "string") {
+            sessionState(decodeURIComponent(modelMatch[1])).model = { providerID: m.providerID, id: m.id };
+          }
+        } catch {
+          // estado best-effort; o switch ja foi aceito
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
@@ -205,6 +235,14 @@ export async function startFakeUpstream(opts = {}) {
           res.writeHead(500, { "content-type": "application/json" });
           res.end('{"error":"switch-agent-down"}');
           return;
+        }
+        try {
+          const a = JSON.parse(raw.toString("utf8"))?.agent;
+          if (typeof a === "string" && a.length > 0) {
+            sessionState(decodeURIComponent(agentMatch[1])).agent = a;
+          }
+        } catch {
+          // estado best-effort; o switch ja foi aceito
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
@@ -256,6 +294,25 @@ export async function startFakeUpstream(opts = {}) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
 
+  // ---- upgrade bruto (eco): prova que o tunel do gateway nao corrompe ----
+  const upgradeSockets = new Set();
+  server.on("upgrade", (req, socket) => {
+    state.upgrades.push({ path: req.url });
+    upgradeSockets.add(socket);
+    socket.on("close", () => upgradeSockets.delete(socket));
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n");
+    socket.on("data", (chunk) => {
+      if (!socket.destroyed) socket.write(chunk); // eco byte a byte
+    });
+    socket.on("error", () => {
+      try {
+        socket.destroy();
+      } catch {
+        // ja fechado
+      }
+    });
+  });
+
   return {
     url: `http://127.0.0.1:${port}`,
     port,
@@ -265,6 +322,13 @@ export async function startFakeUpstream(opts = {}) {
       return state.order.map((e) => e.kind);
     },
     async close() {
+      for (const s of upgradeSockets) {
+        try {
+          s.destroy();
+        } catch {
+          // ja fechado
+        }
+      }
       server.closeAllConnections?.();
       await new Promise((resolve) => server.close(resolve));
     },
