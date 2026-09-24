@@ -183,6 +183,29 @@ test("A5: modo orchestrate -> persist-first resume:false, NUNCA wake, dispatch R
   }
 });
 
+test("A10c: sessao sem estado legivel -> parcial honesto com rollback=false (nunca silencioso)", async () => {
+  const up = await startFakeUpstream({ agentSwitchFail: true, sessionBare: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_bare/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ROUTE: quick fix" }),
+    });
+    assert.equal(res.status, 200, "fallback responde nativo mesmo sem estado previo");
+    assert.equal(up.state.prompts.length, 1, "exatamente 1 forward (pre-admissao)");
+    assert.equal(up.state.models.length, 1, "sem estado anterior: NENHUM rollback inventado");
+    const c = gw.counters();
+    assert.equal(c.routeApplied, 0);
+    assert.equal(c.routePartial, 1, "parcial contabilizado mesmo sem rollback possivel");
+    const partial = gw.logs.find((l) => l.includes("route-partial"));
+    assert.ok(partial && partial.includes('"rollback":false'), "evento declara rollback=false");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("A10b: falha de agent APOS model aplicado -> rollback best-effort, parcial NUNCA silencioso", async () => {
   const up = await startFakeUpstream({ agentSwitchFail: true });
   const gw = await startGateway(up.url, testConfig({ rules: RULES }));
@@ -214,6 +237,31 @@ test("A10b: falha de agent APOS model aplicado -> rollback best-effort, parcial 
       !gw.logs.some((l) => l.includes('"type":"route"') && l.includes("ses_partial")),
       "parcial nao se disfarca de route aplicada",
     );
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
+test("A12b: sessao interna (metadata worker) com prompt limpo -> bypass, sem orchestration aninhada", async () => {
+  const up = await startFakeUpstream({
+    sessionMetadata: {
+      ses_worker1: { "jev-router": INTERNAL_WORKER_MARKER, "jev-role": INTERNAL_WORKER_ROLE },
+    },
+  });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_worker1/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ORCH: nested attack with clean metadata" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(up.state.prompts.length, 1, "forward normal 1x (comportamento nativo preservado)");
+    assert.equal(up.state.prompts[0].parsed.resume, undefined, "nunca vira admissao/orchestrate");
+    assert.equal(up.state.rpcs.length, 0, "ZERO dispatch para sessao interna");
+    assert.equal(up.state.patches.length, 0);
+    assert.equal(gw.counters().admitted, 0, "admissao zerada para sessao interna");
   } finally {
     await gw.close();
     await up.close();

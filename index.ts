@@ -1108,6 +1108,22 @@ export default Plugin.define({
               // synthetic duravel (resume:false), API publica suportada.
               await ctx.session.synthetic({ sessionID, text, resume: false });
             },
+            // Guarda de papel autoritativa (#24/I1): sessoes internas nunca
+            // iniciam orchestration aninhada (o gateway filtra best-effort
+            // antes; aqui e in-process). Leitura indisponivel => permite.
+            isInternalSession: async (sessionID: string) => {
+              try {
+                const info: any = await ctx.session.get({ sessionID });
+                const metadata = info?.metadata;
+                return (
+                  isInternalWorkerSession(metadata) ||
+                  isInternalCriticSession(metadata) ||
+                  isInternalOrchestratorSession(metadata)
+                );
+              } catch {
+                return false;
+              }
+            },
           }),
         });
       } catch (err) {

@@ -135,12 +135,16 @@ export class UpstreamClient {
   }
 
   /**
-   * Leitura best-effort do estado da sessao (para rollback de route parcial).
-   * Parse defensivo: o contrato pode expor model como string "prov/id", como
-   * Model.Ref {providerID,id}, ou nao expor nada (ausencia => undefined, sem
-   * throw — o chamador trata como rollback indisponivel, nunca como erro).
+   * Leitura best-effort do estado da sessao (para rollback de route parcial e
+   * guarda de papel interno). Parse defensivo: model pode vir como string
+   * "prov/id", como Model.Ref {providerID,id}, ou nao vir (ausencia =>
+   * undefined, sem throw); metadata ausente/ilegivel => undefined.
    */
-  async getSession(sessionID: string): Promise<{ model?: { providerID: string; id: string }; agent?: string }> {
+  async getSession(sessionID: string): Promise<{
+    model?: { providerID: string; id: string };
+    agent?: string;
+    metadata?: Record<string, unknown>;
+  }> {
     const out = await this.requestOk("GET", `/api/session/${encodeURIComponent(sessionID)}`);
     let data: unknown;
     try {
@@ -151,7 +155,7 @@ export class UpstreamClient {
     }
     if (data === null || typeof data !== "object" || Array.isArray(data)) return {};
     const d = data as Record<string, unknown>;
-    const result: { model?: { providerID: string; id: string }; agent?: string } = {};
+    const result: { model?: { providerID: string; id: string }; agent?: string; metadata?: Record<string, unknown> } = {};
     const m = d.model;
     if (typeof m === "string" && m.includes("/")) {
       const sep = m.indexOf("/");
@@ -168,6 +172,10 @@ export class UpstreamClient {
     if (typeof a === "string" && a.length > 0) result.agent = a;
     else if (a !== null && typeof a === "object" && !Array.isArray(a) && typeof (a as { id?: unknown }).id === "string") {
       result.agent = (a as { id: string }).id;
+    }
+    const meta = d.metadata;
+    if (meta !== null && typeof meta === "object" && !Array.isArray(meta)) {
+      result.metadata = meta as Record<string, unknown>;
     }
     return result;
   }

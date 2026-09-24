@@ -23,6 +23,7 @@ import { decideAndApplyRoute } from "./route.ts";
 import { autoAdmissionRunID } from "../orchestration/admission.ts";
 import { AdmissionRpc } from "../orchestration/admission-rpc.ts";
 import { withKeyedLock } from "../lock.ts";
+import { isInternalOrchestrationSession } from "../worker-hooks.ts";
 
 export interface GatewayRecord {
   runID: string;
@@ -230,6 +231,29 @@ export function createGatewayServer(
     }
 
     // ---------------- orchestrate: persist-first, nunca wake ----------------
+    // Guarda de papel em duas camadas: o prompt-metadata ja foi filtrado na
+    // decisao (internal-bypass); aqui a SESSAO-alvo e verificada best-effort
+    // (worker/critic/orchestrator nunca atravessam para outra orchestration).
+    // Papel interno confirmado => forward normal (pre-admissao, nativo, zero
+    // orchestration). Leitura indisponivel => segue (a guarda autoritativa
+    // vive no handler do plugin, com acesso in-process a sessao); a falha de
+    // leitura e emitida para diagnostico.
+    if (decision.mode === "orchestrate") {
+      let internalSession = false;
+      try {
+        const sess = await upstream.getSession(sessionID);
+        internalSession = isInternalOrchestrationSession(sess.metadata);
+      } catch (err) {
+        emit("session-check-failed", { sessionID, error: bounded(err) });
+      }
+      if (internalSession) {
+        emit("internal-session-bypass", { sessionID });
+        counters.forwarded += 1;
+        proxyRequest(req, res, proxyOpts(read.body));
+        return;
+      }
+    }
+
     let admit: { status: number; body: Buffer };
     try {
       admit = await upstream.admitPrompt(sessionID, admissionForwardFields(parsed.body));
