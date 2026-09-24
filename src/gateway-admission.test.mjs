@@ -183,6 +183,43 @@ test("A5: modo orchestrate -> persist-first resume:false, NUNCA wake, dispatch R
   }
 });
 
+test("A10b: falha de agent APOS model aplicado -> rollback best-effort, parcial NUNCA silencioso", async () => {
+  const up = await startFakeUpstream({ agentSwitchFail: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_partial/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ROUTE: quick fix" }),
+    });
+    assert.equal(res.status, 200, "fallback responde nativo mesmo com parcial");
+    assert.equal(up.state.prompts.length, 1, "exatamente 1 forward (pre-admissao)");
+    assert.equal(up.state.models.length, 2, "model aplicado + rollback best-effort");
+    assert.equal(up.state.agents.length, 1, "agent falhou 1x");
+    // rollback EFETIVO: estado final da sessao == estado anterior
+    const final = await (await fetch(`${up.url}/api/session/ses_partial`)).json();
+    assert.equal(final.data?.model?.id, "muse-spark-1.3-contributor-free", "rollback restaurou o modelo anterior");
+    const c = gw.counters();
+    assert.equal(c.routeApplied, 0, "route NAO conta como aplicada");
+    assert.equal(c.routePartial, 1, "parcial registrado em contador proprio (nunca fallback silencioso)");
+    assert.ok(
+      c.records.length === 0 || c.records.every((r) => r.state !== "started"),
+      "nenhum record de orchestration em caminho route",
+    );
+    assert.ok(
+      gw.logs.some((l) => l.includes("route-partial")),
+      "evento route-partial emitido no log diagnostico",
+    );
+    assert.ok(
+      !gw.logs.some((l) => l.includes('"type":"route"') && l.includes("ses_partial")),
+      "parcial nao se disfarca de route aplicada",
+    );
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("A11: falha pos-admissao -> fail-closed 502, nunca re-encaminha/wake, record preservado", async () => {
   // RPC do plugin falha depois da admissao duravel
   {

@@ -17,6 +17,13 @@ export interface RouteOutcome {
   applied: boolean;
   decision?: RouteDecision;
   reason?: string;
+  /**
+   * Parcial NAO-silencioso: model foi aplicado mas o agent falhou depois.
+   * `rollback` indica se o modelo anterior foi restaurado best-effort
+   * (false quando o estado anterior era desconhecido — documentado, nunca
+   * mascarado como fallback limpo).
+   */
+  partial?: { modelApplied: string; rollback: boolean };
 }
 
 function bounded(err: unknown): string {
@@ -72,8 +79,45 @@ export async function decideAndApplyRoute(input: {
     const sep = decision.model.indexOf("/");
     const providerID = decision.model.slice(0, sep);
     const modelID = decision.model.slice(sep + 1);
+    // Estado anterior best-effort (para rollback se o agent falhar depois).
+    // Ausente/ilegivel => rollback indisponivel (parcial documentado, nunca
+    // mascarado como fallback limpo).
+    let beforeModel: { providerID: string; id: string } | undefined;
+    try {
+      const current = await input.upstream.getSession(input.sessionID);
+      beforeModel = current.model;
+    } catch {
+      beforeModel = undefined;
+    }
     await input.upstream.switchModel(input.sessionID, { providerID, id: modelID });
-    await input.upstream.switchAgent(input.sessionID, decision.agent);
+    try {
+      await input.upstream.switchAgent(input.sessionID, decision.agent);
+    } catch (err) {
+      // Switch de model para o MESMO estado anterior = no-op semantico:
+      // nenhum side effect parcial, fallback limpo e honesto.
+      if (
+        beforeModel !== undefined &&
+        beforeModel.providerID === providerID &&
+        beforeModel.id === modelID
+      ) {
+        return { applied: false, decision, reason: `agent switch falhou (model inalterado): ${bounded(err)}` };
+      }
+      let rollback = false;
+      if (beforeModel !== undefined) {
+        try {
+          await input.upstream.switchModel(input.sessionID, beforeModel);
+          rollback = true;
+        } catch {
+          rollback = false;
+        }
+      }
+      return {
+        applied: false,
+        decision,
+        reason: `agent switch falhou apos model aplicado (${bounded(err)}); rollback=${rollback}`,
+        partial: { modelApplied: decision.model, rollback },
+      };
+    }
     return { applied: true, decision };
   } catch (err) {
     return { applied: false, reason: bounded(err) };

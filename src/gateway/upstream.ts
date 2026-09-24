@@ -135,6 +135,44 @@ export class UpstreamClient {
   }
 
   /**
+   * Leitura best-effort do estado da sessao (para rollback de route parcial).
+   * Parse defensivo: o contrato pode expor model como string "prov/id", como
+   * Model.Ref {providerID,id}, ou nao expor nada (ausencia => undefined, sem
+   * throw — o chamador trata como rollback indisponivel, nunca como erro).
+   */
+  async getSession(sessionID: string): Promise<{ model?: { providerID: string; id: string }; agent?: string }> {
+    const out = await this.requestOk("GET", `/api/session/${encodeURIComponent(sessionID)}`);
+    let data: unknown;
+    try {
+      const parsed = out.json() as { data?: unknown };
+      data = parsed?.data;
+    } catch {
+      return {};
+    }
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return {};
+    const d = data as Record<string, unknown>;
+    const result: { model?: { providerID: string; id: string }; agent?: string } = {};
+    const m = d.model;
+    if (typeof m === "string" && m.includes("/")) {
+      const sep = m.indexOf("/");
+      const providerID = m.slice(0, sep);
+      const id = m.slice(sep + 1);
+      if (providerID.length > 0 && id.length > 0) result.model = { providerID, id };
+    } else if (m !== null && typeof m === "object" && !Array.isArray(m)) {
+      const mm = m as Record<string, unknown>;
+      const providerID = typeof mm.providerID === "string" ? mm.providerID : undefined;
+      const id = typeof mm.id === "string" ? mm.id : typeof mm.modelID === "string" ? mm.modelID : undefined;
+      if (providerID && id) result.model = { providerID, id };
+    }
+    const a = d.agent;
+    if (typeof a === "string" && a.length > 0) result.agent = a;
+    else if (a !== null && typeof a === "object" && !Array.isArray(a) && typeof (a as { id?: unknown }).id === "string") {
+      result.agent = (a as { id: string }).id;
+    }
+    return result;
+  }
+
+  /**
    * Admissao persist-first: prompt com resume:false. Campos passados sao
    * somente os conhecidos do contrato (texto/files/metadata/delivery/id real).
    * Resposta nativa devolvida verbatim para o cliente.

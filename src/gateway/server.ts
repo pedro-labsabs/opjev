@@ -39,6 +39,8 @@ export interface GatewayCounters {
   rpcSkippedDuplicate: number;
   routeApplied: number;
   routeFallback: number;
+  /** Route com side effect parcial (model aplicado, agent falhou): nunca silencioso. */
+  routePartial: number;
   rejected: number;
   failClosed: number;
   ambiguous: number;
@@ -122,6 +124,7 @@ export function createGatewayServer(
     rpcSkippedDuplicate: 0,
     routeApplied: 0,
     routeFallback: 0,
+    routePartial: 0,
     rejected: 0,
     failClosed: 0,
     ambiguous: 0,
@@ -208,6 +211,14 @@ export function createGatewayServer(
           model: outcome.decision?.model,
           agent: outcome.decision?.agent,
           via: outcome.decision?.via,
+        });
+      } else if (outcome.partial !== undefined) {
+        counters.routePartial += 1;
+        emit("route-partial", {
+          sessionID,
+          modelApplied: outcome.partial.modelApplied,
+          rollback: outcome.partial.rollback,
+          reason: bounded(outcome.reason ?? "agent switch falhou apos model aplicado"),
         });
       } else {
         counters.routeFallback += 1;
