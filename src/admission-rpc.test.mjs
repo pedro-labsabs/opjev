@@ -106,6 +106,12 @@ test("R-IDENTIDADE: runID deriva de sessionID+messageID — NUNCA hash(text)", a
   assert.notEqual(a, d, "sessao distinta => runID distinto");
   assert.ok(a.startsWith("auto-ses_x-msg_1".slice(0, 10)), "runID legivel a partir da identidade");
 
+  // sufixo anti-aliasing: identidades longas differing so alem do corte nao colidem
+  const long1 = autoAdmissionRunID(`ses_${"a".repeat(120)}X`, "msg_1");
+  const long2 = autoAdmissionRunID(`ses_${"a".repeat(120)}Y`, "msg_1");
+  assert.notEqual(long1, long2, "truncamento nunca alia identidades distintas");
+  assert.ok(long1.length <= 200 && long2.length <= 200, "runID capped");
+
   // contrato: objective identico com messageID distinto gera contracts distintos
   const k1 = buildAutomaticExecutionContract({ sessionID: "ses_x", messageID: "msg_1", objective: "mesmo texto" });
   const k2 = buildAutomaticExecutionContract({ sessionID: "ses_x", messageID: "msg_2", objective: "mesmo texto" });
@@ -167,6 +173,40 @@ test("R7b: novo handler sobre o MESMO storage (restart de processo) -> replay co
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(second.state.runs.length, 0, "nenhum run novo apos restart");
   assert.equal(first.state.runs.length, 1, "exatamente 1 run no total");
+});
+
+test("R-ROLE: sessao interna -> internal-bypass, zero run, zero record", async () => {
+  const { store, state, handler } = fakeDeps({
+    isInternalSession: async () => true,
+  });
+  const out = await handler(VALID);
+  assert.equal(out.status, "internal-bypass");
+  assert.equal(out.runID, autoAdmissionRunID(VALID.sessionID, VALID.messageID));
+  assert.equal(state.runs.length, 0, "NENHUM run para sessao interna");
+  assert.equal(state.published.length, 0);
+  assert.equal(store.has(admissionRecordKey(VALID.sessionID, VALID.messageID)), false, "sem record");
+});
+
+test("R-GATE-RACE: binding vira awaiting-human entre check e dispatch -> ZERO run novo", async () => {
+  const { deps, store, state, handler } = fakeDeps();
+  // O binding muda DEPOIS da primeira leitura (outro run completou com gate
+  // humano enquanto este dispatch aguardava o lock): o re-check dentro do
+  // lock precisa enxergar e bloquear.
+  let bindingReads = 0;
+  const realGet = deps.storage.get.bind(deps.storage);
+  deps.storage.get = async (key) => {
+    const v = await realGet(key);
+    if (key === sessionBindingKey(VALID.sessionID)) {
+      bindingReads += 1;
+      if (bindingReads >= 2) return { runID: "auto-outro-run", phase: "awaiting-human" };
+    }
+    return v;
+  };
+  const out = await handler(VALID);
+  assert.equal(out.status, "awaiting-human-no-resume", "re-check dentro do lock bloqueia");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(state.runs.length, 0, "NENHUM runner apos flip do binding");
+  assert.equal(store.has(admissionRecordKey(VALID.sessionID, VALID.messageID)), false, "sem record");
 });
 
 test("R13: binding em awaiting-human -> ZERO auto-resume, zero run", async () => {

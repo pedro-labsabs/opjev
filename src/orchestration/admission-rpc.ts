@@ -122,6 +122,14 @@ export interface AdmissionHandlerDeps {
     worker?: { outcome?: string };
   }>;
   publish(sessionID: string, text: string): Promise<void>;
+  /**
+   * Guarda de papel autoritativa (opcional): true = sessao interna
+   * (worker/critic/orchestrator) => bypass sem run e sem record. Ausente =
+   * permite (testes hermeticos; em producao o index.ts conecta ao ctx real e
+   * o gateway ja filtra best-effort antes). Erro do seam = permite (a
+   * indisponibilidade da leitura nao pode travar turnos legitimos aqui).
+   */
+  isInternalSession?: (sessionID: string) => Promise<boolean>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -155,6 +163,20 @@ export function createAdmissionOrchestrateHandler(
     const input = validateAdmissionOrchestrateInput(rawInput);
     const { sessionID, messageID, objective, maxRounds } = input;
 
+    // 0. guarda de papel autoritativa: sessao interna nunca inicia orchestration
+    // (o gateway ja filtra best-effort; aqui e in-process, sem rede).
+    if (deps.isInternalSession !== undefined) {
+      let internal = false;
+      try {
+        internal = await deps.isInternalSession(sessionID);
+      } catch {
+        internal = false;
+      }
+      if (internal) {
+        return { runID: autoAdmissionRunID(sessionID, messageID), status: "internal-bypass" };
+      }
+    }
+
     // 1. gate humano primeiro: prevalece sobre idempotencia (zero auto-resume)
     const binding = asRecord(await deps.storage.get(sessionBindingKey(sessionID)));
     const bindingRunID = binding !== undefined && typeof binding.runID === "string" ? binding.runID : "";
@@ -168,8 +190,28 @@ export function createAdmissionOrchestrateHandler(
 
     const runID = autoAdmissionRunID(sessionID, messageID);
     const recordKey = admissionRecordKey(sessionID, messageID);
+    // Lock de SESSAO (externo) + lock de TURNO (interno): admissoes da mesma
+    // sessao serializam o trecho gate+record, fechando a corrida em que o
+    // binding vira awaiting-human entre o check e o dispatch de outro turno.
+    // Sessoes distintas nunca se tocam (chaves distintas, sem deadlock: ordem
+    // fixa sessao->turno, chaves sempre diferentes).
+    const sessionLockKey = `admission/session/${sessionID}`;
 
-    return await withKeyedLock(runID, async () => {
+    return await withKeyedLock(sessionLockKey, async () => {
+      // Re-check AUTORITATIVO do gate humano dentro do lock de sessao (o
+      // fast-path acima e so atalho; este prevalece sobre idempotencia).
+      const innerBinding = asRecord(await deps.storage.get(sessionBindingKey(sessionID)));
+      const innerBindingRunID =
+        innerBinding !== undefined && typeof innerBinding.runID === "string" ? innerBinding.runID : "";
+      if (
+        innerBinding !== undefined &&
+        innerBindingRunID !== "" &&
+        bindingStatusFromPhase(innerBinding.phase) === "awaiting-human"
+      ) {
+        return { runID: innerBindingRunID, status: "awaiting-human-no-resume" };
+      }
+
+      return await withKeyedLock(runID, async () => {
       // 2. idempotencia por record: mesma identidade => nunca um run extra.
       // Excecao: "binding-failed" significa que a persistencia pre-run falhou
       // ANTES de qualquer runner (provado abaixo: o runner so e invocado apos
@@ -249,6 +291,7 @@ export function createAdmissionOrchestrateHandler(
       })();
 
       return { runID, status: "started" };
+      });
     });
   };
 }
