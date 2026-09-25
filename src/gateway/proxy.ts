@@ -6,8 +6,11 @@
 //     resposta (SSE streama chunk a chunk);
 //   - cancelamento do cliente destrui o request upstream (e vice-versa);
 //   - timeout por INATIVIDADE de socket (nao mata stream longo com trafego);
-//   - headers hop-by-hop retirados; Authorization do cliente preservado;
-//     Authorization proprio SO quando o cliente nao enviou (nunca logado);
+//   - headers hop-by-hop de framing e proxy-credenciais retirados (HTTP e
+//     upgrade; no upgrade, connection/upgrade atravessam por serem a semantica
+//     do handshake); Authorization do cliente segue verbatim, sem injecao
+//     (nunca logado); sem Authorization, nenhuma credencial e adicionada
+//     (o upstream decide);
 //   - upgrade: tunel TCP bruto (bytes do handshake reescritos so no Host e
 //     repassados verbatim; nunca via http.request, que emitiria um segundo
 //     head e corromperia o handshake).
@@ -130,12 +133,23 @@ export function proxyUpgrade(
   head: Buffer,
   opts: { protocol: "http:" | "https:"; hostname: string; port: number; host: string; timeoutMs: number },
 ): void {
-  // request-line + headers originais (host reescrito para o upstream)
+  // request-line + headers originais (host reescrito; hop-by-hop de framing e
+  // proxy-credenciais removidos como no HTTP — EXCETO connection/upgrade, que
+  // sao a semantica do proprio handshake e precisam atravessar)
+  const TUNNEL_STRIP = new Set([
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+  ]);
   const headLines: string[] = [];
   for (let i = 0; i < req.rawHeaders.length; i += 2) {
     const name = req.rawHeaders[i]!;
     const value = req.rawHeaders[i + 1]!;
-    if (name.toLowerCase() === "host") continue;
+    const lower = name.toLowerCase();
+    if (lower === "host" || TUNNEL_STRIP.has(lower)) continue;
     headLines.push(`${name}: ${value}`);
   }
   headLines.push(`Host: ${opts.host}`);

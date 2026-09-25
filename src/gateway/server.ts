@@ -70,6 +70,16 @@ function bounded(err: unknown): string {
   return raw.split("\n")[0]!.slice(0, 300);
 }
 
+/**
+ * Postura de auth do CLIENTE para chamadas do gateway em seu nome: a
+ * Authorization recebida verbatim, ou null (anonimo). O gateway nunca
+ * substitui pela senha de env nesses caminhos — o upstream decide.
+ */
+function clientAuthOf(req: IncomingMessage): string | null {
+  const v = req.headers.authorization;
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
 type BodyResult = { kind: "ok"; body: Buffer } | { kind: "too-large" } | { kind: "aborted" };
 
 function readBodyLimited(req: IncomingMessage, maxBytes: number): Promise<BodyResult> {
@@ -205,6 +215,7 @@ export function createGatewayServer(
         text: parsed.text,
         config,
         upstream,
+        clientAuth: clientAuthOf(req),
         ...(deps.env !== undefined ? { env: deps.env } : {}),
       });
       if (outcome.applied) {
@@ -241,9 +252,18 @@ export function createGatewayServer(
     if (decision.mode === "orchestrate") {
       let internalSession = false;
       try {
-        const sess = await upstream.getSession(sessionID);
+        // O lookup espelha a credencial do CLIENTE (nunca a senha de env):
+        // sem credencial valida, o upstream 401/403 e nada e admitido. O
+        // gateway nao confere privilegio que o upstream negaria ao cliente.
+        const sess = await upstream.getSession(sessionID, clientAuthOf(req));
         internalSession = isInternalOrchestrationSession(sess.metadata);
       } catch (err) {
+        if (err instanceof UpstreamHttpError && (err.status === 401 || err.status === 403)) {
+          // Cliente nao autorizado pelo upstream: 401 bounded, zero efeito.
+          emit("session-lookup-denied", { sessionID, status: err.status });
+          jsonError(res, 401, "upstream-unauthorized", "upstream recusou a credencial do cliente; nada foi admitido");
+          return;
+        }
         if (err instanceof UpstreamHttpError && err.status === 404) {
           // Lookup DEFINITIVO: sessao inexistente — passthrough nativo (o
           // proprio prompt POST falharia igual), zero orchestration/wake.
@@ -326,6 +346,11 @@ export function createGatewayServer(
         emit("rpc-skipped", { runID, state: prior.state });
         return { kind: "skipped" };
       }
+      // Nota (M5): record local "failed" NAO suprime — retry do cliente
+      // re-dispara a RPC de proposito (recuperacao de falha transitoria de
+      // dispatch). run<=1 continua garantido pelo record DURAVEL do plugin
+      // (duplicate-ignored); o gateway pode emitir >1 RPC no wire e os
+      // contadores refletem o wire, nao runs efetivos.
       try {
         const output = await upstream.rpc(
           AdmissionRpc.id,

@@ -10,8 +10,9 @@
 
 import { decideRoute, type RouteDecision } from "../router.ts";
 import { isFreeModel, resolveOptions, type FreeModel } from "../config.ts";
+import { isInternalOrchestrationSession } from "../worker-hooks.ts";
 import type { GatewayConfig } from "./config.ts";
-import type { UpstreamClient } from "./upstream.ts";
+import type { CallAuth, UpstreamClient } from "./upstream.ts";
 
 export interface RouteOutcome {
   applied: boolean;
@@ -37,11 +38,18 @@ export async function decideAndApplyRoute(input: {
   config: GatewayConfig;
   upstream: UpstreamClient;
   env?: Record<string, string | undefined>;
+  /**
+   * Postura de auth do CLIENTE (string) ou anonima (null): catalogos,
+   * switches e leitura de sessao espelham o cliente — nunca herdam a senha
+   * de env. Cliente anonimo em upstream protegido => 401 nos catalogos =>
+   * fallback normal (o forward decide nativamente).
+   */
+  clientAuth?: CallAuth;
 }): Promise<RouteOutcome> {
   try {
     const [agents, models] = await Promise.all([
-      input.upstream.listAgents(),
-      input.upstream.listModels(),
+      input.upstream.listAgents(input.clientAuth),
+      input.upstream.listModels(input.clientAuth),
     ]);
     const validAgents = agents.map((a) => a.id).filter((id) => id.length > 0);
     const freeCandidates = models
@@ -79,19 +87,26 @@ export async function decideAndApplyRoute(input: {
     const sep = decision.model.indexOf("/");
     const providerID = decision.model.slice(0, sep);
     const modelID = decision.model.slice(sep + 1);
-    // Estado anterior best-effort (para rollback se o agent falhar depois).
-    // Ausente/ilegivel => rollback indisponivel (parcial documentado, nunca
-    // mascarado como fallback limpo).
+    // Guarda de papel (I2): sessao interna nunca recebe switches — forward
+    // normal sem mutacao. Lookup ambiguo => fallback normal (pre-admissao,
+    // seguro); a decisao de orchestrate continua fail-closed no chamador.
     let beforeModel: { providerID: string; id: string } | undefined;
     try {
-      const current = await input.upstream.getSession(input.sessionID);
+      const current = await input.upstream.getSession(input.sessionID, input.clientAuth);
+      if (isInternalOrchestrationSession(current.metadata)) {
+        return {
+          applied: false,
+          decision,
+          reason: "sessao interna: route sem switches (forward normal, zero mutacao)",
+        };
+      }
       beforeModel = current.model;
     } catch {
       beforeModel = undefined;
     }
-    await input.upstream.switchModel(input.sessionID, { providerID, id: modelID });
+    await input.upstream.switchModel(input.sessionID, { providerID, id: modelID }, input.clientAuth);
     try {
-      await input.upstream.switchAgent(input.sessionID, decision.agent);
+      await input.upstream.switchAgent(input.sessionID, decision.agent, input.clientAuth);
     } catch (err) {
       // Switch de model para o MESMO estado anterior = no-op semantico:
       // nenhum side effect parcial, fallback limpo e honesto.
@@ -105,7 +120,7 @@ export async function decideAndApplyRoute(input: {
       let rollback = false;
       if (beforeModel !== undefined) {
         try {
-          await input.upstream.switchModel(input.sessionID, beforeModel);
+          await input.upstream.switchModel(input.sessionID, beforeModel, input.clientAuth);
           rollback = true;
         } catch {
           rollback = false;

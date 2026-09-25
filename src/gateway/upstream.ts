@@ -22,6 +22,14 @@ export class UpstreamHttpError extends Error {
   }
 }
 
+/**
+ * Postura de credencial por chamada (fronteira de autenticacao):
+ * - string  => usa EXATAMENTE essa Authorization (credencial do cliente);
+ * - null    => envia SEM Authorization (postura anonima do cliente);
+ * - undefined => senha de env (somente control-plane pos-validacao).
+ */
+export type CallAuth = string | null | undefined;
+
 export interface UpstreamClientOptions {
   origin: string;
   password?: string;
@@ -44,7 +52,8 @@ export class UpstreamClient {
     this.timeoutMs = opts.timeoutMs;
   }
 
-  private authHeader(): string | undefined {
+  private authHeader(override: CallAuth): string | undefined {
+    if (override !== undefined) return override ?? undefined;
     if (this.password === undefined || this.password === "") return undefined;
     return `Basic ${Buffer.from(`opencode:${this.password}`, "utf8").toString("base64")}`;
   }
@@ -58,10 +67,11 @@ export class UpstreamClient {
     path: string,
     body?: unknown,
     timeoutMs?: number,
+    auth?: CallAuth,
   ): Promise<{ status: number; body: Buffer; json: () => unknown }> {
     const headers: Record<string, string> = { accept: "application/json" };
-    const auth = this.authHeader();
-    if (auth !== undefined) headers.authorization = auth;
+    const authValue = this.authHeader(auth);
+    if (authValue !== undefined) headers.authorization = authValue;
     let payload: string | undefined;
     if (body !== undefined) {
       payload = JSON.stringify(body);
@@ -92,8 +102,9 @@ export class UpstreamClient {
     path: string,
     body?: unknown,
     timeoutMs?: number,
+    auth?: CallAuth,
   ): Promise<{ status: number; body: Buffer; json: () => unknown }> {
-    const out = await this.request(method, path, body, timeoutMs);
+    const out = await this.request(method, path, body, timeoutMs, auth);
     if (out.status < 200 || out.status >= 300) {
       throw new UpstreamHttpError(
         out.status,
@@ -104,8 +115,8 @@ export class UpstreamClient {
     return out;
   }
 
-  async listModels(): Promise<Array<{ id: string; providerID: string }>> {
-    const out = await this.requestOk("GET", "/api/model");
+  async listModels(auth?: CallAuth): Promise<Array<{ id: string; providerID: string }>> {
+    const out = await this.requestOk("GET", "/api/model", undefined, undefined, auth);
     const parsed = out.json() as { data?: unknown };
     if (!Array.isArray(parsed?.data)) throw new Error("catalogo de modelos com forma inesperada");
     return parsed.data.filter(
@@ -117,8 +128,8 @@ export class UpstreamClient {
     );
   }
 
-  async listAgents(): Promise<Array<{ id: string }>> {
-    const out = await this.requestOk("GET", "/api/agent");
+  async listAgents(auth?: CallAuth): Promise<Array<{ id: string }>> {
+    const out = await this.requestOk("GET", "/api/agent", undefined, undefined, auth);
     const parsed = out.json() as { data?: unknown };
     if (!Array.isArray(parsed?.data)) throw new Error("catalogo de agentes com forma inesperada");
     return parsed.data
@@ -126,12 +137,12 @@ export class UpstreamClient {
       .map((a) => ({ id: a.id }));
   }
 
-  async switchModel(sessionID: string, model: { providerID: string; id: string }): Promise<void> {
-    await this.requestOk("POST", `/api/session/${encodeURIComponent(sessionID)}/model`, { model });
+  async switchModel(sessionID: string, model: { providerID: string; id: string }, auth?: CallAuth): Promise<void> {
+    await this.requestOk("POST", `/api/session/${encodeURIComponent(sessionID)}/model`, { model }, undefined, auth);
   }
 
-  async switchAgent(sessionID: string, agent: string): Promise<void> {
-    await this.requestOk("POST", `/api/session/${encodeURIComponent(sessionID)}/agent`, { agent });
+  async switchAgent(sessionID: string, agent: string, auth?: CallAuth): Promise<void> {
+    await this.requestOk("POST", `/api/session/${encodeURIComponent(sessionID)}/agent`, { agent }, undefined, auth);
   }
 
   /**
@@ -140,12 +151,15 @@ export class UpstreamClient {
    * "prov/id", como Model.Ref {providerID,id}, ou nao vir (ausencia =>
    * undefined, sem throw); metadata ausente/ilegivel => undefined.
    */
-  async getSession(sessionID: string): Promise<{
+  async getSession(
+    sessionID: string,
+    auth?: CallAuth,
+  ): Promise<{
     model?: { providerID: string; id: string };
     agent?: string;
     metadata?: Record<string, unknown>;
   }> {
-    const out = await this.requestOk("GET", `/api/session/${encodeURIComponent(sessionID)}`);
+    const out = await this.requestOk("GET", `/api/session/${encodeURIComponent(sessionID)}`, undefined, undefined, auth);
     let data: unknown;
     try {
       const parsed = out.json() as { data?: unknown };
