@@ -43,7 +43,7 @@ export async function startFakeUpstream(opts = {}) {
 
   const state = {
     order: [],      // [{kind, path}] na ordem chegada — prova ordering route→forward
-    auth: [],       // [{kind, authed}] presença de Authorization por request (valor NUNCA registrado)
+    auth: [],       // [{kind, authHash}] sha256 da Authorization (valor NUNCA registrado)
     prompts: [],    // {path, raw, parsed, createdItem}
     patches: [],    // wake attempts (NUNCA deve existir no modo orchestrate)
     models: [],
@@ -52,6 +52,16 @@ export async function startFakeUpstream(opts = {}) {
     rpcRuns: 0,     // runs EFETIVOS criados no modo rpcDedupe (segunda RPC nao cria)
     upgrades: [],   // upgrade attempts (tunel bruto do proxy)
     sse: { connections: 0, closedEarly: 0, completed: 0 },
+  };
+  const requireAuth = opts.requireAuth; // string exata esperada ou undefined (upstream aberto)
+  // Robustez do fake (M4): decode nunca derruba o harness; SSP malformado
+  // fora do prompt vira 404 como qualquer path desconhecido.
+  const safeDecode = (v) => {
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return null;
+    }
   };
 
   let msgSeq = 0;
@@ -85,12 +95,30 @@ export async function startFakeUpstream(opts = {}) {
     });
   }
 
+  const { createHash } = await import("node:crypto");
+  const authHash = (req) => {
+    const v = req.headers.authorization;
+    if (typeof v !== "string") return null;
+    return createHash("sha256").update(v, "utf8").digest("hex");
+  };
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://upstream");
     const path = url.pathname;
     state.order.push({ kind: `${req.method} ${path}`, path });
-    // Fronteira de auth: registra SOMENTE a presenca (nunca o valor).
-    state.auth.push({ kind: `${req.method} ${path}`, authed: typeof req.headers.authorization === "string" });
+    // Fronteira de auth: registra SOMENTE o hash (nunca o valor). Com
+    // requireAuth, credencial ausente/divergente vira 401 nativo — exatamente
+    // como um upstream protegido se comporta.
+    const presented = authHash(req);
+    state.auth.push({ kind: `${req.method} ${path}`, authed: presented !== null, hash: presented });
+    if (requireAuth !== undefined) {
+      const expected = createHash("sha256").update(requireAuth, "utf8").digest("hex");
+      if (presented !== expected) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end('{"error":"unauthorized"}');
+        return;
+      }
+    }
 
     try {
       // ---- SSE de eventos -------------------------------------------------
@@ -155,7 +183,12 @@ export async function startFakeUpstream(opts = {}) {
       // ---- prompt (admissao) ---------------------------------------------
       const promptMatch = req.method === "POST" && /^\/api\/session\/([^/]+)\/prompt$/.exec(path);
       if (promptMatch) {
-        const sid = decodeURIComponent(promptMatch[1]);
+        const sid = safeDecode(promptMatch[1]);
+        if (sid === null) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"not-found"}');
+          return;
+        }
         const raw = await readBody(req);
         let parsed;
         try {
@@ -246,7 +279,12 @@ export async function startFakeUpstream(opts = {}) {
           res.end('{"error":"session-not-found"}');
           return;
         }
-        const sid = decodeURIComponent(sessionGetMatch[1]);
+        const sid = safeDecode(sessionGetMatch[1]);
+        if (sid === null) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"not-found"}');
+          return;
+        }
         const st = sessionState(sid);
         res.writeHead(200, { "content-type": "application/json" });
         if (cfg.sessionBare) {
@@ -279,7 +317,7 @@ export async function startFakeUpstream(opts = {}) {
         try {
           const m = JSON.parse(raw.toString("utf8"))?.model;
           if (m && typeof m.providerID === "string" && typeof m.id === "string") {
-            sessionState(decodeURIComponent(modelMatch[1])).model = { providerID: m.providerID, id: m.id };
+            sessionState(safeDecode(modelMatch[1]) ?? modelMatch[1]).model = { providerID: m.providerID, id: m.id };
           }
         } catch {
           // estado best-effort; o switch ja foi aceito
@@ -301,7 +339,7 @@ export async function startFakeUpstream(opts = {}) {
         try {
           const a = JSON.parse(raw.toString("utf8"))?.agent;
           if (typeof a === "string" && a.length > 0) {
-            sessionState(decodeURIComponent(agentMatch[1])).agent = a;
+            sessionState(safeDecode(agentMatch[1]) ?? agentMatch[1]).agent = a;
           }
         } catch {
           // estado best-effort; o switch ja foi aceito
@@ -321,7 +359,7 @@ export async function startFakeUpstream(opts = {}) {
         } catch {
           input = undefined;
         }
-        state.rpcs.push({ rpcID: decodeURIComponent(rpcMatch[1]), method: decodeURIComponent(rpcMatch[2]), input });
+        state.rpcs.push({ rpcID: safeDecode(rpcMatch[1]) ?? rpcMatch[1], method: safeDecode(rpcMatch[2]) ?? rpcMatch[2], input });
         if (cfg.rpcMode === "fail500") {
           res.writeHead(500, { "content-type": "application/json" });
           res.end('{"error":"rpc-down"}');
@@ -374,7 +412,20 @@ export async function startFakeUpstream(opts = {}) {
   // ---- upgrade bruto (eco): prova que o tunel do gateway nao corrompe ----
   const upgradeSockets = new Set();
   server.on("upgrade", (req, socket) => {
-    state.upgrades.push({ path: req.url, authed: typeof req.headers.authorization === "string" });
+    const presented = authHash(req);
+    state.upgrades.push({
+      path: req.url,
+      authed: presented !== null,
+      hash: presented,
+      proxyAuth: typeof req.headers["proxy-authorization"] === "string",
+    });
+    if (requireAuth !== undefined) {
+      const expected = createHash("sha256").update(requireAuth, "utf8").digest("hex");
+      if (presented !== expected) {
+        socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        return;
+      }
+    }
     upgradeSockets.add(socket);
     socket.on("close", () => upgradeSockets.delete(socket));
     socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n");

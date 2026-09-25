@@ -227,6 +227,7 @@ test("SEC-ROLE-2: isInternalSession throws -> runner=0, sem run, erro bounded", 
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(state.runs.length, 0, "runner NUNCA executado com papel desconhecido");
   assert.equal(store.has(admissionRecordKey(VALID.sessionID, VALID.messageID)), false, "sem record");
+  assert.equal(store.has(sessionBindingKey(VALID.sessionID)), false, "sem binding");
   assert.equal(state.published.length, 0, "nada publicado");
 });
 

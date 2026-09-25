@@ -206,6 +206,27 @@ test("A10c: sessao sem estado legivel -> parcial honesto com rollback=false (nun
   }
 });
 
+test("A10d: forma 200 sem metadata (boundary documentado) => tratada como externa", async () => {
+  // Boundary explicita e travada: metadata ausente/ilegivel nao e sinal de
+  // papel interno (sessoes normais do runtime nao expoem metadata); ausencia
+  // => externa. Lookup que FALHA (rede/5xx) continua fail-closed (SEC-ROLE-1).
+  const up = await startFakeUpstream({ sessionBare: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_bare2/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ORCH: sessao sem metadata" }),
+    });
+    assert.equal(res.status, 200, "ausencia de metadata nao bloqueia turno externo");
+    assert.equal(up.state.prompts.length, 1, "admissao ocorre");
+    assert.equal(up.state.rpcs.length, 1, "dispatch ocorre");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("A10b: falha de agent APOS model aplicado -> rollback best-effort, parcial NUNCA silencioso", async () => {
   const up = await startFakeUpstream({ agentSwitchFail: true });
   const gw = await startGateway(up.url, testConfig({ rules: RULES }));
@@ -309,9 +330,36 @@ test("SEC-ROLE-1b: orchestrate para sessao inexistente (404) -> passthrough nati
       body: JSON.stringify({ text: "ORCH: sessao inexistente" }),
     });
     assert.equal(res.status, 404, "lookup definitivo 404 = passthrough nativo");
+    const body = await res.text();
+    assert.match(body, /session-not-found/, "corpo do lookup repassado (status do lookup, nao do prompt)");
     assert.equal(up.state.prompts.length, 0, "admissao duravel = 0");
     assert.equal(up.state.rpcs.length, 0, "RPC dispatch = 0");
     assert.equal(up.state.patches.length, 0, "parent wake = 0");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
+test("A12c: sessao interna com prefixo ROUTE -> forward sem switches, zero mutacao", async () => {
+  const up = await startFakeUpstream({
+    sessionMetadata: {
+      ses_workerR: { "jev-router": INTERNAL_WORKER_MARKER, "jev-role": INTERNAL_WORKER_ROLE },
+    },
+  });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_workerR/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ROUTE: muda meu modelo" }),
+    });
+    assert.equal(res.status, 200, "fallback responde nativo");
+    assert.equal(up.state.prompts.length, 1, "exatamente 1 forward");
+    assert.equal(up.state.models.length, 0, "ZERO switch de modelo em sessao interna");
+    assert.equal(up.state.agents.length, 0, "ZERO switch de agente em sessao interna");
+    assert.equal(up.state.rpcs.length, 0, "ZERO dispatch");
+    assert.equal(gw.counters().routeApplied, 0, "route nao conta como aplicada");
   } finally {
     await gw.close();
     await up.close();
