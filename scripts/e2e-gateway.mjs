@@ -735,8 +735,12 @@ async function main() {
       return m ? m.length : 0;
     };
     const NORMAL_RE = '"type":"intercept","sessionID":"[^"]+","mode":"normal"';
+    const RPC_RE = '"type":"rpc-dispatched"';
     const normalBaseline = countFileMatches(gwLogPath, NORMAL_RE);
-    const rpcBaseline = since(gwMark).filter((e) => e.type === "rpc-dispatched").length;
+    const rpcBaseline = countFileMatches(gwLogPath, RPC_RE);
+    // Ordem ESTRUTURAL: ORCH primeiro (composer livre — nada executando),
+    // ping normal depois. Isso elimina a corrida em que o submit do ORCH se
+    // perdia com o composer ocupado pela execucao do ping.
     const spec = {
       bin: BIN,
       args: ["--server", gwOrigin],
@@ -744,6 +748,18 @@ async function main() {
       env: { OPENCODE_PASSWORD: pw, HOME: homeDir, PATH: process.env.PATH ?? "" },
       boot_ms: 20000,
       steps: [
+        { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
+        {
+          wait_log: {
+            file: gwLogPath,
+            regex: RPC_RE,
+            baseline: rpcBaseline,
+            min_extra: 1,
+            timeout_ms: 180000,
+          },
+        },
+        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
+        { sleep_ms: 8000 },
         { type: "ping normal pelo tui atraves do gateway", enter: true, after_enter_ms: 500 },
         {
           wait_log: {
@@ -754,18 +770,6 @@ async function main() {
             timeout_ms: 120000,
           },
         },
-        { sleep_ms: 8000 },
-        { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
-        {
-          wait_log: {
-            file: gwLogPath,
-            regex: '"type":"rpc-dispatched"',
-            baseline: rpcBaseline,
-            min_extra: 1,
-            timeout_ms: 180000,
-          },
-        },
-        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
         { sleep_ms: 12000 },
       ],
       tail_ms: 2000,
@@ -873,26 +877,32 @@ async function main() {
       tuiNormal.length === 1 && tuiOrch.length === 1 && tuiNormal[0].sessionID === tuiOrch[0].sessionID,
       `normalSid=${tuiNormal[0]?.sessionID} orchSid=${tuiOrch[0]?.sessionID}`,
     );
-    // parent=0 ESTRITO e compativel com o ping previo: nenhuma execution.started
-    // da sessao do TUI pode existir A PARTIR da admissao do ORCH (o ping
-    // normal executa nativamente ANTES — exec anterior e legitima). Wake
-    // sincrono durante a admissao cairia depois de admittedT e seria pego.
+    // parent=0 JANELADO (ordem ORCH-primeiro): nenhuma execution.started da
+    // sessao do TUI entre a admissao do ORCH e o submit do ping normal. O ping
+    // executa DEPOIS (nativo, legitimo) — wake sincrono na admissao cairia na
+    // janela e seria pego. Final precisa mostrar a exec do ping (>=1).
     const tuiAdmitted = since(gwMark).find((e) => e.type === "admitted" && e.sessionID === tuiSid);
-    const lateExecs = sseEvents.filter(
+    const tuiPing = since(gwMark).find(
+      (e) => e.type === "intercept" && e.mode === "normal" && e.sessionID === tuiSid,
+    );
+    const windowExecs = sseEvents.filter(
       (e) =>
         e.type.includes("execution.started") &&
         tuiSid !== null &&
         e.raw.includes(`"sessionID":"${tuiSid}"`) &&
         tuiAdmitted !== undefined &&
-        e.t >= tuiAdmitted.t - 2000,
+        tuiPing !== undefined &&
+        e.t >= tuiAdmitted.t - 2000 &&
+        e.t < tuiPing.t,
     );
     assert(
-      "TUI orchestrate: parent=0 (nenhuma execucao nova do parent apos admission)",
+      "TUI orchestrate: parent=0 (nenhuma execucao entre admission e ping)",
       tuiSid !== null &&
         tuiAdmitted !== undefined &&
-        lateExecs.length === 0 &&
-        execStartedCount(tuiSid) === execAtOrch,
-      `admittedT=${tuiAdmitted?.t} lateExecs=${lateExecs.length} execAtOrch=${execAtOrch} final=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
+        tuiPing !== undefined &&
+        windowExecs.length === 0 &&
+        execStartedCount(tuiSid) >= 1,
+      `windowExecs=${windowExecs.length} finalExecs=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
     );
     assert(
       "TUI: notice da publicacao chega ao inbox da sessao do TUI",
