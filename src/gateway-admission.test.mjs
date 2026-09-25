@@ -366,6 +366,32 @@ test("A12c: sessao interna com prefixo ROUTE -> forward sem switches, zero mutac
   }
 });
 
+test("A12d: route com session-role lookup ambiguo -> fallback normal, zero switches", async () => {
+  const up = await startFakeUpstream({ sessionFail: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_ambrole/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ROUTE: probe" }),
+    });
+    assert.equal(res.status, 200, "fallback responde nativo");
+    assert.equal(up.state.models.length, 0, "ZERO switch de modelo com papel desconhecido");
+    assert.equal(up.state.agents.length, 0, "ZERO switch de agente com papel desconhecido");
+    assert.equal(up.state.rpcs.length, 0, "ZERO dispatch");
+    assert.equal(up.state.prompts.length, 1, "prompt original encaminhado exatamente 1x");
+    const c = gw.counters();
+    assert.equal(c.routeApplied, 0, "route nao aplicada");
+    assert.equal(c.routeFallback, 1, "fallback contabilizado");
+    assert.equal(c.routePartial, 0, "nada parcial (nenhum efeito ocorreu)");
+    assert.equal(c.admitted, 0, "admissao zero");
+    assert.equal(c.rpcDispatched, 0, "dispatch zero");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("A11: falha pos-admissao -> fail-closed 502, nunca re-encaminha/wake, record preservado", async () => {
   // RPC do plugin falha depois da admissao duravel
   {

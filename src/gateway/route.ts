@@ -88,8 +88,10 @@ export async function decideAndApplyRoute(input: {
     const providerID = decision.model.slice(0, sep);
     const modelID = decision.model.slice(sep + 1);
     // Guarda de papel (I2): sessao interna nunca recebe switches — forward
-    // normal sem mutacao. Lookup ambiguo => fallback normal (pre-admissao,
-    // seguro); a decisao de orchestrate continua fail-closed no chamador.
+    // normal sem mutacao. Lookup AMBIGUO (papel desconhecido) => tambem
+    // fallback normal ANTES de qualquer mutacao: sem provar externo, route
+    // nao aplica. Nao inventa estado anterior; nao usa senha de env (a chamada
+    // acima ja espelha input.clientAuth).
     let beforeModel: { providerID: string; id: string } | undefined;
     try {
       const current = await input.upstream.getSession(input.sessionID, input.clientAuth);
@@ -101,8 +103,12 @@ export async function decideAndApplyRoute(input: {
         };
       }
       beforeModel = current.model;
-    } catch {
-      beforeModel = undefined;
+    } catch (err) {
+      return {
+        applied: false,
+        decision,
+        reason: `papel da sessao indeterminado; route nao aplicada (fallback normal): ${bounded(err)}`,
+      };
     }
     await input.upstream.switchModel(input.sessionID, { providerID, id: modelID }, input.clientAuth);
     try {
