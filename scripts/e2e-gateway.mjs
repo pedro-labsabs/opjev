@@ -880,7 +880,10 @@ async function main() {
     // parent=0 JANELADO (ordem ORCH-primeiro): nenhuma execution.started da
     // sessao do TUI entre a admissao do ORCH e o submit do ping normal. O ping
     // executa DEPOIS (nativo, legitimo) — wake sincrono na admissao cairia na
-    // janela e seria pego. Final precisa mostrar a exec do ping (>=1).
+    // janela e seria pego. Cobertura conjunta: janela==0 (causalidade) +
+    // execAtOrch==0 (nada executava na admissao) + final==1 (exatamente o
+    // ping; >=2 indicaria wake tardio) + wire com ZERO PATCH em todo o run
+    // (nenhum mecanismo de wake disparou em nenhuma fase).
     const tuiAdmitted = since(gwMark).find((e) => e.type === "admitted" && e.sessionID === tuiSid);
     const tuiPing = since(gwMark).find(
       (e) => e.type === "intercept" && e.mode === "normal" && e.sessionID === tuiSid,
@@ -895,14 +898,16 @@ async function main() {
         e.t >= tuiAdmitted.t - 2000 &&
         e.t < tuiPing.t,
     );
+    const finalExecs = tuiSid !== null ? execStartedCount(tuiSid) : -1;
     assert(
-      "TUI orchestrate: parent=0 (nenhuma execucao entre admission e ping)",
+      "TUI orchestrate: parent=0 (janela admission->ping limpa, exatamente o ping no final)",
       tuiSid !== null &&
         tuiAdmitted !== undefined &&
         tuiPing !== undefined &&
         windowExecs.length === 0 &&
-        execStartedCount(tuiSid) >= 1,
-      `windowExecs=${windowExecs.length} finalExecs=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
+        execAtOrch === 0 &&
+        finalExecs === 1,
+      `windowExecs=${windowExecs.length} execAtOrch=${execAtOrch} finalExecs=${finalExecs}`,
     );
     assert(
       "TUI: notice da publicacao chega ao inbox da sessao do TUI",

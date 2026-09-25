@@ -289,3 +289,32 @@ global provado acima), timeouts do driver TUI curtos para o ambiente
 com worker `succeeded` — admission/orquestração ocorreram 1×; o veredicto é
 assunto do kernel, não deste slice. Rodada final do E2E reexecutada no HEAD
 de entrega.
+
+## 10. Round de repair do mantenedor (fail-closed, auth boundary, path)
+
+1. **C1 — deputy confuso no orchestrate (CRÍTICO, corrigido).** Evidência de
+   wire: 100% dos requests reais (incluindo TUI) já carregam Authorization
+   própria — a injeção do proxy nunca foi necessária. Nova política, sem flag
+   nova e sem exceção de loopback: o lookup de sessão do orchestrate espelha
+   EXATAMENTE a postura de auth do cliente (presente→verbatim, ausente→sem
+   auth); 401/403 do upstream vira 401 bounded com zero efeito. Upstream
+   aberto continua aberto (postura do operador preservada). `admit`+RPC
+   (pós-decisão, mesmo domínio) seguem com a senha de env. Proxy nunca recebe
+   a senha (removida de `ProxyOptions` — separação estrutural). Route espelha
+   a mesma postura em catalogos/switches/session-read (anonimo em upstream
+   protegido => 401 nos catalogos => fallback normal => 401 nativo).
+2. **I2 — route sem guarda de papel (corrigido).** `decideAndApplyRoute`
+   verifica a sessão: interna => forward normal com ZERO switches.
+3. **I3 — metadata ausente (decidido + travado, A10d).** Boundary explícita:
+   200 sem metadata => externa (sessoes normais do runtime nao expoem
+   metadata; fail-closed aqui mataria o caminho provado no E2E). Lookup que
+   FALHA continua fail-closed (SEC-ROLE-1). Risco residual inerente a guardas
+   por sinal, documentado.
+4. **I4 — asserts de auth por hash sha256 (nunca valor).** Fake registra
+   `authHash`; testes comparam igualdade (byte-preservacao, nao so presenca).
+5. **M5 — retry apos `failed` re-dispara RPC (documentado, sem mudanca).**
+   Suprimir quebraria recuperacao de falha transitoria; dedupe continua no
+   record duravel do plugin (I7c: `rpcRuns==1` com 2 RPCs no wire).
+6. **M6 — sniffer persiste corpos em `http.jsonl` por design de evidencia;**
+   artefatos vivem em `$E2E_ROOT` temporario e nunca sao commitados. Notice de
+   erro do worker e bounded (2000 chars).
