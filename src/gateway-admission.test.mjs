@@ -379,6 +379,7 @@ test("A12d: route com session-role lookup ambiguo -> fallback normal, zero switc
     assert.equal(up.state.models.length, 0, "ZERO switch de modelo com papel desconhecido");
     assert.equal(up.state.agents.length, 0, "ZERO switch de agente com papel desconhecido");
     assert.equal(up.state.rpcs.length, 0, "ZERO dispatch");
+    assert.equal(up.state.patches.length, 0, "nenhum wake");
     assert.equal(up.state.prompts.length, 1, "prompt original encaminhado exatamente 1x");
     const c = gw.counters();
     assert.equal(c.routeApplied, 0, "route nao aplicada");
