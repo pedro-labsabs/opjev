@@ -268,6 +268,56 @@ test("A12b: sessao interna (metadata worker) com prompt limpo -> bypass, sem orc
   }
 });
 
+test("SEC-ROLE-1: orchestrate com session lookup 500 -> fail-closed, zero orchestration", async () => {
+  const up = await startFakeUpstream({ sessionFail: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_unknown_role/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ORCH: papel indeterminado" }),
+    });
+    assert.equal(res.status, 502, "papel desconhecido = erro bounded, nunca orchestrate");
+    const err = await res.json();
+    assert.equal(err.error.code, "session-role-unknown");
+    assert.equal(up.state.prompts.length, 0, "admissao duravel = 0");
+    assert.equal(up.state.rpcs.length, 0, "RPC dispatch = 0");
+    assert.equal(up.state.patches.length, 0, "parent wake = 0 (nenhum forward, nenhum PATCH)");
+    assert.equal(gw.counters().admitted, 0);
+
+    // Servidor vivo e caminhos explicitos intactos: normal funciona.
+    const ok = await fetch(`${gw.url}/api/session/ses_unknown_role/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "hello normal" }),
+    });
+    assert.equal(ok.status, 200, "modo normal nao e afetado pelo fail-closed de orchestrate");
+    assert.equal(up.state.prompts.length, 1, "apenas o forward normal chegou ao upstream");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
+test("SEC-ROLE-1b: orchestrate para sessao inexistente (404) -> passthrough nativo, zero orchestration", async () => {
+  const up = await startFakeUpstream({ sessionNotFound: true });
+  const gw = await startGateway(up.url, testConfig({ rules: RULES }));
+  try {
+    const res = await fetch(`${gw.url}/api/session/ses_fantasma/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ORCH: sessao inexistente" }),
+    });
+    assert.equal(res.status, 404, "lookup definitivo 404 = passthrough nativo");
+    assert.equal(up.state.prompts.length, 0, "admissao duravel = 0");
+    assert.equal(up.state.rpcs.length, 0, "RPC dispatch = 0");
+    assert.equal(up.state.patches.length, 0, "parent wake = 0");
+  } finally {
+    await gw.close();
+    await up.close();
+  }
+});
+
 test("A11: falha pos-admissao -> fail-closed 502, nunca re-encaminha/wake, record preservado", async () => {
   // RPC do plugin falha depois da admissao duravel
   {

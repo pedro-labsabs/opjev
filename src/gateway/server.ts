@@ -141,6 +141,9 @@ export function createGatewayServer(
 
   const upstreamURL = new URL(config.upstreamOrigin);
   const upstreamPort = Number.parseInt(upstreamURL.port || "", 10) || (config.upstreamProtocol === "https:" ? 443 : 80);
+  // Control-plane interno (admissao, RPC, catalogos, switches, session
+  // lookup): unico consumidor da senha de env. O proxy (abaixo) NUNCA recebe
+  // a senha — separacao estrutural, nao apenas disciplinar.
   const upstream = new UpstreamClient({
     origin: config.upstreamOrigin,
     ...(config.upstreamPassword !== undefined ? { password: config.upstreamPassword } : {}),
@@ -154,7 +157,6 @@ export function createGatewayServer(
     hostname: upstreamURL.hostname,
     port: upstreamPort,
     timeoutMs: config.proxyTimeoutMs,
-    ...(config.upstreamPassword !== undefined ? { password: config.upstreamPassword } : {}),
     ...(bodyOverride !== undefined ? { bodyOverride } : {}),
   });
 
@@ -231,20 +233,36 @@ export function createGatewayServer(
     }
 
     // ---------------- orchestrate: persist-first, nunca wake ----------------
-    // Guarda de papel em duas camadas: o prompt-metadata ja foi filtrado na
-    // decisao (internal-bypass); aqui a SESSAO-alvo e verificada best-effort
-    // (worker/critic/orchestrator nunca atravessam para outra orchestration).
-    // Papel interno confirmado => forward normal (pre-admissao, nativo, zero
-    // orchestration). Leitura indisponivel => segue (a guarda autoritativa
-    // vive no handler do plugin, com acesso in-process a sessao); a falha de
-    // leitura e emitida para diagnostico.
+    // Guarda de papel fail-closed: o prompt-metadata ja foi filtrado na
+    // decisao (internal-bypass); aqui a SESSAO-alvo precisa ser EXTERNAMENTE
+    // confirmada. Papel interno => bypass normal. Papel AMBIGUO (lookup
+    // falhou) => 502 session-role-unknown, nunca orchestrate. Somente 404
+    // definitivo (sessao inexistente) vira passthrough nativo.
     if (decision.mode === "orchestrate") {
       let internalSession = false;
       try {
         const sess = await upstream.getSession(sessionID);
         internalSession = isInternalOrchestrationSession(sess.metadata);
       } catch (err) {
-        emit("session-check-failed", { sessionID, error: bounded(err) });
+        if (err instanceof UpstreamHttpError && err.status === 404) {
+          // Lookup DEFINITIVO: sessao inexistente — passthrough nativo (o
+          // proprio prompt POST falharia igual), zero orchestration/wake.
+          emit("session-lookup-rejected", { sessionID, status: err.status });
+          res.writeHead(err.status, { "content-type": "application/json" });
+          res.end(err.body);
+          return;
+        }
+        // Papel AMBIGUO (rede/timeout/5xx no lookup): fail-closed. Papel
+        // desconhecido nunca pode virar orchestrate — runner = 0.
+        counters.failClosed += 1;
+        emit("session-role-unknown", { sessionID, error: bounded(err) });
+        jsonError(
+          res,
+          502,
+          "session-role-unknown",
+          "papel da sessao indeterminado; orchestration recusada (fail-closed)",
+        );
+        return;
       }
       if (internalSession) {
         emit("internal-session-bypass", { sessionID });
@@ -355,7 +373,17 @@ export function createGatewayServer(
     })();
     const match = req.method === "POST" ? PROMPT_PATH.exec(pathname) : null;
     if (match !== null) {
-      const sessionID = decodeURIComponent(match[1]!);
+      // Entrada HTTP invalida nunca derruba o processo: percent-encoding
+      // malformado vira 400 bounded com zero efeito upstream.
+      let sessionID: string;
+      try {
+        sessionID = decodeURIComponent(match[1]!);
+      } catch {
+        counters.rejected += 1;
+        emit("rejected", { code: "invalid-session-path" });
+        jsonError(res, 400, "invalid-session-path", "session ID com percent-encoding invalido");
+        return;
+      }
       handleIntercept(req, res, sessionID).catch((err) => {
         emit("gateway-error", { sessionID, error: bounded(err) });
         jsonError(res, 502, "gateway-error", bounded(err));
