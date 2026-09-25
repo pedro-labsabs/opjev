@@ -36,7 +36,6 @@ export interface ProxyOptions {
   hostname: string;
   port: number;
   timeoutMs: number;
-  password?: string;
   /** Corpo ja lido (requests interceptados): reenvio byte a byte. */
   bodyOverride?: Buffer;
 }
@@ -44,10 +43,6 @@ export interface ProxyOptions {
 function bounded(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
   return raw.split("\n")[0]!.slice(0, 200);
-}
-
-function basic(password: string): string {
-  return `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`;
 }
 
 export function proxyRequest(
@@ -58,9 +53,11 @@ export function proxyRequest(
   const headers: Record<string, string | string[] | undefined> = { ...clientReq.headers };
   for (const hop of HOP_BY_HOP) delete headers[hop];
   headers.host = opts.host;
-  if (opts.password !== undefined && opts.password !== "" && headers.authorization === undefined) {
-    headers.authorization = basic(opts.password);
-  }
+  // Boundary de autenticacao: o gateway NUNCA injeta credencial no trafego do
+  // cliente. Authorization do cliente segue verbatim; cliente sem Authorization
+  // chega ao upstream sem auth (o upstream decide, ex. 401 nativo). A senha de
+  // env serve SOMENTE ao control-plane interno (UpstreamClient: admissao, RPC,
+  // catalogos, switches, session lookup) — nunca ao proxy.
   if (opts.bodyOverride !== undefined) {
     headers["content-length"] = String(opts.bodyOverride.byteLength);
   }
