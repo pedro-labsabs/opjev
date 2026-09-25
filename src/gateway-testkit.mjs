@@ -29,6 +29,10 @@ export async function startFakeUpstream(opts = {}) {
     // ok | fail500 | invalid-shape (200 sem output.runID)
     rpcMode: opts.rpcMode ?? "ok",
     rpcDelayMs: opts.rpcDelayMs ?? 0,
+    // sessionFail: GET de sessao responde 500 (lookup indisponivel)
+    sessionFail: opts.sessionFail ?? false,
+    // sessionNotFound: GET de sessao responde 404 (sessao inexistente)
+    sessionNotFound: opts.sessionNotFound ?? false,
     // rpcDedupe: emula o record DURAVEL do plugin (segunda RPC da mesma
     // identidade retorna duplicate-ignored, sem novo run — run<=1 cross-restart)
     rpcDedupe: opts.rpcDedupe ?? false,
@@ -39,6 +43,7 @@ export async function startFakeUpstream(opts = {}) {
 
   const state = {
     order: [],      // [{kind, path}] na ordem chegada — prova ordering route→forward
+    auth: [],       // [{kind, authed}] presença de Authorization por request (valor NUNCA registrado)
     prompts: [],    // {path, raw, parsed, createdItem}
     patches: [],    // wake attempts (NUNCA deve existir no modo orchestrate)
     models: [],
@@ -84,6 +89,8 @@ export async function startFakeUpstream(opts = {}) {
     const url = new URL(req.url, "http://upstream");
     const path = url.pathname;
     state.order.push({ kind: `${req.method} ${path}`, path });
+    // Fronteira de auth: registra SOMENTE a presenca (nunca o valor).
+    state.auth.push({ kind: `${req.method} ${path}`, authed: typeof req.headers.authorization === "string" });
 
     try {
       // ---- SSE de eventos -------------------------------------------------
@@ -229,6 +236,16 @@ export async function startFakeUpstream(opts = {}) {
       // ---- sessao (leitura de estado p/ rollback de route) -------------------
       const sessionGetMatch = req.method === "GET" && /^\/api\/session\/([^/]+)$/.exec(path);
       if (sessionGetMatch) {
+        if (cfg.sessionFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"session-unavailable"}');
+          return;
+        }
+        if (cfg.sessionNotFound) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"session-not-found"}');
+          return;
+        }
         const sid = decodeURIComponent(sessionGetMatch[1]);
         const st = sessionState(sid);
         res.writeHead(200, { "content-type": "application/json" });
@@ -357,7 +374,7 @@ export async function startFakeUpstream(opts = {}) {
   // ---- upgrade bruto (eco): prova que o tunel do gateway nao corrompe ----
   const upgradeSockets = new Set();
   server.on("upgrade", (req, socket) => {
-    state.upgrades.push({ path: req.url });
+    state.upgrades.push({ path: req.url, authed: typeof req.headers.authorization === "string" });
     upgradeSockets.add(socket);
     socket.on("close", () => upgradeSockets.delete(socket));
     socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n");

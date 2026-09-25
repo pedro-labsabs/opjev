@@ -126,8 +126,9 @@ export interface AdmissionHandlerDeps {
    * Guarda de papel autoritativa (opcional): true = sessao interna
    * (worker/critic/orchestrator) => bypass sem run e sem record. Ausente =
    * permite (testes hermeticos; em producao o index.ts conecta ao ctx real e
-   * o gateway ja filtra best-effort antes). Erro do seam = permite (a
-   * indisponibilidade da leitura nao pode travar turnos legitimos aqui).
+   * o gateway ja filtra fail-closed antes). Se o seam LANCAR (papel
+   * indeterminado), o handler recusa com erro bounded — erro de lookup nunca
+   * vira `internal=false`.
    */
   isInternalSession?: (sessionID: string) => Promise<boolean>;
 }
@@ -163,14 +164,18 @@ export function createAdmissionOrchestrateHandler(
     const input = validateAdmissionOrchestrateInput(rawInput);
     const { sessionID, messageID, objective, maxRounds } = input;
 
-    // 0. guarda de papel autoritativa: sessao interna nunca inicia orchestration
-    // (o gateway ja filtra best-effort; aqui e in-process, sem rede).
+    // 0. guarda de papel autoritativa: sessao interna nunca inicia orchestration.
+    // Papel INDETERMINADO (seam lancou) => recusa fail-closed: erro bounded,
+    // runner = 0, sem record. Erro de lookup nunca vira `internal=false`.
     if (deps.isInternalSession !== undefined) {
-      let internal = false;
+      let internal: boolean;
       try {
         internal = await deps.isInternalSession(sessionID);
-      } catch {
-        internal = false;
+      } catch (err) {
+        throw new OrchestrationError(
+          "admission-role-unknown",
+          `papel da sessao indeterminado (runner nao executado): ${boundedError(err)}`,
+        );
       }
       if (internal) {
         return { runID: autoAdmissionRunID(sessionID, messageID), status: "internal-bypass" };

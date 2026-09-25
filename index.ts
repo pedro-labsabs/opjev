@@ -1109,20 +1109,18 @@ export default Plugin.define({
               await ctx.session.synthetic({ sessionID, text, resume: false });
             },
             // Guarda de papel autoritativa (#24/I1): sessoes internas nunca
-            // iniciam orchestration aninhada (o gateway filtra best-effort
-            // antes; aqui e in-process). Leitura indisponivel => permite.
+            // iniciam orchestration aninhada (o gateway filtra fail-closed
+            // antes; aqui e in-process). Leitura indisponivel => PROPAGA
+            // (o handler recusa fail-closed; erro de lookup nunca vira
+            // `internal=false`).
             isInternalSession: async (sessionID: string) => {
-              try {
-                const info: any = await ctx.session.get({ sessionID });
-                const metadata = info?.metadata;
-                return (
-                  isInternalWorkerSession(metadata) ||
-                  isInternalCriticSession(metadata) ||
-                  isInternalOrchestratorSession(metadata)
-                );
-              } catch {
-                return false;
-              }
+              const info: any = await ctx.session.get({ sessionID });
+              const metadata = info?.metadata;
+              return (
+                isInternalWorkerSession(metadata) ||
+                isInternalCriticSession(metadata) ||
+                isInternalOrchestratorSession(metadata)
+              );
             },
           }),
         });

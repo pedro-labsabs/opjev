@@ -209,6 +209,37 @@ test("R-GATE-RACE: binding vira awaiting-human entre check e dispatch -> ZERO ru
   assert.equal(store.has(admissionRecordKey(VALID.sessionID, VALID.messageID)), false, "sem record");
 });
 
+test("SEC-ROLE-2: isInternalSession throws -> runner=0, sem run, erro bounded", async () => {
+  const { store, state, handler } = fakeDeps({
+    isInternalSession: async () => {
+      throw new Error("ctx indisponivel");
+    },
+  });
+  await assert.rejects(
+    () => handler(VALID),
+    (err) => {
+      assert.equal(err?.code, "admission-role-unknown", "code diagnostico bounded");
+      assert.ok(String(err?.message ?? err).length <= 400, "mensagem bounded");
+      return true;
+    },
+    "erro explicito bounded",
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(state.runs.length, 0, "runner NUNCA executado com papel desconhecido");
+  assert.equal(store.has(admissionRecordKey(VALID.sessionID, VALID.messageID)), false, "sem record");
+  assert.equal(state.published.length, 0, "nada publicado");
+});
+
+test("SEC-ROLE-4: isInternalSession => false -> caminho normal de orchestration intacto", async () => {
+  const { state, handler } = fakeDeps({
+    isInternalSession: async () => false,
+  });
+  const out = await handler(VALID);
+  assert.equal(out.status, "started", "sessao explicitamente externa orquestra normalmente");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(state.runs.length, 1, "exatamente 1 run");
+});
+
 test("R13: binding em awaiting-human -> ZERO auto-resume, zero run", async () => {
   const { store, state, handler } = fakeDeps();
   store.set(sessionBindingKey(VALID.sessionID), {
