@@ -451,12 +451,13 @@ async function main() {
     );
     const msgs = await waitFor(async () => {
       const res = await api("GET", `/api/session/${normal.sid}/message`);
-      return /"role"\s*:\s*"assistant"/.test(res.text) ? res : null;
+      // Forma real do transcript v2.0.11 (wire): {"data":[{..., "type":"assistant", ...}]}
+      return /"type"\s*:\s*"assistant"/.test(res.text) ? res : null;
     }, T.exec, "resposta nativa no transcript");
     assert(
       "normal: resposta nativa chega ao transcript",
-      /"role"\s*:\s*"assistant"/.test(msgs.text),
-      `assistantInTranscript=${/"role"\s*:\s*"assistant"/.test(msgs.text)}`,
+      /"type"\s*:\s*"assistant"/.test(msgs.text),
+      `assistantInTranscript=${/"type"\s*:\s*"assistant"/.test(msgs.text)}`,
     );
   } catch (err) {
     assert("fase normal", false, err.message);
@@ -721,6 +722,21 @@ async function main() {
     const gwMark = gwEvents.length;
     const sessMark = await api("GET", "/api/session");
     const beforeIds = new Set(sesIds(sessMark.text));
+    // Baselines ABSOLUTOS capturados ANTES do spawn (o driver espera a partir
+    // deles — sem corrida entre type e leitura de baseline no wait).
+    const countFileMatches = (file, regex) => {
+      let text = "";
+      try {
+        text = fs.readFileSync(file, "utf8");
+      } catch {
+        return 0;
+      }
+      const m = text.match(new RegExp(regex, "g"));
+      return m ? m.length : 0;
+    };
+    const NORMAL_RE = '"type":"intercept","sessionID":"[^"]+","mode":"normal"';
+    const normalBaseline = countFileMatches(gwLogPath, NORMAL_RE);
+    const rpcBaseline = since(gwMark).filter((e) => e.type === "rpc-dispatched").length;
     const spec = {
       bin: BIN,
       args: ["--server", gwOrigin],
@@ -732,14 +748,23 @@ async function main() {
         {
           wait_log: {
             file: gwLogPath,
-            regex: '"type":"intercept","sessionID":"[^"]+","mode":"normal"',
+            regex: NORMAL_RE,
+            baseline: normalBaseline,
             min_extra: 1,
             timeout_ms: 120000,
           },
         },
         { sleep_ms: 8000 },
         { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
-        { wait_log: { file: gwLogPath, regex: '"type":"rpc-dispatched"', min_extra: 1, timeout_ms: 180000 } },
+        {
+          wait_log: {
+            file: gwLogPath,
+            regex: '"type":"rpc-dispatched"',
+            baseline: rpcBaseline,
+            min_extra: 1,
+            timeout_ms: 180000,
+          },
+        },
         { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
         { sleep_ms: 12000 },
       ],
@@ -848,14 +873,26 @@ async function main() {
       tuiNormal.length === 1 && tuiOrch.length === 1 && tuiNormal[0].sessionID === tuiOrch[0].sessionID,
       `normalSid=${tuiNormal[0]?.sessionID} orchSid=${tuiOrch[0]?.sessionID}`,
     );
+    // parent=0 ESTRITO e compativel com o ping previo: nenhuma execution.started
+    // da sessao do TUI pode existir A PARTIR da admissao do ORCH (o ping
+    // normal executa nativamente ANTES — exec anterior e legitima). Wake
+    // sincrono durante a admissao cairia depois de admittedT e seria pego.
+    const tuiAdmitted = since(gwMark).find((e) => e.type === "admitted" && e.sessionID === tuiSid);
+    const lateExecs = sseEvents.filter(
+      (e) =>
+        e.type.includes("execution.started") &&
+        tuiSid !== null &&
+        e.raw.includes(`"sessionID":"${tuiSid}"`) &&
+        tuiAdmitted !== undefined &&
+        e.t >= tuiAdmitted.t - 2000,
+    );
     assert(
       "TUI orchestrate: parent=0 (nenhuma execucao nova do parent apos admission)",
       tuiSid !== null &&
-        execAtOrch !== null &&
-        execAtOrch === 0 &&
-        execStartedCount(tuiSid) === 0 &&
+        tuiAdmitted !== undefined &&
+        lateExecs.length === 0 &&
         execStartedCount(tuiSid) === execAtOrch,
-      `execAtOrch=${execAtOrch} final=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
+      `admittedT=${tuiAdmitted?.t} lateExecs=${lateExecs.length} execAtOrch=${execAtOrch} final=${tuiSid !== null ? execStartedCount(tuiSid) : "n/a"}`,
     );
     assert(
       "TUI: notice da publicacao chega ao inbox da sessao do TUI",

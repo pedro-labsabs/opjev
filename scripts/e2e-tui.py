@@ -106,7 +106,13 @@ def main() -> int:
                 pump(step["sleep_ms"] / 1000.0)
             elif "wait_log" in step:
                 wl = step["wait_log"]
-                baseline = count_in_file(wl["file"], wl["regex"])
+                # baseline ABSOLUTO (quando fornecido pelo orquestrador, contado
+                # ANTES do spawn do TUI): elimina a corrida em que o submit
+                # acontece entre o type e a leitura do baseline no wait.
+                if "baseline" in wl:
+                    baseline = int(wl["baseline"])
+                else:
+                    baseline = count_in_file(wl["file"], wl["regex"])
                 target = baseline + int(wl.get("min_extra", 1))
                 deadline = time.time() + wl.get("timeout_ms", 30000) / 1000.0
                 ok = False
