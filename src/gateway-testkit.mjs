@@ -501,6 +501,35 @@ export const TEST_RULES = JSON.stringify([
   { prefix: "ROUTE:", mode: "route" },
 ]);
 
+/**
+ * Fake Jev (SystemOne) minimalista: conta POSTs de decisao e responde 500
+ * (forca o fallback heuristico deterministico do router — sem rede, sem
+ * flake). Prova direta de "Jev foi/não foi consultado".
+ */
+export async function startFakeJev() {
+  const state = { calls: [] };
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      state.calls.push({ path: req.url, bytes: Buffer.concat(chunks).byteLength });
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end('{"error":"jev-down"}');
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    port,
+    state,
+    async close() {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
 /** Config de teste agressiva: timeouts curtos, corpos bounded, log coletado. */
 export function testConfig(extra = {}) {
   return {

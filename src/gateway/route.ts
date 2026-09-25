@@ -45,7 +45,37 @@ export async function decideAndApplyRoute(input: {
    * fallback normal (o forward decide nativamente).
    */
   clientAuth?: CallAuth;
+  /**
+   * Seam de teste para o endpoint Jev (hermetico): quando definido, substitui
+   * o endpoint default das opcoes. Producao (server.ts) nunca passa — usa o
+   * default canonico. Nao muda decisao, so o destino HTTP da consulta.
+   */
+  jevEndpoint?: string;
+  jevApiKey?: string | undefined;
 }): Promise<RouteOutcome> {
+  // Guarda de papel PRIMEIRO: sem confirmacao de papel externo, NENHUM
+  // trabalho de routing (ZERO catalogos, ZERO Jev, ZERO switches). Sessoes
+  // internas ja tem executor determinado pelo dispatcher; papel ambiguo nao
+  // pode provar externo. Metadata ausente em GET 200 continua externa (o
+  // runtime pode nao expor metadata em sessoes normais). Lookup sempre com
+  // input.clientAuth — nunca senha de env.
+  let beforeModel: { providerID: string; id: string } | undefined;
+  try {
+    const current = await input.upstream.getSession(input.sessionID, input.clientAuth);
+    if (isInternalOrchestrationSession(current.metadata)) {
+      return {
+        applied: false,
+        reason: "sessao interna: sem routing, sem catalogos, sem Jev (forward normal)",
+      };
+    }
+    beforeModel = current.model;
+  } catch (err) {
+    return {
+      applied: false,
+      reason: `papel da sessao indeterminado; sem routing, sem catalogos, sem Jev (fallback normal): ${bounded(err)}`,
+    };
+  }
+
   try {
     const [agents, models] = await Promise.all([
       input.upstream.listAgents(input.clientAuth),
@@ -67,8 +97,8 @@ export async function decideAndApplyRoute(input: {
       freeCandidates,
       route: "unknown",
       jevModel: opts.jevModel,
-      jevEndpoint: opts.jevEndpoint,
-      apiKey,
+      jevEndpoint: input.jevEndpoint ?? opts.jevEndpoint,
+      apiKey: input.jevApiKey !== undefined ? input.jevApiKey : apiKey,
       confidenceThreshold: opts.confidenceThreshold,
       timeoutMs: input.config.routeDecisionTimeoutMs,
     });
@@ -87,29 +117,7 @@ export async function decideAndApplyRoute(input: {
     const sep = decision.model.indexOf("/");
     const providerID = decision.model.slice(0, sep);
     const modelID = decision.model.slice(sep + 1);
-    // Guarda de papel (I2): sessao interna nunca recebe switches — forward
-    // normal sem mutacao. Lookup AMBIGUO (papel desconhecido) => tambem
-    // fallback normal ANTES de qualquer mutacao: sem provar externo, route
-    // nao aplica. Nao inventa estado anterior; nao usa senha de env (a chamada
-    // acima ja espelha input.clientAuth).
-    let beforeModel: { providerID: string; id: string } | undefined;
-    try {
-      const current = await input.upstream.getSession(input.sessionID, input.clientAuth);
-      if (isInternalOrchestrationSession(current.metadata)) {
-        return {
-          applied: false,
-          decision,
-          reason: "sessao interna: route sem switches (forward normal, zero mutacao)",
-        };
-      }
-      beforeModel = current.model;
-    } catch (err) {
-      return {
-        applied: false,
-        decision,
-        reason: `papel da sessao indeterminado; route nao aplicada (fallback normal): ${bounded(err)}`,
-      };
-    }
+    // beforeModel veio do role guard (primeira chamada, com clientAuth).
     await input.upstream.switchModel(input.sessionID, { providerID, id: modelID }, input.clientAuth);
     try {
       await input.upstream.switchAgent(input.sessionID, decision.agent, input.clientAuth);

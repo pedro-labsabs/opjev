@@ -283,6 +283,18 @@ test("A12b: sessao interna (metadata worker) com prompt limpo -> bypass, sem orc
     assert.equal(up.state.rpcs.length, 0, "ZERO dispatch para sessao interna");
     assert.equal(up.state.patches.length, 0);
     assert.equal(gw.counters().admitted, 0, "admissao zerada para sessao interna");
+    // Pipeline de routing nunca iniciada: 1 lookup de papel, ZERO catalogos.
+    const kinds = up.order();
+    assert.equal(
+      kinds.filter((k) => k === "GET /api/session/ses_worker1").length,
+      1,
+      "role lookup executado exatamente 1x",
+    );
+    assert.equal(
+      kinds.filter((k) => k === "GET /api/model" || k === "GET /api/agent").length,
+      0,
+      "ZERO catalog work para sessao interna",
+    );
   } finally {
     await gw.close();
     await up.close();
@@ -360,6 +372,18 @@ test("A12c: sessao interna com prefixo ROUTE -> forward sem switches, zero mutac
     assert.equal(up.state.agents.length, 0, "ZERO switch de agente em sessao interna");
     assert.equal(up.state.rpcs.length, 0, "ZERO dispatch");
     assert.equal(gw.counters().routeApplied, 0, "route nao conta como aplicada");
+    // Pipeline de routing nunca iniciada: 1 lookup de papel, ZERO catalogos.
+    const kindsC = up.order();
+    assert.equal(
+      kindsC.filter((k) => k === "GET /api/session/ses_workerR").length,
+      1,
+      "role lookup executado exatamente 1x",
+    );
+    assert.equal(
+      kindsC.filter((k) => k === "GET /api/model" || k === "GET /api/agent").length,
+      0,
+      "ZERO catalog work para sessao interna",
+    );
   } finally {
     await gw.close();
     await up.close();
@@ -381,6 +405,18 @@ test("A12d: route com session-role lookup ambiguo -> fallback normal, zero switc
     assert.equal(up.state.rpcs.length, 0, "ZERO dispatch");
     assert.equal(up.state.patches.length, 0, "nenhum wake");
     assert.equal(up.state.prompts.length, 1, "prompt original encaminhado exatamente 1x");
+    // Pipeline de routing nunca iniciada: lookup tentado 1x, ZERO catalogos.
+    const kindsD = up.order();
+    assert.equal(
+      kindsD.filter((k) => k === "GET /api/session/ses_ambrole").length,
+      1,
+      "role lookup tentado exatamente 1x",
+    );
+    assert.equal(
+      kindsD.filter((k) => k === "GET /api/model" || k === "GET /api/agent").length,
+      0,
+      "ZERO catalog work com papel desconhecido",
+    );
     const c = gw.counters();
     assert.equal(c.routeApplied, 0, "route nao aplicada");
     assert.equal(c.routeFallback, 1, "fallback contabilizado");
