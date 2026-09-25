@@ -1,0 +1,541 @@
+// Harness de teste do gateway: upstream OpenCode FAKE em HTTP real (node:http)
+// + starter do gateway real. Os testes exercitam fronteira HTTP de verdade
+// (requests/responses sobre socket), nunca mocks de funcao.
+//
+// O fake upstream implementa o subconjunto do contrato público v2.0.11 que o
+// gateway toca: prompt (admissao/resume:false + idempotencia por id), inbox
+// PATCH (wake), catalogos model/agent, switches, RPC e SSE de eventos.
+import http from "node:http";
+
+export async function startFakeUpstream(opts = {}) {
+  const cfg = {
+    modelCatalog: opts.modelCatalog ?? [
+      { id: "nemotron-3.5-lightning-free", providerID: "opencode", name: "Nemotron" },
+      { id: "big-pickle", providerID: "opencode", name: "Big Pickle" },
+      { id: "muse-spark-1.3-contributor-free", providerID: "opencode", name: "Muse" },
+    ],
+    agentCatalog: opts.agentCatalog ?? [
+      { id: "build", name: "Build", mode: "primary" },
+      { id: "plan", name: "Plan", mode: "primary" },
+    ],
+    // gap entre chunks do SSE fake (prova que o gateway nao mata stream
+    // ocioso com timeout de request; default 150ms como antes)
+    sseGapMs: opts.sseGapMs ?? 150,
+    // sessionBare: GET de sessao sem model/agent (forma degradada — o parser
+    // do gateway trata como estado desconhecido, nunca como erro)
+    sessionBare: opts.sessionBare ?? false,
+    // ok | fail500 | hang (nunca responde = ambiguo)
+    promptMode: opts.promptMode ?? "ok",
+    // ok | fail500 | invalid-shape (200 sem output.runID)
+    rpcMode: opts.rpcMode ?? "ok",
+    rpcDelayMs: opts.rpcDelayMs ?? 0,
+    // sessionFail: GET de sessao responde 500 (lookup indisponivel)
+    sessionFail: opts.sessionFail ?? false,
+    // sessionNotFound: GET de sessao responde 404 (sessao inexistente)
+    sessionNotFound: opts.sessionNotFound ?? false,
+    // rpcDedupe: emula o record DURAVEL do plugin (segunda RPC da mesma
+    // identidade retorna duplicate-ignored, sem novo run — run<=1 cross-restart)
+    rpcDedupe: opts.rpcDedupe ?? false,
+    modelSwitchFail: opts.modelSwitchFail ?? false,
+    agentSwitchFail: opts.agentSwitchFail ?? false,
+    catalogFail: opts.catalogFail ?? false,
+  };
+
+  const state = {
+    order: [],      // [{kind, path}] na ordem chegada — prova ordering route→forward
+    auth: [],       // [{kind, authHash}] sha256 da Authorization (valor NUNCA registrado)
+    prompts: [],    // {path, raw, parsed, createdItem}
+    patches: [],    // wake attempts (NUNCA deve existir no modo orchestrate)
+    models: [],
+    agents: [],
+    rpcs: [],
+    rpcRuns: 0,     // runs EFETIVOS criados no modo rpcDedupe (segunda RPC nao cria)
+    upgrades: [],   // upgrade attempts (tunel bruto do proxy)
+    sse: { connections: 0, closedEarly: 0, completed: 0 },
+  };
+  const requireAuth = opts.requireAuth; // string exata esperada ou undefined (upstream aberto)
+  // Robustez do fake (M4): decode nunca derruba o harness; SSP malformado
+  // fora do prompt vira 404 como qualquer path desconhecido.
+  const safeDecode = (v) => {
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return null;
+    }
+  };
+
+  let msgSeq = 0;
+  const rpcAdmissions = new Map(); // `${sid}\0${mid}` -> {runID, runs} (record duravel p/ rpcDedupe)
+  // Identidade GLOBAL do upstream (runtime real v2.0.11 provado): ids de
+  // mensagem fornecidos pelo cliente sao unicos por upstream, NAO por sessao
+  // (mesmo id em outra sessao => 409 ConflictError). Replay na MESMA sessao
+  // com o mesmo id => 200 idempotente com o mesmo item.
+  const idem = new Map(); // clientID -> {sid, msgID}
+  const sessions = new Map(); // sid -> {model: {providerID,id}, agent, metadata} (estado p/ rollback)
+  const sessionMetadata = opts.sessionMetadata ?? {};
+  function sessionState(sid) {
+    let s = sessions.get(sid);
+    if (!s) {
+      // Default DIFERENTE do lane fast-coding: garante que um switch de route
+      // real muda o estado (exercicio honesto do rollback parcial).
+      s = { model: { providerID: "opencode", id: "muse-spark-1.3-contributor-free" }, agent: "build" };
+      const meta = sessionMetadata[sid];
+      if (meta !== null && typeof meta === "object" && !Array.isArray(meta)) s.metadata = meta;
+      sessions.set(sid, s);
+    }
+    return s;
+  }
+
+  function readBody(req) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+  }
+
+  const { createHash } = await import("node:crypto");
+  const authHash = (req) => {
+    const v = req.headers.authorization;
+    if (typeof v !== "string") return null;
+    return createHash("sha256").update(v, "utf8").digest("hex");
+  };
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://upstream");
+    const path = url.pathname;
+    state.order.push({ kind: `${req.method} ${path}`, path });
+    // Fronteira de auth: registra SOMENTE o hash (nunca o valor). Com
+    // requireAuth, credencial ausente/divergente vira 401 nativo — exatamente
+    // como um upstream protegido se comporta.
+    const presented = authHash(req);
+    state.auth.push({ kind: `${req.method} ${path}`, authed: presented !== null, hash: presented });
+    if (requireAuth !== undefined) {
+      const expected = createHash("sha256").update(requireAuth, "utf8").digest("hex");
+      if (presented !== expected) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end('{"error":"unauthorized"}');
+        return;
+      }
+    }
+
+    try {
+      // ---- SSE de eventos -------------------------------------------------
+      if (req.method === "GET" && path === "/api/event") {
+        state.sse.connections += 1;
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        let closed = false;
+        req.on("close", () => {
+          if (!res.writableEnded) {
+            closed = true;
+            state.sse.closedEarly += 1;
+          }
+        });
+        res.write('data: {"type":"first"}\n\n');
+        setTimeout(() => {
+          if (!closed && !res.writableEnded && !res.destroyed) res.write('data: {"type":"second"}\n\n');
+        }, cfg.sseGapMs);
+        setTimeout(() => {
+          if (!closed && !res.destroyed) {
+            res.end();
+            state.sse.completed += 1;
+          }
+        }, cfg.sseGapMs + 200);
+        return;
+      }
+
+      if (req.method === "GET" && path === "/api/info") {
+        res.writeHead(200, { "content-type": "application/json", "x-fake": "info" });
+        res.end(JSON.stringify({ version: "fake-upstream" }));
+        return;
+      }
+
+      if (req.method === "GET" && path === "/api/custom") {
+        res.writeHead(418, { "content-type": "text/plain", "x-custom": "keep-me" });
+        res.end("teapot-body");
+        return;
+      }
+
+      // ---- catalogos ------------------------------------------------------
+      if (req.method === "GET" && path === "/api/model") {
+        if (cfg.catalogFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"catalog-down"}');
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ location: { directory: "/tmp/fake" }, data: cfg.modelCatalog }));
+        return;
+      }
+
+      if (req.method === "GET" && path === "/api/agent") {
+        if (cfg.catalogFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"catalog-down"}');
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ location: { directory: "/tmp/fake" }, data: cfg.agentCatalog }));
+        return;
+      }
+
+      // ---- prompt (admissao) ---------------------------------------------
+      const promptMatch = req.method === "POST" && /^\/api\/session\/([^/]+)\/prompt$/.exec(path);
+      if (promptMatch) {
+        const sid = safeDecode(promptMatch[1]);
+        if (sid === null) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"not-found"}');
+          return;
+        }
+        const raw = await readBody(req);
+        let parsed;
+        try {
+          parsed = JSON.parse(raw.toString("utf8"));
+        } catch {
+          parsed = { __unparsable: true };
+        }
+
+        if (cfg.promptMode === "hang") {
+          state.prompts.push({ path, raw, parsed, createdItem: false, sid });
+          return; // nunca responde — ambiguidade de admissao
+        }
+        if (cfg.promptMode === "fail500") {
+          state.prompts.push({ path, raw, parsed, createdItem: false, sid });
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"prompt-rejected"}');
+          return;
+        }
+
+        const clientId = typeof parsed.id === "string" ? parsed.id : undefined;
+        let msgID;
+        let createdItem = true;
+        if (clientId !== undefined) {
+          const known = idem.get(clientId);
+          if (known !== undefined) {
+            if (known.sid !== sid) {
+              // Conflito global de identidade (runtime real: 409 ConflictError):
+              // o item pertence a outra sessao; nada e criado aqui.
+              state.prompts.push({ path, raw, parsed, createdItem: false, sid, conflict: true });
+              res.writeHead(409, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  _tag: "ConflictError",
+                  message: `Prompt message ID conflicts with an existing durable record: ${clientId}`,
+                  resource: clientId,
+                }),
+              );
+              return;
+            }
+            msgID = known.msgID;
+            createdItem = false; // replay idempotente: MESMO item, count=1
+          } else {
+            msgID = clientId;
+            idem.set(clientId, { sid, msgID });
+          }
+        } else {
+          msgSeq += 1;
+          msgID = `msg_test${msgSeq}`;
+        }
+
+        state.prompts.push({ path, raw, parsed, createdItem, sid, msgID });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            data: {
+              id: msgID,
+              sessionID: sid,
+              time: { created: 1790000000000 + msgSeq },
+              type: parsed.type === "synthetic" ? "synthetic" : "user",
+              payload: { text: parsed.text },
+              delivery: parsed.delivery ?? "steer",
+            },
+          }),
+        );
+        return;
+      }
+
+      // ---- wake (inbox PATCH) ---------------------------------------------
+      const patchMatch = req.method === "PATCH" && /^\/api\/session\/([^/]+)\/inbox\/([^/]+)$/.exec(path);
+      if (patchMatch) {
+        const raw = await readBody(req);
+        state.patches.push({ path, raw: raw.toString("utf8") });
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      // ---- sessao (leitura de estado p/ rollback de route) -------------------
+      const sessionGetMatch = req.method === "GET" && /^\/api\/session\/([^/]+)$/.exec(path);
+      if (sessionGetMatch) {
+        if (cfg.sessionFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"session-unavailable"}');
+          return;
+        }
+        if (cfg.sessionNotFound) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"session-not-found"}');
+          return;
+        }
+        const sid = safeDecode(sessionGetMatch[1]);
+        if (sid === null) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end('{"error":"not-found"}');
+          return;
+        }
+        const st = sessionState(sid);
+        res.writeHead(200, { "content-type": "application/json" });
+        if (cfg.sessionBare) {
+          res.end(JSON.stringify({ data: { id: sid } }));
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            data: {
+              id: sid,
+              model: st.model,
+              agent: st.agent,
+              ...(st.metadata !== undefined ? { metadata: st.metadata } : {}),
+            },
+          }),
+        );
+        return;
+      }
+
+      // ---- switches de route ----------------------------------------------
+      const modelMatch = req.method === "POST" && /^\/api\/session\/([^/]+)\/model$/.exec(path);
+      if (modelMatch) {
+        const raw = await readBody(req);
+        state.models.push({ path, raw: JSON.parse(raw.toString("utf8") || "{}") });
+        if (cfg.modelSwitchFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"switch-model-down"}');
+          return;
+        }
+        try {
+          const m = JSON.parse(raw.toString("utf8"))?.model;
+          if (m && typeof m.providerID === "string" && typeof m.id === "string") {
+            sessionState(safeDecode(modelMatch[1]) ?? modelMatch[1]).model = { providerID: m.providerID, id: m.id };
+          }
+        } catch {
+          // estado best-effort; o switch ja foi aceito
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+
+      const agentMatch = req.method === "POST" && /^\/api\/session\/([^/]+)\/agent$/.exec(path);
+      if (agentMatch) {
+        const raw = await readBody(req);
+        state.agents.push({ path, raw: JSON.parse(raw.toString("utf8") || "{}") });
+        if (cfg.agentSwitchFail) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"switch-agent-down"}');
+          return;
+        }
+        try {
+          const a = JSON.parse(raw.toString("utf8"))?.agent;
+          if (typeof a === "string" && a.length > 0) {
+            sessionState(safeDecode(agentMatch[1]) ?? agentMatch[1]).agent = a;
+          }
+        } catch {
+          // estado best-effort; o switch ja foi aceito
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+
+      // ---- RPC --------------------------------------------------------------
+      const rpcMatch = req.method === "POST" && /^\/api\/rpc\/([^/]+)\/([^/]+)$/.exec(path);
+      if (rpcMatch) {
+        const raw = await readBody(req);
+        let input;
+        try {
+          input = JSON.parse(raw.toString("utf8")).input;
+        } catch {
+          input = undefined;
+        }
+        state.rpcs.push({ rpcID: safeDecode(rpcMatch[1]) ?? rpcMatch[1], method: safeDecode(rpcMatch[2]) ?? rpcMatch[2], input });
+        if (cfg.rpcMode === "fail500") {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"rpc-down"}');
+          return;
+        }
+        const respond = () => {
+          if (res.destroyed) return;
+          if (cfg.rpcMode === "invalid-shape") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end("{}");
+            return;
+          }
+          const sid = String(input?.sessionID ?? "ses_x");
+          const mid = String(input?.messageID ?? "msg_x");
+          if (cfg.rpcDedupe) {
+            const key = `${sid}\0${mid}`;
+            const known = rpcAdmissions.get(key);
+            if (known !== undefined) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ output: { runID: known.runID, status: "duplicate-ignored" } }));
+              return;
+            }
+            const runID = `auto-${sid}-${mid}`;
+            rpcAdmissions.set(key, { runID, runs: 1 });
+            state.rpcRuns += 1;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ output: { runID, status: "started" } }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ output: { runID: `auto-${sid}-${mid}`, status: "started" } }));
+        };
+        if (cfg.rpcDelayMs > 0) setTimeout(respond, cfg.rpcDelayMs);
+        else respond();
+        return;
+      }
+
+      // ---- fallback transparente -------------------------------------------
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end('{"error":"not-found"}');
+    } catch {
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    }
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+
+  // ---- upgrade bruto (eco): prova que o tunel do gateway nao corrompe ----
+  const upgradeSockets = new Set();
+  server.on("upgrade", (req, socket) => {
+    const presented = authHash(req);
+    state.upgrades.push({
+      path: req.url,
+      authed: presented !== null,
+      hash: presented,
+      proxyAuth: typeof req.headers["proxy-authorization"] === "string",
+    });
+    if (requireAuth !== undefined) {
+      const expected = createHash("sha256").update(requireAuth, "utf8").digest("hex");
+      if (presented !== expected) {
+        socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        return;
+      }
+    }
+    upgradeSockets.add(socket);
+    socket.on("close", () => upgradeSockets.delete(socket));
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n");
+    socket.on("data", (chunk) => {
+      if (!socket.destroyed) socket.write(chunk); // eco byte a byte
+    });
+    socket.on("error", () => {
+      try {
+        socket.destroy();
+      } catch {
+        // ja fechado
+      }
+    });
+  });
+
+  return {
+    url: `http://127.0.0.1:${port}`,
+    port,
+    cfg,
+    state,
+    order() {
+      return state.order.map((e) => e.kind);
+    },
+    async close() {
+      for (const s of upgradeSockets) {
+        try {
+          s.destroy();
+        } catch {
+          // ja fechado
+        }
+      }
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
+ * Sobe o gateway REAL (src/gateway/server.ts) em porta efêmera contra o
+ * upstream fake. `overrides` entra na config bounded (mesmo shape do env).
+ * `logs` coleta as linhas de log do gateway (para asserção de não-vazamento).
+ */
+export async function startGateway(upstreamUrl, overrides = {}) {
+  const { resolveGatewayConfig } = await import("./gateway/config.ts");
+  const { createGatewayServer } = await import("./gateway/server.ts");
+  const config = resolveGatewayConfig({
+    enabled: true,
+    upstream: upstreamUrl,
+    host: "127.0.0.1",
+    port: 0,
+    ...overrides,
+  });
+  const logs = [];
+  const gw = createGatewayServer(config, {
+    log: (line) => logs.push(line),
+  });
+  await gw.listen(0);
+  return {
+    url: `http://127.0.0.1:${gw.port}`,
+    port: gw.port,
+    logs,
+    counters: () => gw.counters(),
+    activeSockets: () => gw.activeSockets(),
+    close: async () => {
+      await gw.close();
+    },
+  };
+}
+
+/** Env determinística default para os testes de modo (regras explícitas). */
+export const TEST_RULES = JSON.stringify([
+  { prefix: "ORCH:", mode: "orchestrate" },
+  { prefix: "ROUTE:", mode: "route" },
+]);
+
+/**
+ * Fake Jev (SystemOne) minimalista: conta POSTs de decisao e responde 500
+ * (forca o fallback heuristico deterministico do router — sem rede, sem
+ * flake). Prova direta de "Jev foi/não foi consultado".
+ */
+export async function startFakeJev() {
+  const state = { calls: [] };
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      state.calls.push({ path: req.url, bytes: Buffer.concat(chunks).byteLength });
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end('{"error":"jev-down"}');
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    port,
+    state,
+    async close() {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/** Config de teste agressiva: timeouts curtos, corpos bounded, log coletado. */
+export function testConfig(extra = {}) {
+  return {
+    routeDecisionTimeoutMs: 300,
+    proxyTimeoutMs: 2000,
+    rpcTimeoutMs: 1500,
+    ...extra,
+  };
+}
