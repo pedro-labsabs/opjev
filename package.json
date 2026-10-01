@@ -4,9 +4,14 @@
   "description": "Jev (System One) como juiz-roteador para free models do OpenCode Zen, com fallback em cadeia",
   "type": "module",
   "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit -p ./tsconfig.json",
-    "test": "node --test ./src/*.test.mjs"
+    "test": "node --test ./src/*.test.mjs",
+    "e2e:gateway": "node scripts/e2e-gateway.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.7"

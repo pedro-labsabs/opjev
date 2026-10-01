@@ -1,8 +1,11 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  // No OpenCode v2.0.11, o servidor do projeto (`opencode serve`) carrega os plugins declarados
+  // no opencode.json do projeto (caminho local ou pacote instalado), enquanto a interface CLI/TUI (`opencode`)
+  // carrega extensoes TUI a partir de ~/.config/opencode/plugins/<nome-do-plugin> (entrypoint ./tui).
   "plugins": [
     {
-      "package": "./plugins/jev-free-router",
+      "package": "./plugins/opencode-jev-free-router",
       "options": {
         "jevModel": "jev-1.13-free",
         "jevEndpoint": "https://opencode.ai/zen/v1/systemone",

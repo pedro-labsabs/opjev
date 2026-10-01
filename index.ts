@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import { AdmissionRpc, createAdmissionOrchestrateHandler } from "./src/orchestration/admission-rpc.ts";
 import { FREE_POOL, isFreeModel, resolveOptions, splitModelRef, type FreeModel, type RouteKind, type RouterOptions } from "./src/config.ts";
 import { resolveApiKey } from "./src/auth.ts";
 import {
@@ -36,6 +37,11 @@ import {
 } from "./src/orchestration/agent-catalog.ts";
 import { attemptKey } from "./src/orchestration/dispatcher.ts";
 import type { AgentCatalogEntry } from "./src/orchestration/agent-catalog.ts";
+import {
+  OrchestrationResultRpc,
+  ORCHESTRATION_RESULT_EVENT,
+  buildOrchestrationResultEvent,
+} from "./src/orchestration/presentation.ts";
 import {
   buildCriticContextInstruction,
   buildOrchestratorContextInstruction,
@@ -1085,6 +1091,80 @@ export default Plugin.define({
     // Resolve por chamada (nao so no setup) para captar `export` ou
     // `/connect` feitos apos o load. resolveApiKey le a env primeiro.
     const getKey = () => resolveApiKey(ctx, opts.apiKeyEnv);
+
+    // Emissor do evento de apresentacao (presentation boundary, PR #27):
+    // registro somete-eventos no mesmo seam RPC publico; `null` quando a
+    // superficie nao expoe rpc.register (ex.: lado TUI).
+    let presentationEmit: { emit(name: string, data: unknown): Promise<void> } | null = null;
+
+    // Seam RPC PUBLICO bounded (#24): o gateway de admission deterministico
+    // persiste o prompt (resume:false) e dispara runOrchestrationOnce EXATAMENTE
+    // uma vez por identidade de turno, por aqui — sem parent/model trampoline.
+    // Server-side apenas; ctx sem rpc.register (ex.: lado TUI) = no-op.
+    if (ctx?.rpc && typeof ctx.rpc.register === "function") {
+      try {
+        try {
+          const presentationReg = await ctx.rpc.register(OrchestrationResultRpc, {} as any);
+          if (
+            presentationReg &&
+            presentationReg.events &&
+            typeof (presentationReg.events as any).emit === "function"
+          ) {
+            presentationEmit = presentationReg.events as any;
+          }
+        } catch {
+          // Superficie sem suporte a RPC so-eventos: apresentacao fica
+          // indisponivel (degradacao bounded); admission segue integralmente.
+        }
+        await ctx.rpc.register(AdmissionRpc, {
+          orchestrate: createAdmissionOrchestrateHandler({
+            storage: {
+              get: (key: string) => safeStorageGet(ctx, key),
+              set: async (key: string, value: unknown) => {
+                await ctx.storage.set(key, value);
+              },
+            },
+            runner: (contract: ExecutionContract) =>
+              runOrchestrationOnce(contract, makeOrchestrationDeps(ctx, opts, getKey)),
+            publish: async (sessionID: string, text: string) => {
+              // resultado voltando a experiencia OpenCode SEM wake do parent:
+              // synthetic duravel (resume:false), API publica suportada.
+              await ctx.session.synthetic({ sessionID, text, resume: false });
+            },
+            // Guarda de papel autoritativa (#24/I1): sessoes internas nunca
+            // iniciam orchestration aninhada (o gateway filtra fail-closed
+            // antes; aqui e in-process). Leitura indisponivel => PROPAGA
+            // (o handler recusa fail-closed; erro de lookup nunca vira
+            // `internal=false`).
+            isInternalSession: async (sessionID: string) => {
+              const info: any = await ctx.session.get({ sessionID });
+              const metadata = info?.metadata;
+              return (
+                isInternalWorkerSession(metadata) ||
+                isInternalCriticSession(metadata) ||
+                isInternalOrchestratorSession(metadata)
+              );
+            },
+            // Presentation boundary (PR #27): transporta o notice bounded do
+            // run concluido por evento RPC publico. SEM autoridade: o emit
+            // e fire-and-forget; falha nunca altera record/binding/publicacao.
+            notify: (event) => {
+              void presentationEmit?.emit(ORCHESTRATION_RESULT_EVENT, event).catch(() => {
+                // TUI indisponivel: degradacao bounded (estado authoritative preservado)
+              });
+            },
+          }),
+        });
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err).split("\n")[0] ?? "erro";
+        console.error(`[opjev] rpc de admission indisponivel nesta superficie: ${msg.slice(0, 200)}`);
+      }
+    }
+
+    // Surface TUI (sem ctx.tool): o entrypoint server aqui nada faz — a
+    // apresentacao vive no entrypoint `tui` (tui.ts). Guarda evita TypeError
+    // quando o host cli carrega este arquivo por resolucao de package.
+    if (!ctx?.tool || typeof ctx.tool.transform !== "function") return;
 
     await ctx.tool.transform((editor: any) => {
       editor.namespace({
