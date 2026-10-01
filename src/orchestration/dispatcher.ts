@@ -34,7 +34,7 @@ import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFi
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
-import { formatFollowupsSection, type PendingFollowup } from "./followup.ts";
+import { formatFollowupsSection, revertFollowupConsumption, type PendingFollowup, type FollowupStorage } from "./followup.ts";
 
 export const WORKER_TIMEOUT_MS = 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -209,6 +209,7 @@ export interface DispatcherDeps {
    * consumo e prompt canonico intacto (regressao zero, comportamento #27).
    */
   followups?: (runID: string, round: number) => Promise<PendingFollowup[]>;
+  storage?: FollowupStorage;
 }
 
 export interface OrchestrationRunResult {
@@ -763,16 +764,26 @@ async function executeSchedule(
       // falha do seam => degradacao bounded (rodada segue sem a secao, follow-up
       // continua pendente — nunca consumido sem retorno). NAO e nova rodada,
       // comando ou transicao normativa: apenas entrada do prompt da rodada.
+      let takenFollowups: PendingFollowup[] = [];
       if (deps.followups !== undefined) {
         try {
-          const pending: PendingFollowup[] = await deps.followups(contract.runID, state.round);
-          const section = formatFollowupsSection(pending, state.round);
+          takenFollowups = await deps.followups(contract.runID, state.round);
+          const section = formatFollowupsSection(takenFollowups, state.round);
           if (section) promptText = `${promptText}\n\n${section}`;
         } catch {
           // degradacao bounded: o follow-up permanece pendente no record
         }
       }
-      await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+      try {
+        await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+      } catch (promptErr) {
+        if (deps.storage && takenFollowups.length > 0) {
+          try {
+            await revertFollowupConsumption({ storage: deps.storage }, contract.runID, takenFollowups);
+          } catch {}
+        }
+        throw promptErr;
+      }
       await withTimeout(() => deps.runtime.wait({ sessionID: workerSessionID }), timeoutMs, () => deps.runtime.interrupt?.({ sessionID: workerSessionID }));
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });

@@ -155,17 +155,20 @@ async function attachFollowupToActiveRun(
   // o binding permanece intocado (continua o run ativo). Falha de storage =>
   // erro bounded fail-closed (o replay recusa via record/index).
   try {
-    await deps.storage.set(followupIndexKey(activeRunID), [...index, messageID]);
     await deps.storage.set(
       followupKey(activeRunID, messageID),
       buildFollowupRecord({ sessionID, messageID, runID: activeRunID, text: objective, at: Date.now() }),
     );
+    await deps.storage.set(followupIndexKey(activeRunID), [...index, messageID]);
     await deps.storage.set(admissionRecordKey(sessionID, messageID), {
       runID: activeRunID,
       state: "followup-attached",
       at: Date.now(),
     });
   } catch (err) {
+    try {
+      await deps.storage.set(followupKey(activeRunID, messageID), undefined);
+    } catch {}
     throw new OrchestrationError(
       "followup-persistence-failed",
       `persistencia do follow-up falhou (runner nao executado, binding intocado): ${boundedError(err)}`,

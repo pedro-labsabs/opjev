@@ -212,9 +212,9 @@ export function createFollowupTakeSeam(deps: {
     }
     return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
       const index = readFollowupIndex(await deps.storage.get(followupIndexKey(safeRunID)));
-      const out: PendingFollowup[] = [];
+      const targets: Array<{ messageID: string; record: FollowupRecord }> = [];
       for (const messageID of index) {
-        if (out.length >= cap) break;
+        if (targets.length >= cap) break;
         const raw = await deps.storage.get(followupKey(safeRunID, messageID));
         if (raw === undefined) continue; // index sem record (crash window documentado)
         let rec: FollowupRecord;
@@ -224,18 +224,73 @@ export function createFollowupTakeSeam(deps: {
           continue; // ilegivel: skip bounded (nunca consumido sem validar)
         }
         if (rec.state !== "pending") continue;
-        await deps.storage.set(followupKey(safeRunID, messageID), {
-          ...rec,
-          state: "consumed",
-          consumedAt: now(),
-          consumedBoundary: `round-${round}-worker-prompt`,
-          consumedRound: round,
-        });
-        out.push({ messageID: rec.messageID, text: rec.text });
+        targets.push({ messageID, record: rec });
+      }
+
+      const out: PendingFollowup[] = [];
+      const updatedKeys: string[] = [];
+      const consumedAt = now();
+      const consumedBoundary = `round-${round}-worker-prompt`;
+      try {
+        for (const t of targets) {
+          const key = followupKey(safeRunID, t.messageID);
+          await deps.storage.set(key, {
+            ...t.record,
+            state: "consumed",
+            consumedAt,
+            consumedBoundary,
+            consumedRound: round,
+          });
+          updatedKeys.push(key);
+          out.push({ messageID: t.record.messageID, text: t.record.text });
+        }
+      } catch (err) {
+        for (let i = 0; i < updatedKeys.length; i++) {
+          try {
+            await deps.storage.set(updatedKeys[i], targets[i].record);
+          } catch {}
+        }
+        throw err;
       }
       return out;
     });
   };
+}
+
+/**
+ * Reverte o consumo de follow-ups se a entrega no runtime (prompt) falhar
+ * antes do worker receber os inputs.
+ */
+export async function revertFollowupConsumption(
+  deps: { storage: FollowupStorage },
+  runID: string,
+  pending: PendingFollowup[],
+): Promise<void> {
+  if (!Array.isArray(pending) || pending.length === 0) return;
+  const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+  await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+    for (const item of pending) {
+      if (!item?.messageID) continue;
+      const raw = await deps.storage.get(followupKey(safeRunID, item.messageID));
+      if (raw === undefined) continue;
+      try {
+        const rec = normalizeFollowupRecord(raw);
+        if (rec.state === "consumed") {
+          const reverted: FollowupRecord = {
+            messageID: rec.messageID,
+            sessionID: rec.sessionID,
+            runID: rec.runID,
+            text: rec.text,
+            state: "pending",
+            at: rec.at,
+          };
+          await deps.storage.set(followupKey(safeRunID, item.messageID), reverted);
+        }
+      } catch {
+        // best-effort revert
+      }
+    }
+  });
 }
 
 /**

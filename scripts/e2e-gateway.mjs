@@ -801,27 +801,6 @@ async function main() {
       `attached=${since(replayMark).filter((e) => e.type === "rpc-followup-attached").length} dispatched=${since(replayMark).filter((e) => e.type === "rpc-dispatched").length}`,
     );
 
-    // Evidencia CRUA do storage do plugin: provenance completa dos dois
-    // records (messageID, sessionID, runID) — exatamente 1 record por F,
-    // sem vazamento cruzado entre sessoes.
-    const kv = readPluginKv(homeDir);
-    const fuRec1 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === FU_MSG) : [];
-    const fuRec2 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === "msg_e2efollowB0002") : [];
-    assert(
-      "follow-up: 1 record duravel por F com provenance completa (storage real)",
-      fuRec1.length === 1 &&
-        fuRec1[0].sessionID === fu.sid &&
-        fuRec1[0].runID === fu.runA &&
-        typeof fuRec1[0].text === "string" &&
-        fuRec1[0].text.includes("timeout"),
-      kv === null ? "kv indisponivel" : `records=${fuRec1.length} state=${fuRec1[0]?.state}`,
-    );
-    assert(
-      "follow-up: isolamento no storage (record de S2 pertence a S2/R2)",
-      fuRec2.length === 1 && fuRec2[0].sessionID === fu.sid2 && fuRec2[0].runID === fu.runB,
-      kv === null ? "kv indisponivel" : `records=${fuRec2.length} sid=${fuRec2[0]?.sessionID}`,
-    );
-
     // Terminal(R) + novo prompt => novo run permitido: espera o run A terminar
     // (notice de FASE publicada na sessao — nao confundir com o notice de
     // attach do follow-up, que usa o mesmo prefixo "Orquestracao <runA>"), e
@@ -836,6 +815,36 @@ async function main() {
       },
       T.notice,
       "notice do run A (terminal)",
+    );
+
+    // Evidencia CRUA do storage do plugin: provenance completa dos dois
+    // records (messageID, sessionID, runID) — exatamente 1 record por F,
+    // sem vazamento cruzado entre sessoes.
+    const kv = readPluginKv(homeDir);
+    const fuRec1 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === FU_MSG) : [];
+    const fuRec2 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === "msg_e2efollowB0002") : [];
+    assert(
+      "follow-up: 1 record duravel por F com provenance completa, state === consumed e consumedBoundary (storage real)",
+      fuRec1.length === 1 &&
+        fuRec1[0].sessionID === fu.sid &&
+        fuRec1[0].runID === fu.runA &&
+        typeof fuRec1[0].text === "string" &&
+        fuRec1[0].text.includes("timeout") &&
+        fuRec1[0].state === "consumed" &&
+        typeof fuRec1[0].consumedBoundary === "string" &&
+        fuRec1[0].consumedBoundary.length > 0 &&
+        fuRec1[0].consumedBoundary !== "run-finished-without-consumption",
+      kv === null ? "kv indisponivel" : `records=${fuRec1.length} state=${fuRec1[0]?.state} boundary=${fuRec1[0]?.consumedBoundary}`,
+    );
+    assert(
+      "follow-up: isolamento no storage (record de S2 pertence a S2/R2 e consumido)",
+      fuRec2.length === 1 &&
+        fuRec2[0].sessionID === fu.sid2 &&
+        fuRec2[0].runID === fu.runB &&
+        fuRec2[0].state === "consumed" &&
+        typeof fuRec2[0].consumedBoundary === "string" &&
+        fuRec2[0].consumedBoundary !== "run-finished-without-consumption",
+      kv === null ? "kv indisponivel" : `records=${fuRec2.length} sid=${fuRec2[0]?.sessionID} state=${fuRec2[0]?.state}`,
     );
     const termMark = gwEvents.length;
     const rt = await api("POST", `/api/session/${fu.sid}/prompt`, {

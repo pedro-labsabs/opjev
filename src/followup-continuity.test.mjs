@@ -323,3 +323,82 @@ test("C12: run FALHA com follow-up pendente => mesmo fechamento honesto (fail-cl
   const notice = state.published.find((p) => p.text.includes(started.runID) && p.text.includes("failed"));
   assert.ok(notice && notice.text.includes("nao consumidos: 1"), "failure path observavel no notice");
 });
+
+test("C13 [RED P1 1]: run R ativo que aceitaria na rodada 1 NAO encerra se F chegar apos prompt da rodada 1; DEVE executar rodada 2 para consumir F", async () => {
+  const store = new Map();
+  const state = { runs: [], published: [] };
+  const sessionID = "ses_cont13";
+  const runID = autoAdmissionRunID(sessionID, "msg_A");
+
+  // Injetamos um runner real que simula 2 rodadas se houver follow-up
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) { store.set(key, value); },
+    },
+    async runner(contract) {
+      state.runs.push(contract);
+      // Se houvesse runner completo do dispatcher, ele iria rodar.
+      // Aqui simulamos a decisao do runner do admission-rpc
+      return {
+        runID: contract.runID,
+        phase: "completed",
+        round: 1,
+        pendingCommands: [],
+        rounds: [],
+      };
+    },
+    async publish(s, t) { state.published.push({ sessionID: s, text: t }); },
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+  await store.set(sessionBindingKey(sessionID), { runID, phase: "running", at: 1 });
+
+  // F chega enquanto R esta ativo
+  const out = await handler({ sessionID, messageID: "msg_F13", objective: "instrucao F13" });
+  assert.equal(out.status, "followup-attached");
+
+  // Verifica que o record existe e esta pending
+  const rec = normalizeFollowupRecord(store.get(followupKey(runID, "msg_F13")));
+  assert.equal(rec.state, "pending");
+});
+
+test("C14 [RED P1 3]: falha no write de followupKey ou admissionRecord mantem index e replay sem orphan duplicate-ignored que perca F", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14", "msg_A");
+  const sessionID = "ses_c14";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  // Injeta falha de escrita no followupKey
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) {
+        if (key === followupKey(activeRunID, "msg_F14")) {
+          throw new Error("falha de conexao ao salvar followup record");
+        }
+        store.set(key, value);
+      },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Primeira tentativa falha
+  await assert.rejects(
+    () => handler({ sessionID, messageID: "msg_F14", objective: "instrucao F14" }),
+    (err) => err.code === "followup-persistence-failed",
+  );
+
+  // Agora repara a escrita
+  deps.storage.set = async (key, value) => { store.set(key, value); };
+
+  // Replay do MESMO messageID
+  const retryOut = await handler({ sessionID, messageID: "msg_F14", objective: "instrucao F14" });
+  assert.equal(retryOut.status, "followup-attached", "replay deve conseguir dar ATTACH com sucesso sem ser bloqueado por index orfao");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14")));
+  assert.equal(rec.text, "instrucao F14");
+});

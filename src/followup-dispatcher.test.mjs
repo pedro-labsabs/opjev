@@ -17,6 +17,19 @@ import {
   createFollowupTakeSeam,
 } from "./orchestration/followup.ts";
 
+function fakeStorage(seed = {}) {
+  const map = new Map(Object.entries(seed));
+  return {
+    async get(key) {
+      return map.get(key);
+    },
+    async set(key, value) {
+      map.set(key, value);
+    },
+    _map: map,
+  };
+}
+
 function contract(over = {}) {
   return {
     runID: "test-run-followup",
@@ -224,4 +237,47 @@ test("D5: cap por rodada — excedente e consumido no boundary seguinte, cada it
   const round1 = new Set(inRound(promptCalls[0].text));
   const round2 = inRound(promptCalls[1].text);
   assert.equal(round2.filter((id) => round1.has(id)).length, 0, "sem sobreposicao entre rodadas");
+});
+
+test("D6 [RED P1 2]: falha no runtime.prompt apos take/preparacao NAO deixa followup como consumed no storage", async () => {
+  const c = contract({ maxRounds: 1 });
+  const { deps, store, promptCalls } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  await seedFollowup(storage, c.runID, "msg_D6");
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 5 });
+  deps.storage = storage;
+
+  // runtime.prompt falha ao tentar entregar o prompt contendo F
+  deps.runtime.prompt = async () => {
+    throw new Error("falha de conexao/network no prompt");
+  };
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "failed", "run deve falhar se o prompt falhar");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D6")));
+  assert.equal(rec.state, "pending", "followup deve continuar PENDING se o prompt falhou antes de ser entregue");
+});
+
+test("D7 [RED P1 2]: falha no meio do take de 2 follow-ups NAO deixa o primeiro como consumed se o take lancar erro", async () => {
+  const store = fakeStorage();
+  await store.set(followupKey("r1", "m1"), buildFollowupRecord({ sessionID: "s", messageID: "m1", runID: "r1", text: "f1", at: 1 }));
+  await store.set(followupKey("r1", "m2"), buildFollowupRecord({ sessionID: "s", messageID: "m2", runID: "r1", text: "f2", at: 2 }));
+  await store.set(followupIndexKey("r1"), ["m1", "m2"]);
+
+  // Injeta falha no storage ao tentar gravar m2
+  const origSet = store.set.bind(store);
+  store.set = async (key, val) => {
+    if (key.includes("m2")) throw new Error("falha de escrita no m2");
+    return origSet(key, val);
+  };
+
+  const take = createFollowupTakeSeam({ storage: store, now: () => 10 });
+  await assert.rejects(
+    () => take("r1", 1),
+    (err) => err.message.includes("falha de escrita no m2"),
+  );
+
+  const rec1 = normalizeFollowupRecord(await store.get(followupKey("r1", "m1")));
+  assert.equal(rec1.state, "pending", "m1 deve permanecer PENDING se a operacao atomica do take falhar");
 });
