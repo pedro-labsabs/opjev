@@ -3,10 +3,10 @@
 - Date: 2026-10-01
 - PR: pedro-labsabs/opjev#27 — `feat: add deterministic orchestration admission gateway`
 - Branch: `feat/deterministic-admission-gateway`
-- Delivery HEAD: `0bf727a` (with P1 token correlation, unified plugin install, and fresh evidence)
+- Delivery HEAD: `ec76d2f8338ab5e2174b5fea36f458a4d0888c39` (Runtime behavior tested at TESTED_CODE_SHA `ec76d2f8338ab5e2174b5fea36f458a4d0888c39` with causal server plugin loading proof)
 - Base at investigation: `main@7a3686e` (not advanced — no rebase needed)
 - Runtime authority: OpenCode **v2.0.11** (`/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli`), `@opencode/plugin@2.0.7`
-- **Verdict: GO.** A supported public surface exists and was proven end-to-end in real runtime; the orchestration result is now VISIBLE in the real TUI with `parent=0`, `RPC=1`, `run=1`, strictly correlated to the unique run identity/digest.
+- **Verdict: GO.** A supported public surface exists and was proven end-to-end in real runtime; the orchestration result is now VISIBLE in the real TUI with `parent=0`, `RPC=1`, `run=1`, strictly correlated to the unique run identity/digest. Server plugin loading from the documented path `./plugins/opencode-jev-free-router` is proven causally via pre-flight RPC activation prior to TUI HOME installation.
 
 ## 1. Capability question and answer
 
