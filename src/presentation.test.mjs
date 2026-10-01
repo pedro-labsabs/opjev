@@ -154,8 +154,6 @@ test("V5: dedupe e bounded (cap de memoria, nunca cresce sem limite)", async () 
   assert.equal(emits.length, 12);
 });
 
-// ───────────────────────────── V6 — isolamento de erro ─────────────────────
-
 test("V6: falha de emit (apresentacao) nao propaga e nao afeta estado", async () => {
   const presenter = createOrchestrationResultPresenter({
     emit: async () => {
@@ -165,6 +163,33 @@ test("V6: falha de emit (apresentacao) nao propaga e nao afeta estado", async ()
   });
   const out = await presenter.publish(validEventInput());
   assert.equal(out, false); // degradacao bounded, sem throw
+});
+
+test("V6: primeira tentativa falha -> replay do mesmo runID -> apresentacao ocorre exatamente uma vez", async () => {
+  let attempts = 0;
+  const emits = [];
+  const presenter = createOrchestrationResultPresenter({
+    emit: async (event) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("Falha temporaria de render/transporte");
+      }
+      emits.push(event);
+    },
+    isPresentable: () => true,
+  });
+
+  const res1 = await presenter.publish(validEventInput({ runID: "run-retry-1" }));
+  assert.equal(res1, false);
+  assert.equal(emits.length, 0);
+
+  const res2 = await presenter.publish(validEventInput({ runID: "run-retry-1" }));
+  assert.equal(res2, true);
+  assert.equal(emits.length, 1);
+
+  const res3 = await presenter.publish(validEventInput({ runID: "run-retry-1" }));
+  assert.equal(res3, true);
+  assert.equal(emits.length, 1);
 });
 
 // ───────────────────────────── V7 — sem autoridade ─────────────────────────

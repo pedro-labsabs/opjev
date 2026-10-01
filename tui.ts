@@ -53,12 +53,6 @@ export default Plugin.define({
             const sessionID = String(data.sessionID ?? "");
             if (runID === "" || sessionID === "") return;
             if (seen.has(runID)) return; // duplicata: display unico
-            if (seen.size >= SEEN_CAP) {
-              const first = seen.values().next().value;
-              if (typeof first === "string") seen.delete(first);
-            }
-            seen.add(runID);
-
             // Filtro de papel (fail-closed): sessao corrente do TUI deve ser a
             // parent do run; sessoes internas/subagentes nunca apresentam.
             let currentSessionID: string | undefined;
@@ -68,12 +62,14 @@ export default Plugin.define({
             } catch {
               return; // rota indeterminada => sem apresentacao
             }
+
             let info: any;
             try {
               info = ctx.data.session.get(sessionID);
             } catch {
-              info = undefined; // lookup falhou => segue sem metadata (so parentID/current)
+              return; // lookup de sessao falhou => fail-closed: sem apresentacao
             }
+
             const presentable = isPresentableSession({
               currentSessionID,
               eventSessionID: sessionID,
@@ -88,6 +84,12 @@ export default Plugin.define({
               variant: data.phase === "failed" ? "error" : "success",
               duration: TOAST_DURATION_MS,
             });
+
+            if (seen.size >= SEEN_CAP) {
+              const first = seen.values().next().value;
+              if (typeof first === "string") seen.delete(first);
+            }
+            seen.add(runID);
           } catch {
             // falha de apresentacao isolada: nunca propaga
           }

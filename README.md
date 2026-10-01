@@ -226,6 +226,17 @@ export OPENCODE_API_KEY=...
 
 Copie `opencode.jsonc.example` para seu `opencode.jsonc` (ou adicione o bloco `plugins`).
 
+### Instalacao do Plugin TUI (OpenCode v2.0.11)
+
+No OpenCode v2.0.11, o servidor backend (`opencode serve`) carrega o plugin principal configurado no projeto (`.` / `index.ts`), mas a interface CLI/TUI (`opencode`) nao herda automaticamente a configuracao de plugins do projeto para extensoes do TUI. Para habilitar a apresentacao do resultado (notificacao toast no TUI via entrypoint `./tui`), instale o pacote no diretorio de plugins do usuario:
+
+```bash
+mkdir -p ~/.config/opencode/plugins/opjev
+cp package.json index.ts tui.ts ~/.config/opencode/plugins/opjev/
+cp -r src ~/.config/opencode/plugins/opjev/
+ln -snf $(pwd)/node_modules ~/.config/opencode/plugins/node_modules
+```
+
 ```bash
 npm run typecheck
 npm test

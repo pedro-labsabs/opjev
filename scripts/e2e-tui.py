@@ -52,11 +52,11 @@ def main() -> int:
         os.execvpe(spec["bin"], [spec["bin"], *spec["args"]], env)
         os._exit(127)
 
-    # janela 40x120 (TUI renderiza melhor e o dump tem texto "cru" legivel)
+    # janela 50x300 (TUI renderiza sem truncar a mensagem do toast e o runID)
     try:
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+      fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 300, 0, 0))
     except OSError:
-        pass
+      pass
 
     dump = open(spec["dump_to"], "wb", buffering=0)
     alive = True

@@ -10,5 +10,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["./index.ts", "./src/**/*.ts"]
+  "include": ["./index.ts", "./tui.ts", "./src/**/*.ts"]
 }

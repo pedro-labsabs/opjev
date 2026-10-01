@@ -161,13 +161,13 @@ export function createOrchestrationResultPresenter(deps: {
           return false; // papel indeterminado => fail-closed (nao apresenta)
   }
       }
-      if (seen.size >= seenCap) {
-        const first = seen.values().next().value;
-        if (typeof first === "string") seen.delete(first); // cap FIFO bounded
-      }
-      seen.add(event.runID);
       try {
         await deps.emit(event);
+        if (seen.size >= seenCap) {
+          const first = seen.values().next().value;
+          if (typeof first === "string") seen.delete(first); // cap FIFO bounded
+        }
+        seen.add(event.runID);
       } catch {
         return false; // degradacao bounded: nunca propaga, nunca executa nada
       }

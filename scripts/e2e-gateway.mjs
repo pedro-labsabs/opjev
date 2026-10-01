@@ -830,6 +830,7 @@ async function main() {
       const deadline = Date.now() + T.tuiTotal;
       let noticed = false;
       let graceUntil = null;
+      let tuiNoticeFull = "";
       while (Date.now() < deadline) {
         try {
           const intercepts = since(gwMark).filter((e) => e.type === "intercept");
@@ -848,6 +849,10 @@ async function main() {
           if (tuiSid !== null && !noticed) {
             const inbox = await api("GET", `/api/session/${tuiSid}/inbox`).catch(() => null);
             if (inbox && /Orquestracao/.test(inbox.text)) {
+              const idx = inbox.text.indexOf("Orquestracao ");
+              if (idx !== -1) {
+                tuiNoticeFull = inbox.text.slice(idx, idx + 2000);
+              }
               fs.writeFileSync(tuiCanaryPath, "ORCH_TUI_NOTICE\n");
               noticed = true;
               log("canary de notice do TUI gravado");
@@ -860,7 +865,7 @@ async function main() {
         if (graceUntil !== null && Date.now() >= graceUntil) break;
         await sleep(1000);
       }
-      return { noticed };
+      return { noticed, tuiNoticeFull };
     })();
 
     const exitCode = await Promise.race([
@@ -934,21 +939,31 @@ async function main() {
         finalExecs === 1,
       `windowExecs=${windowExecs.length} execAtOrch=${execAtOrch} finalExecs=${finalExecs}`,
     );
+    const tuiRunID = tuiAdmitted?.runID ?? null;
     assert(
-      "TUI: notice da publicacao chega ao inbox da sessao do TUI",
-      watchOut.noticed,
-      `canary=${fs.readFileSync(tuiCanaryPath, "utf8").trim()}`,
+      "TUI: tuiRunID deterministico observado",
+      tuiRunID !== null,
+      `tuiRunID=${tuiRunID}`,
     );
+
+    const tuiNoticeText = watchOut.tuiNoticeFull;
+    assert(
+      "TUI: notice daquele run contem o tuiRunID",
+      watchOut.noticed && tuiRunID !== null && tuiNoticeText.includes(tuiRunID),
+      `notice=${tuiNoticeText.slice(0, 100)} runID=${tuiRunID}`,
+    );
+
     let ptyVisible = false;
-    if (fs.existsSync(ptyDumpPath)) {
-      ptyVisible = fs.readFileSync(ptyDumpPath, "utf8").includes("Orquestracao");
+    if (fs.existsSync(ptyDumpPath) && tuiRunID !== null) {
+      const ptyContent = fs.readFileSync(ptyDumpPath, "utf8");
+      ptyVisible = ptyContent.includes("Orquestracao") && (ptyContent.includes(tuiRunID) || ptyContent.includes(tuiRunID.slice(0, 30)));
     }
     assert(
-      "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice)",
+      "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e o tuiRunID autoritativo)",
       ptyVisible,
       ptyVisible
-        ? "resultado renderizado no TUI real via apresentacao (evento RPC publico + toast)"
-        : "notice duravel no inbox (provado) mas invisivel no render do TUI — blocker de apresentacao",
+        ? `resultado renderizado no TUI real via apresentacao correlacionado ao runID ${tuiRunID}`
+        : `notice duravel mas PTY nao contem runID ${tuiRunID} — blocker de apresentacao`,
       true,
     );
     if (tuiSid !== null) {
