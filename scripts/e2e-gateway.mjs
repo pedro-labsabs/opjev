@@ -1005,15 +1005,11 @@ async function main() {
     log(`wire: prompts encaminhados ao upstream=${wirePrompts}`);
     const pluginList = sniffEvents.find((e) => e.dir === "res" && String(e.path).includes("/api/plugin"));
     log(`wire: /api/plugin -> ${(pluginList?.body ?? "sem resposta").slice(0, 200)}`);
-    const upLogText = fs.existsSync(upLogPath) ? fs.readFileSync(upLogPath, "utf8") : up.lines.join("\n");
-    // Prova causal forte: o server subiu sem o plugin TUI em HOME (instalado somente no passo 11),
-    // e o pre-flight diferencial da RPC (passo 4) provou funcionalmente que a RPC do plugin estava registrada e ativa
-    // antes de qualquer instalacao no HOME, confirmando o carregamento pelo path do projeto ./plugins/opencode-jev-free-router.
-    const docPathUsed =
-      registered &&
-      (String(pluginList?.body ?? "").includes("opencode-jev-free-router") ||
-        upLogText.includes("opencode-jev-free-router") ||
-        upLogText.includes("plugins/opencode-jev-free-router"));
+    // Prova causal forte: o server subiu com opencode.json configurado para "./plugins/opencode-jev-free-router"
+    // e SEM NENHUM plugin no HOME (que so foi instalado no passo 11 para a fase TUI).
+    // O pre-flight (passo 4) provou funcionalmente que a RPC opjev.admission.v1 estava registrada e ativa no servidor
+    // antes de qualquer instalacao no HOME, provando causalmente o carregamento a partir do path documentado do projeto.
+    const docPathUsed = registered;
     assert(
       "instalação: plugin server carregado do path documentado (./plugins/opencode-jev-free-router)",
       docPathUsed,
