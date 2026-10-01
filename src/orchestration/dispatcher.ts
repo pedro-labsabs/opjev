@@ -1341,6 +1341,15 @@ async function executeSchedule(
           }
         }
         if (hasPending) {
+          try {
+            const followVerdict: JevVerdict = {
+              done: false,
+              failureClass: "implementation",
+              sameExecutorCanRepair: true,
+              nextAction: "repair-same",
+            };
+            out.state = transitionRun(out.state, { type: "VERDICT_RECEIVED", verdict: followVerdict }).state;
+          } catch {}
           mode = "repair-same";
           continue;
         }
