@@ -267,6 +267,31 @@ async function main() {
     path.join(projectDir, "opencode.json"),
     `${JSON.stringify({ plugins: [{ package: REPO }] }, null, 2)}\n`,
   );
+  // Presentation boundary (PR #27): o cli/TUI (role=cli) NAO herda os plugins
+  // do opencode.json do projeto no v2.0.11 — instala o plugin em
+  // <HOME>/.config/opencode/plugins para que o entrypoint `tui` carregue e o
+  // resultado do run fique VISIVEL no render do TUI (toast publico).
+  const cliPluginDir = path.join(homeDir, ".config", "opencode", "plugins", "opjev");
+  fs.mkdirSync(cliPluginDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cliPluginDir, "package.json"),
+    `${JSON.stringify(
+      { name: "opjev-cli-plugin", version: "0.1.0", type: "module", main: "./index.ts", exports: { ".": "./index.ts", "./tui": "./tui.ts" } },
+      null,
+      2,
+    )}\n`,
+  );
+  fs.copyFileSync(path.join(REPO, "index.ts"), path.join(cliPluginDir, "index.ts"));
+  fs.copyFileSync(path.join(REPO, "tui.ts"), path.join(cliPluginDir, "tui.ts"));
+  fs.cpSync(path.join(REPO, "src"), path.join(cliPluginDir, "src"), { recursive: true });
+  // Resolucao de @opencode/plugin a partir do plugin do config dir (walk-up).
+  const cliNodeModules = path.join(homeDir, "node_modules");
+  try {
+    fs.rmSync(cliNodeModules, { force: true, recursive: true });
+  } catch {
+    // melhor esforco
+  }
+  fs.symlinkSync(path.join(REPO, "node_modules"), cliNodeModules, "dir");
 
   // ---------------------------------------------------- 1. upstream serve
   const upPort = await freePort();
@@ -922,9 +947,9 @@ async function main() {
       "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice)",
       ptyVisible,
       ptyVisible
-        ? "PASS total"
-        : "PARCIAL: notice duravel no inbox (provado) mas invisivel no render do TUI — blocker documentado",
-      false,
+        ? "resultado renderizado no TUI real via apresentacao (evento RPC publico + toast)"
+        : "notice duravel no inbox (provado) mas invisivel no render do TUI — blocker de apresentacao",
+      true,
     );
     if (tuiSid !== null) {
       const tuiMsgs = await api("GET", `/api/session/${tuiSid}/message`).catch(() => ({ status: 0, text: "" }));
