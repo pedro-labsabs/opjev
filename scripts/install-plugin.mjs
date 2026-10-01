@@ -34,8 +34,35 @@ export function installPluginToHome(homeDir, repoDir = REPO) {
   fs.symlinkSync(path.join(repoDir, "node_modules"), cliNodeModules, "dir");
 }
 
+export function installServerPluginToProject(projectDir, repoDir = REPO) {
+  const serverTargetDir = path.join(projectDir, "plugins", "opencode-jev-free-router");
+  fs.mkdirSync(serverTargetDir, { recursive: true });
+
+  fs.copyFileSync(path.join(repoDir, "package.json"), path.join(serverTargetDir, "package.json"));
+  fs.copyFileSync(path.join(repoDir, "index.ts"), path.join(serverTargetDir, "index.ts"));
+  fs.copyFileSync(path.join(repoDir, "tui.ts"), path.join(serverTargetDir, "tui.ts"));
+  fs.cpSync(path.join(repoDir, "src"), path.join(serverTargetDir, "src"), { recursive: true });
+
+  const projectNodeModules = path.join(serverTargetDir, "node_modules");
+  try {
+    fs.rmSync(projectNodeModules, { force: true, recursive: true });
+  } catch {
+    // melhor esforco
+  }
+  fs.symlinkSync(path.join(repoDir, "node_modules"), projectNodeModules, "dir");
+}
+
+export function preparePluginInstallation(homeDir, projectDir, repoDir = REPO) {
+  installPluginToHome(homeDir, repoDir);
+  if (projectDir) {
+    installServerPluginToProject(projectDir, repoDir);
+  }
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const targetHome = process.env.HOME ?? path.join(process.cwd(), "home");
-  installPluginToHome(targetHome);
-  console.log(`[opjev] Plugin instalado com sucesso em ${path.join(targetHome, ".config/opencode/plugins/opjev")}`);
+  const targetProject = process.cwd();
+  preparePluginInstallation(targetHome, targetProject);
+  console.log(`[opjev] Plugin TUI instalado em ${path.join(targetHome, ".config/opencode/plugins/opjev")}`);
+  console.log(`[opjev] Plugin Server instalado em ${path.join(targetProject, "plugins/opencode-jev-free-router")}`);
 }

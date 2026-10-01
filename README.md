@@ -226,9 +226,11 @@ export OPENCODE_API_KEY=...
 
 Copie `opencode.jsonc.example` para seu `opencode.jsonc` (ou adicione o bloco `plugins`).
 
-### Instalacao do Plugin TUI (OpenCode v2.0.11)
+### Instalacao Unificada do Plugin (Server e TUI no OpenCode v2.0.11)
 
-No OpenCode v2.0.11, o servidor backend (`opencode serve`) carrega o plugin principal configurado no projeto (`.` / `index.ts`), mas a interface CLI/TUI (`opencode`) nao herda automaticamente a configuracao de plugins do projeto para extensoes do TUI. Para habilitar a apresentacao do resultado (notificacao toast no TUI via entrypoint `./tui`), execute o helper de instalacao do projeto (usado identicamente pelo E2E e pela documentacao):
+No OpenCode v2.0.11, o servidor backend (`opencode serve`) carrega o plugin do projeto configurado em `opencode.json` (apontando para `"package": "./plugins/opencode-jev-free-router"` conforme `opencode.jsonc.example`), enquanto a interface CLI/TUI (`opencode`) carrega extensoes TUI a partir de `<HOME>/.config/opencode/plugins/opjev` (entrypoint `./tui`).
+
+Para preparar ambos os caminhos de forma deterministica e idêntica ao E2E, execute o helper de instalação:
 
 ```bash
 node scripts/install-plugin.mjs
@@ -237,6 +239,13 @@ node scripts/install-plugin.mjs
 Ou manualmente:
 
 ```bash
+# 1. Plugin Server (projeto)
+mkdir -p plugins/opencode-jev-free-router
+cp package.json index.ts tui.ts plugins/opencode-jev-free-router/
+cp -r src plugins/opencode-jev-free-router/
+ln -snf $(pwd)/node_modules plugins/opencode-jev-free-router/node_modules
+
+# 2. Plugin TUI (HOME CLI)
 mkdir -p ~/.config/opencode/plugins/opjev
 cp package.json index.ts tui.ts ~/.config/opencode/plugins/opjev/
 cp -r src ~/.config/opencode/plugins/opjev/

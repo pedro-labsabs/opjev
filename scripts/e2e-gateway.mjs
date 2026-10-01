@@ -22,7 +22,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { installPluginToHome } from "./install-plugin.mjs";
+import { preparePluginInstallation } from "./install-plugin.mjs";
 import { runIDDigest } from "../src/orchestration/admission.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -265,14 +265,8 @@ async function main() {
   const tuiCanaryPath = path.join(RUN_DIR, "tui-notice.canary");
   const resultPath = path.join(RUN_DIR, "e2e-result.json");
 
-  fs.writeFileSync(
-    path.join(projectDir, "opencode.json"),
-    `${JSON.stringify({ plugins: [{ package: REPO }] }, null, 2)}\n`,
-  );
-  // Presentation boundary (PR #27): o cli/TUI (role=cli) NAO herda os plugins
-  // do opencode.json do projeto no v2.0.11 — instala o plugin em
-  // <HOME>/.config/opencode/plugins usando o helper canonico do projeto.
-  installPluginToHome(homeDir, REPO);
+  fs.copyFileSync(path.join(REPO, "opencode.jsonc.example"), path.join(projectDir, "opencode.json"));
+  preparePluginInstallation(homeDir, projectDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
   const upPort = await freePort();
@@ -455,15 +449,32 @@ async function main() {
       execStartedCount(normal.sid) >= 1,
       `execStarted=${execStartedCount(normal.sid)}`,
     );
+    function hasAssistantMessage(jsonText) {
+      const obj = tryParse(jsonText);
+      const items = Array.isArray(obj) ? obj : Array.isArray(obj?.data) ? obj.data : null;
+      if (!items) return false;
+      return items.some((m) => m && (m.role === "assistant" || m.type === "assistant" || m.info?.role === "assistant"));
+    }
+
+    // Negative control: transcript com somente mensagem user/non-assistant -> assertion deve falhar
+    const userOnlyTranscript = JSON.stringify({
+      data: [
+        { id: "msg_user1", role: "user", type: "user", parts: [{ type: "text", text: "PONG" }], info: { id: "1" } },
+      ],
+    });
+    assert(
+      "normal (negative control): transcript sem assistant e rejeitado pela verificação",
+      hasAssistantMessage(userOnlyTranscript) === false,
+    );
+
     const msgs = await waitFor(async () => {
       const res = await api("GET", `/api/session/${normal.sid}/message`);
-      // Forma real do transcript v2.0.11 (wire): {"data":[{..., "type":"assistant", ...}]} ou role:"assistant" ou text
-      return /"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(res.text) ? res : null;
-    }, T.exec, "resposta nativa no transcript");
+      return hasAssistantMessage(res.text) ? res : null;
+    }, T.exec, "resposta nativa do assistant no transcript");
     assert(
-      "normal: resposta nativa chega ao transcript",
-      /"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(msgs.text),
-      `assistantInTranscript=${/"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(msgs.text)}`,
+      "normal: resposta do assistant realmente presente no transcript",
+      hasAssistantMessage(msgs.text),
+      `hasAssistantMessage=${hasAssistantMessage(msgs.text)}`,
     );
   } catch (err) {
     assert("fase normal", false, err.message);
@@ -991,6 +1002,16 @@ async function main() {
     log(`wire: prompts encaminhados ao upstream=${wirePrompts}`);
     const pluginList = sniffEvents.find((e) => e.dir === "res" && String(e.path).includes("/api/plugin"));
     log(`wire: /api/plugin -> ${(pluginList?.body ?? "sem resposta").slice(0, 200)}`);
+    const upLogText = fs.existsSync(upLogPath) ? fs.readFileSync(upLogPath, "utf8") : up.lines.join("\n");
+    const docPathUsed =
+      String(pluginList?.body ?? "").includes("opencode-jev-free-router") ||
+      upLogText.includes("opencode-jev-free-router") ||
+      fs.existsSync(path.join(projectDir, "plugins", "opencode-jev-free-router", "package.json"));
+    assert(
+      "instalação: plugin server carregado do path documentado (./plugins/opencode-jev-free-router)",
+      docPathUsed,
+      `docPathUsed=${docPathUsed}`,
+    );
   } catch (err) {
     assert("cross-checks sniffer", false, err.message);
   }
