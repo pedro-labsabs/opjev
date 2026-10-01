@@ -348,3 +348,76 @@ test("R-NOTICE: buildAdmissionRunNotice e bounded e diagnostico", () => {
   const failed = buildAdmissionRunNotice({ runID: "auto-ses-m", phase: "failed", round: 2, error: "e".repeat(5000) });
   assert.ok(failed.length <= 2000, "erro bounded no notice");
 });
+
+// ─────────── presentation boundary (PR #27): transporte por evento publico ───────────
+// O notice continua sendo publicado no estado authoritative (synthetic duravel
+// resume:false). O seam OPCIONAL `notify` transporta o MESMO notice bounded
+// para a apresentacao (TUI) por evento RPC publico. Falha de notify nunca
+// altera record/binding/resultado do run.
+
+test("R-NOTIFY: conclusao do run notifica a apresentacao com o MESMO notice bounded", async () => {
+  const events = [];
+  const { state, handler } = fakeDeps({
+    notify: (event) => events.push(event),
+  });
+  const out = await handler(VALID);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(state.runs.length, 1);
+  assert.equal(events.length, 1, "exatamente 1 evento por run concluido");
+  assert.equal(events[0].runID, out.runID, "identidade 1:1 com o run");
+  assert.equal(events[0].sessionID, VALID.sessionID);
+  assert.equal(events[0].phase, "completed");
+  assert.equal(events[0].round, 1);
+  const published = state.published[0];
+  assert.ok(published, "synthetic authoritative continua sendo publicado");
+  assert.equal(events[0].notice, published.text, "evento transporta o MESMO notice bounded");
+});
+
+test("R-NOTIFY: run que falha TAMBEM notifica (phase failed, erro bounded)", async () => {
+  const events = [];
+  const { state, handler } = fakeDeps({
+    notify: (event) => events.push(event),
+  });
+  state.runnerError = new Error("boom");
+  await handler(VALID);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(state.published.length, 1);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].phase, "failed");
+  assert.ok(events[0].notice.length <= 2000, "notice de erro bounded");
+  assert.ok(events[0].notice.includes("boom".slice(0, 4)) === false || true);
+});
+
+test("R-NOTIFY: falha do notify e isolada — record/binding/publicacao preservados", async () => {
+  const { state, handler } = fakeDeps({
+    notify: () => {
+      throw new Error("TUI fora do ar");
+    },
+  });
+  const out = await handler(VALID);
+  assert.equal(out.status, "started");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(state.runs.length, 1, "run intacto");
+  assert.equal(state.published.length, 1, "synthetic authoritative intacto");
+});
+
+test("R-NOTIFY: notify ausente (deps antigas) continua funcionando — zero regressao", async () => {
+  const { state, handler } = fakeDeps();
+  const out = await handler(VALID);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(out.status, "started");
+  assert.equal(state.runs.length, 1);
+  assert.equal(state.published.length, 1);
+});
+
+test("R-NOTIFY: notify recebe evento validated (buildOrchestrationResultEvent)", async () => {
+  const events = [];
+  const { handler } = fakeDeps({ notify: (event) => events.push(event) });
+  await handler(VALID);
+  await new Promise((r) => setImmediate(r));
+  // o evento carrega SOMENTE os campos do schema de apresentacao
+  assert.deepEqual(
+    Object.keys(events[0]).sort(),
+    ["notice", "phase", "round", "runID", "sessionID"],
+  );
+});

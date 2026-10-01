@@ -17,6 +17,7 @@ import {
   sessionBindingKey,
 } from "./admission.ts";
 import { withKeyedLock } from "../lock.ts";
+import { buildOrchestrationResultEvent } from "./presentation.ts";
 
 export const NOTICE_LIMIT = 2000;
 
@@ -123,6 +124,19 @@ export interface AdmissionHandlerDeps {
   }>;
   publish(sessionID: string, text: string): Promise<void>;
   /**
+   * Presentation boundary (opcional): transporta o notice bounded do run
+   * concluido para a camada de apresentacao (TUI) por evento RPC publico.
+   * SEM autoridade: falha/ausencia nunca altera record/binding/publicacao
+   * sintetica; o estado authoritative continua intocado.
+   */
+  notify?(event: {
+    runID: string;
+    sessionID: string;
+    phase: string;
+    round?: number;
+    notice: string;
+  }): void;
+  /**
    * Guarda de papel autoritativa (opcional): true = sessao interna
    * (worker/critic/orchestrator) => bypass sem run e sem record. Ausente =
    * permite (testes hermeticos; em producao o index.ts conecta ao ctx real e
@@ -137,6 +151,29 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+/**
+ * Presentation boundary: monta o evento validated (allowlist, bounded) e
+ * entrega ao seam `notify`. NUNCA propaga erro: falha de apresentacao nao
+ * pode transformar run concluido em execucao nem corromper o estado.
+ */
+function notifyPresentationSafe(
+  deps: AdmissionHandlerDeps,
+  input: {
+    runID: string;
+    sessionID: string;
+    phase: string;
+    round?: number;
+    notice: string;
+  },
+): void {
+  if (deps.notify === undefined) return;
+  try {
+    deps.notify(buildOrchestrationResultEvent(input));
+  } catch {
+    // degradacao bounded: apresentacao indisponivel nunca derruba o run
+  }
 }
 
 async function publishSafe(deps: AdmissionHandlerDeps, sessionID: string, text: string): Promise<void> {
@@ -279,6 +316,19 @@ export function createAdmissionOrchestrateHandler(
               ...(result.worker !== undefined ? { worker: result.worker } : {}),
             }),
           );
+          notifyPresentationSafe(deps, {
+            runID,
+            sessionID,
+            phase,
+            ...(result.round !== undefined ? { round: result.round } : {}),
+            notice: buildAdmissionRunNotice({
+              runID,
+              phase,
+              ...(result.round !== undefined ? { round: result.round } : {}),
+              ...(result.error !== undefined ? { error: result.error } : {}),
+              ...(result.worker !== undefined ? { worker: result.worker } : {}),
+            }),
+          });
         } catch (err) {
           const error = boundedError(err);
           try {
@@ -292,6 +342,12 @@ export function createAdmissionOrchestrateHandler(
             // mesmo escope acima
           }
           await publishSafe(deps, sessionID, buildAdmissionRunNotice({ runID, phase: "failed", error }));
+          notifyPresentationSafe(deps, {
+            runID,
+            sessionID,
+            phase: "failed",
+            notice: buildAdmissionRunNotice({ runID, phase: "failed", error }),
+          });
         }
       })();
 
