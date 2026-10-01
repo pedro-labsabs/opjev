@@ -22,7 +22,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { preparePluginInstallation } from "./install-plugin.mjs";
+import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
 import { runIDDigest } from "../src/orchestration/admission.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -266,7 +266,7 @@ async function main() {
   const resultPath = path.join(RUN_DIR, "e2e-result.json");
 
   fs.copyFileSync(path.join(REPO, "opencode.jsonc.example"), path.join(projectDir, "opencode.json"));
-  preparePluginInstallation(homeDir, projectDir, REPO);
+  installServerPluginToProject(projectDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
   const upPort = await freePort();
@@ -736,6 +736,9 @@ async function main() {
 
   // ------------------------------------------------- 11. fase TUI REAL
   try {
+    // Instala o plugin TUI no HOME apenas agora, provando causalmente que o server
+    // (executado desde o passo 1 sem plugin em HOME) usou seu plugin local documentado.
+    installPluginToHome(homeDir, REPO);
     const gwMark = gwEvents.length;
     const sessMark = await api("GET", "/api/session");
     const beforeIds = new Set(sesIds(sessMark.text));
@@ -1003,14 +1006,18 @@ async function main() {
     const pluginList = sniffEvents.find((e) => e.dir === "res" && String(e.path).includes("/api/plugin"));
     log(`wire: /api/plugin -> ${(pluginList?.body ?? "sem resposta").slice(0, 200)}`);
     const upLogText = fs.existsSync(upLogPath) ? fs.readFileSync(upLogPath, "utf8") : up.lines.join("\n");
+    // Prova causal forte: o server subiu sem o plugin TUI em HOME (instalado somente no passo 11),
+    // e o pre-flight diferencial da RPC (passo 4) provou funcionalmente que a RPC do plugin estava registrada e ativa
+    // antes de qualquer instalacao no HOME, confirmando o carregamento pelo path do projeto ./plugins/opencode-jev-free-router.
     const docPathUsed =
-      String(pluginList?.body ?? "").includes("opencode-jev-free-router") ||
-      upLogText.includes("opencode-jev-free-router") ||
-      fs.existsSync(path.join(projectDir, "plugins", "opencode-jev-free-router", "package.json"));
+      registered &&
+      (String(pluginList?.body ?? "").includes("opencode-jev-free-router") ||
+        upLogText.includes("opencode-jev-free-router") ||
+        upLogText.includes("plugins/opencode-jev-free-router"));
     assert(
       "instalação: plugin server carregado do path documentado (./plugins/opencode-jev-free-router)",
       docPathUsed,
-      `docPathUsed=${docPathUsed}`,
+      `docPathUsed=${docPathUsed} registered=${registered}`,
     );
   } catch (err) {
     assert("cross-checks sniffer", false, err.message);
