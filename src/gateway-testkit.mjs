@@ -36,6 +36,10 @@ export async function startFakeUpstream(opts = {}) {
     // rpcDedupe: emula o record DURAVEL do plugin (segunda RPC da mesma
     // identidade retorna duplicate-ignored, sem novo run — run<=1 cross-restart)
     rpcDedupe: opts.rpcDedupe ?? false,
+    // rpcFollowupAware: emula o plugin #13 — binding ativo por sessao;
+    // segunda RPC de OUTRA identidade na mesma sessao responde
+    // { runID: runAtivo, status: "followup-attached" } (zero segundo run).
+    rpcFollowupAware: opts.rpcFollowupAware ?? false,
     modelSwitchFail: opts.modelSwitchFail ?? false,
     agentSwitchFail: opts.agentSwitchFail ?? false,
     catalogFail: opts.catalogFail ?? false,
@@ -66,6 +70,8 @@ export async function startFakeUpstream(opts = {}) {
 
   let msgSeq = 0;
   const rpcAdmissions = new Map(); // `${sid}\0${mid}` -> {runID, runs} (record duravel p/ rpcDedupe)
+  const activeRuns = new Map(); // sid -> runID ativo (emulacao do binding #13)
+  const attachedMsgs = new Map(); // sid -> Set(messageID) emulacao do record de attach #13
   // Identidade GLOBAL do upstream (runtime real v2.0.11 provado): ids de
   // mensagem fornecidos pelo cliente sao unicos por upstream, NAO por sessao
   // (mesmo id em outra sessao => 409 ConflictError). Replay na MESMA sessao
@@ -374,6 +380,29 @@ export async function startFakeUpstream(opts = {}) {
           }
           const sid = String(input?.sessionID ?? "ses_x");
           const mid = String(input?.messageID ?? "msg_x");
+          if (cfg.rpcFollowupAware) {
+            const active = activeRuns.get(sid);
+            if (active !== undefined) {
+              // Record duravel do plugin (#13): mesma identidade => duplicate-ignored.
+              const seen = attachedMsgs.get(sid);
+              if (seen !== undefined && seen.has(mid)) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ output: { runID: active, status: "duplicate-ignored" } }));
+                return;
+              }
+              if (seen === undefined) attachedMsgs.set(sid, new Set());
+              attachedMsgs.get(sid).add(mid);
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ output: { runID: active, status: "followup-attached" } }));
+              return;
+            }
+            const runID = `auto-${sid}-${mid}`;
+            activeRuns.set(sid, runID);
+            state.rpcRuns += 1;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ output: { runID, status: "started" } }));
+            return;
+          }
           if (cfg.rpcDedupe) {
             const key = `${sid}\0${mid}`;
             const known = rpcAdmissions.get(key);
@@ -489,6 +518,19 @@ export async function startGateway(upstreamUrl, overrides = {}) {
     logs,
     counters: () => gw.counters(),
     activeSockets: () => gw.activeSockets(),
+    /** Eventos estruturados do log do gateway (type/... por linha JSON). */
+    events() {
+      const out = [];
+      for (const line of logs) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj && typeof obj.type === "string") out.push(obj);
+        } catch {
+          // linha humana
+        }
+      }
+      return out;
+    },
     close: async () => {
       await gw.close();
     },

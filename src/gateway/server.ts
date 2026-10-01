@@ -38,6 +38,8 @@ export interface GatewayCounters {
   admitted: number;
   rpcDispatched: number;
   rpcSkippedDuplicate: number;
+  /** Follow-ups anexados a runs ativos (#13): attach nao e dispatch de run. */
+  followupAttached: number;
   routeApplied: number;
   routeFallback: number;
   /** Route com side effect parcial (model aplicado, agent falhou): nunca silencioso. */
@@ -133,6 +135,7 @@ export function createGatewayServer(
     admitted: 0,
     rpcDispatched: 0,
     rpcSkippedDuplicate: 0,
+    followupAttached: 0,
     routeApplied: 0,
     routeFallback: 0,
     routePartial: 0,
@@ -361,6 +364,26 @@ export function createGatewayServer(
         if (output === null || typeof output !== "object" || typeof (output as { runID?: unknown }).runID !== "string") {
           throw new Error("output da RPC sem runID");
         }
+        const outStatus = typeof (output as { status?: unknown }).status === "string" ? (output as { status: string }).status : "";
+        if (outStatus === "followup-attached") {
+          // #13: o run ativo R possui o follow-up (identidade != runID dono).
+          // NAO e dispatch de run: nenhum novo record "started", contador
+          // dedicado + evento de observabilidade com o runID DONO.
+          const ownerID = (output as { runID: string }).runID;
+          counters.followupAttached += 1;
+          emit("rpc-followup-attached", { runID: ownerID, sessionID, messageID });
+          return { kind: "attached" };
+        }
+        if (outStatus === "duplicate-ignored") {
+          // #13: o plugin recusou por record duravel (replay/re-dispatch do
+          // gateway apos restart ou pos-attach). NENHUM run criado: nunca
+          // incrementar rpcDispatched nem gravar "started" (contadores
+          // refletem runs efetivos, nao trafego de wire).
+          const ownerID = (output as { runID: string }).runID;
+          counters.rpcSkippedDuplicate += 1;
+          emit("rpc-duplicate-ignored", { runID: ownerID, sessionID, messageID });
+          return { kind: "attached" };
+        }
         putRecord(runID, sessionID, messageID, "started");
         counters.rpcDispatched += 1;
         emit("rpc-dispatched", { runID });
@@ -382,6 +405,9 @@ export function createGatewayServer(
       );
       return;
     }
+    // #13: follow-up anexado ao run ativo pelo plugin — resposta continua o
+    // shape NATIVO da admissao (identidade duravel do turno); o gateway apenas
+    // observou o attach (zero segundo run, zero re-encaminhamento).
 
     // responde o shape NATIVO da admissao (dispatch ou duplicata suprimida)
     res.writeHead(admit.status, { "content-type": "application/json" });

@@ -34,6 +34,7 @@ import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFi
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
+import { formatFollowupsSection, type PendingFollowup } from "./followup.ts";
 
 export const WORKER_TIMEOUT_MS = 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -200,6 +201,14 @@ export interface DispatcherDeps {
     at: number;
   }): Promise<void>;
   now?(): number;
+  /**
+   * Consumo de follow-ups (#13): seam opcional injetado pelo adapter. Chamado
+   * pelo scheduler no boundary de montagem do prompt de CADA rodada; retorna
+   * os pendentes (exactly-once via registro consumido no admission storage)
+   * que entram como secao bounded no prompt da rodada. Ausente => zero
+   * consumo e prompt canonico intacto (regressao zero, comportamento #27).
+   */
+  followups?: (runID: string, round: number) => Promise<PendingFollowup[]>;
 }
 
 export interface OrchestrationRunResult {
@@ -747,6 +756,21 @@ async function executeSchedule(
           // Instrucao bounded do humano (#12): so e injetada na rodada retomada.
           ...(mode === "human-resume" && input.humanInstruction ? { humanInstruction: input.humanInstruction } : {}),
         });
+      }
+      // Boundary de consumo de follow-ups (#13): a montagem do prompt da rodada
+      // e um boundary ja governado (ownership do control plane). Consumo
+      // exactly-once (registro consumido no admission storage), secao bounded;
+      // falha do seam => degradacao bounded (rodada segue sem a secao, follow-up
+      // continua pendente — nunca consumido sem retorno). NAO e nova rodada,
+      // comando ou transicao normativa: apenas entrada do prompt da rodada.
+      if (deps.followups !== undefined) {
+        try {
+          const pending: PendingFollowup[] = await deps.followups(contract.runID, state.round);
+          const section = formatFollowupsSection(pending, state.round);
+          if (section) promptText = `${promptText}\n\n${section}`;
+        } catch {
+          // degradacao bounded: o follow-up permanece pendente no record
+        }
       }
       await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
       await withTimeout(() => deps.runtime.wait({ sessionID: workerSessionID }), timeoutMs, () => deps.runtime.interrupt?.({ sessionID: workerSessionID }));

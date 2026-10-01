@@ -24,6 +24,7 @@ import {
   type WorkerSessionView,
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
+import { createFollowupTakeSeam } from "./src/orchestration/followup.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { withResumeLock } from "./src/orchestration/resume-lock.ts";
 import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
@@ -860,6 +861,17 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
+    // Consumo de follow-ups (#13): o mesmo storage de admission alimenta o
+    // boundary de rodada. Consumo exactly-once (registro consumido no record);
+    // storage indisponivel => degradacao bounded (rodada segue sem a secao).
+    followups: createFollowupTakeSeam({
+      storage: {
+        get: (key: string) => safeStorageGet(ctx, key),
+        set: async (key: string, value: unknown) => {
+          await ctx.storage.set(key, value);
+        },
+      },
+    }),
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
   };
 }
