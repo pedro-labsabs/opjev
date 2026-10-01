@@ -14,6 +14,7 @@ import {
   type EvidencePacket,
   type ExecutionContract,
   type FailureClass,
+  type InputFrontier,
   type JevVerdict,
   type NextAction,
 } from "./types.ts";
@@ -132,6 +133,9 @@ export interface RoundJudgementState {
   criticFindings: EvidencePacket["criticFindings"];
   resultSummary: string;
   previousVerdict?: JevVerdict;
+  inputRevision?: number;
+  pendingFollowupsCount?: number;
+  pendingFollowups?: Array<{ messageID: string; text: string }>;
 }
 
 /**
@@ -143,6 +147,7 @@ export function buildRoundJudgementState(
   contract: ExecutionContract,
   evidence: EvidencePacket,
   previousVerdict?: JevVerdict,
+  frontier?: InputFrontier,
 ): RoundJudgementState {
   const c = contract as unknown as Record<string, unknown> | undefined;
   const ev = evidence as unknown as Record<string, unknown> | undefined;
@@ -195,6 +200,14 @@ export function buildRoundJudgementState(
     criticFindings,
     resultSummary: truncate(asString(ev?.resultSummary), EVIDENCE_LIMITS.resultSummary),
   };
+  if (frontier) {
+    state.inputRevision = frontier.revision;
+    state.pendingFollowupsCount = frontier.pendingCount;
+    state.pendingFollowups = (frontier.pendingFollowups ?? []).slice(0, 5).map((f) => ({
+      messageID: truncate(asString(f.messageID), 200),
+      text: truncate(asString(f.text), 2000),
+    }));
+  }
   if (previousVerdict) return { ...state, previousVerdict };
   return state;
 }

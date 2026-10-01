@@ -24,6 +24,7 @@ import {
   closeFollowupsForRun,
   followupIndexKey,
   followupKey,
+  followupRevisionKey,
   readFollowupIndex,
 } from "./followup.ts";
 
@@ -127,18 +128,27 @@ async function attachFollowupToActiveRun(
 ): Promise<{ runID: string; status: string }>
 {
   const { sessionID, messageID, objective, activeRunID } = input;
-  // Idempotencia por record ANTES de qualquer escrita: a identidade do turno
-  // (sessionID+messageID) e a chave do record — replay/re-submissao nunca
-  // duplica pending input nem consumo (independe do runID dono).
-  const prior = asRecord(await deps.storage.get(admissionRecordKey(sessionID, messageID)));
+  const fKey = followupKey(activeRunID, messageID);
+  const idxKey = followupIndexKey(activeRunID);
+  const admKey = admissionRecordKey(sessionID, messageID);
+  const revKey = followupRevisionKey(activeRunID);
+
+  // 1. Idempotencia por record ANTES de qualquer escrita:
+  // Se o record existe e o followupKey realmente existe, e duplicate-ignored.
+  const prior = asRecord(await deps.storage.get(admKey));
+  const rawExisting = await deps.storage.get(fKey);
+  const existingFollowup = rawExisting !== undefined;
+
   if (prior && prior.state !== "binding-failed") {
-    return { runID: activeRunID, status: "duplicate-ignored" };
+    if (prior.state !== "followup-attached" || existingFollowup) {
+      return { runID: activeRunID, status: "duplicate-ignored" };
+    }
   }
-  // Defesa em profundidade: o index por run tambem deduplica (janela de crash
-  // entre record e index nunca vira attach duplo).
+
+  // 2. Defesa em profundidade: index deduplica e cap
   let index: string[];
   try {
-    index = readFollowupIndex(await deps.storage.get(followupIndexKey(activeRunID)));
+    index = readFollowupIndex(await deps.storage.get(idxKey));
   } catch (err) {
     throw new OrchestrationError(
       "followup-persistence-failed",
@@ -146,29 +156,65 @@ async function attachFollowupToActiveRun(
     );
   }
   if (index.includes(messageID)) {
-    return { runID: activeRunID, status: "duplicate-ignored" };
+    if (existingFollowup) {
+      return { runID: activeRunID, status: "duplicate-ignored" };
+    }
+    // Orphan index de crash anterior sem record: reconcilia abaixo sem perda de F
   }
-  if (index.length >= FOLLOWUP_LIMITS.perRun) {
+  if (index.length >= FOLLOWUP_LIMITS.perRun && !index.includes(messageID)) {
     return { runID: activeRunID, status: "followup-limit-reached" };
   }
-  // Persistencia pre-consumo: o runner NUNCA e chamado aqui (zero execucao);
-  // o binding permanece intocado (continua o run ativo). Falha de storage =>
-  // erro bounded fail-closed (o replay recusa via record/index).
+
+  const rawRev = await deps.storage.get(revKey);
+  const currentRev = typeof rawRev === "number" && Number.isFinite(rawRev) ? rawRev : index.length;
+  const nextRev = currentRev + 1;
+
+  let wroteFollowup = false;
+  let wroteIndex = false;
+  let wroteAdmission = false;
+  let wroteRev = false;
+
+  const newIndex = index.includes(messageID) ? index : [...index, messageID];
+
   try {
+    // Write 1: followup record
     await deps.storage.set(
-      followupKey(activeRunID, messageID),
+      fKey,
       buildFollowupRecord({ sessionID, messageID, runID: activeRunID, text: objective, at: Date.now() }),
     );
-    await deps.storage.set(followupIndexKey(activeRunID), [...index, messageID]);
-    await deps.storage.set(admissionRecordKey(sessionID, messageID), {
+    wroteFollowup = true;
+
+    // Write 2: followup index
+    if (!index.includes(messageID)) {
+      await deps.storage.set(idxKey, newIndex);
+      wroteIndex = true;
+    }
+
+    // Write 3: admission record
+    await deps.storage.set(admKey, {
       runID: activeRunID,
       state: "followup-attached",
       at: Date.now(),
     });
+    wroteAdmission = true;
+
+    // Write 4: inputRevision
+    await deps.storage.set(revKey, nextRev);
+    wroteRev = true;
   } catch (err) {
-    try {
-      await deps.storage.set(followupKey(activeRunID, messageID), undefined);
-    } catch {}
+    // Rollback explicito de qualquer write efetuado
+    if (wroteAdmission) {
+      try { await deps.storage.set(admKey, undefined); } catch {}
+    }
+    if (wroteIndex) {
+      try { await deps.storage.set(idxKey, index); } catch {}
+    }
+    if (wroteFollowup) {
+      try { await deps.storage.set(fKey, undefined); } catch {}
+    }
+    if (wroteRev) {
+      try { await deps.storage.set(revKey, currentRev); } catch {}
+    }
     throw new OrchestrationError(
       "followup-persistence-failed",
       `persistencia do follow-up falhou (runner nao executado, binding intocado): ${boundedError(err)}`,
@@ -416,53 +462,57 @@ export function createAdmissionOrchestrateHandler(
         try {
           const result = await deps.runner(contract);
           const phase = String(result.phase ?? "completed");
-          let followups: { consumed: number; pending: number } | undefined;
-          try {
-            followups = await closeFollowupsForRun({ storage: deps.storage }, runID);
-          } catch {
-            followups = undefined; // fechamento best-effort: estado do run preservado
-          }
-          const notice = buildAdmissionRunNotice({
-            runID,
-            phase,
-            ...(result.round !== undefined ? { round: result.round } : {}),
-            ...(result.error !== undefined ? { error: result.error } : {}),
-            ...(result.worker !== undefined ? { worker: result.worker } : {}),
-            ...(followups !== undefined ? { followups } : {}),
+          await withKeyedLock(sessionLockKey, async () => {
+            let followups: { consumed: number; pending: number } | undefined;
+            try {
+              followups = await closeFollowupsForRun({ storage: deps.storage }, runID);
+            } catch {
+              followups = undefined; // fechamento best-effort: estado do run preservado
+            }
+            const notice = buildAdmissionRunNotice({
+              runID,
+              phase,
+              ...(result.round !== undefined ? { round: result.round } : {}),
+              ...(result.error !== undefined ? { error: result.error } : {}),
+              ...(result.worker !== undefined ? { worker: result.worker } : {}),
+              ...(followups !== undefined ? { followups } : {}),
+            });
+            await deps.storage.set(recordKey, {
+              runID,
+              state: phase,
+              ...(result.error !== undefined ? { error: boundedError(result.error) } : {}),
+            });
+            await deps.storage.set(sessionBindingKey(sessionID), { runID, phase });
+            await publishSafe(deps, sessionID, notice);
+            notifyPresentationSafe(deps, { runID, sessionID, phase, ...(result.round !== undefined ? { round: result.round } : {}), notice });
           });
-          await deps.storage.set(recordKey, {
-            runID,
-            state: phase,
-            ...(result.error !== undefined ? { error: boundedError(result.error) } : {}),
-          });
-          await deps.storage.set(sessionBindingKey(sessionID), { runID, phase });
-          await publishSafe(deps, sessionID, notice);
-          notifyPresentationSafe(deps, { runID, sessionID, phase, ...(result.round !== undefined ? { round: result.round } : {}), notice });
         } catch (err) {
           const error = boundedError(err);
-          let followups: { consumed: number; pending: number } | undefined;
-          try {
-            followups = await closeFollowupsForRun({ storage: deps.storage }, runID);
-          } catch {
-            followups = undefined;
-          }
-          const failedNotice = buildAdmissionRunNotice({ runID, phase: "failed", error, ...(followups !== undefined ? { followups } : {}) });
-          try {
-            await deps.storage.set(recordKey, { runID, state: "failed", error });
-          } catch {
-            // storage fora do ar: o log/emit do chamador preserva o diagnostico
-          }
-          try {
-            await deps.storage.set(sessionBindingKey(sessionID), { runID, phase: "failed" });
-          } catch {
-            // mesmo escopo acima
-          }
-          await publishSafe(deps, sessionID, failedNotice);
-          notifyPresentationSafe(deps, {
-            runID,
-            sessionID,
-            phase: "failed",
-            notice: failedNotice,
+          await withKeyedLock(sessionLockKey, async () => {
+            let followups: { consumed: number; pending: number } | undefined;
+            try {
+              followups = await closeFollowupsForRun({ storage: deps.storage }, runID);
+            } catch {
+              followups = undefined;
+            }
+            const failedNotice = buildAdmissionRunNotice({ runID, phase: "failed", error, ...(followups !== undefined ? { followups } : {}) });
+            try {
+              await deps.storage.set(recordKey, { runID, state: "failed", error });
+            } catch {
+              // storage fora do ar: o log/emit do chamador preserva o diagnostico
+            }
+            try {
+              await deps.storage.set(sessionBindingKey(sessionID), { runID, phase: "failed" });
+            } catch {
+              // mesmo escopo acima
+            }
+            await publishSafe(deps, sessionID, failedNotice);
+            notifyPresentationSafe(deps, {
+              runID,
+              sessionID,
+              phase: "failed",
+              notice: failedNotice,
+            });
           });
         }
       })();

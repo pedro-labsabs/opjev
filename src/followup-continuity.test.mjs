@@ -363,19 +363,19 @@ test("C13 [RED P1 1]: run R ativo que aceitaria na rodada 1 NAO encerra se F che
   assert.equal(rec.state, "pending");
 });
 
-test("C14 [RED P1 3]: falha no write de followupKey ou admissionRecord mantem index e replay sem orphan duplicate-ignored que perca F", async () => {
+test("C14a [P1 2]: falha no write 1 (followupKey) -> primeira tentativa falha -> replay do mesmo messageID converge deterministicamente", async () => {
   const store = new Map();
-  const activeRunID = autoAdmissionRunID("ses_c14", "msg_A");
-  const sessionID = "ses_c14";
+  const activeRunID = autoAdmissionRunID("ses_c14a", "msg_A");
+  const sessionID = "ses_c14a";
   await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
 
-  // Injeta falha de escrita no followupKey
+  // Injeta falha de escrita no write 1 (followupKey)
   const deps = {
     storage: {
       async get(key) { return store.get(key); },
       async set(key, value) {
-        if (key === followupKey(activeRunID, "msg_F14")) {
-          throw new Error("falha de conexao ao salvar followup record");
+        if (key === followupKey(activeRunID, "msg_F14a")) {
+          throw new Error("falha no write 1: followup record");
         }
         store.set(key, value);
       },
@@ -386,19 +386,133 @@ test("C14 [RED P1 3]: falha no write de followupKey ou admissionRecord mantem in
 
   const handler = createAdmissionOrchestrateHandler(deps);
 
-  // Primeira tentativa falha
+  // Primeira tentativa falha de modo explicito
   await assert.rejects(
-    () => handler({ sessionID, messageID: "msg_F14", objective: "instrucao F14" }),
+    () => handler({ sessionID, messageID: "msg_F14a", objective: "instrucao F14a" }),
     (err) => err.code === "followup-persistence-failed",
   );
 
-  // Agora repara a escrita
+  // Repara a escrita
   deps.storage.set = async (key, value) => { store.set(key, value); };
 
   // Replay do MESMO messageID
-  const retryOut = await handler({ sessionID, messageID: "msg_F14", objective: "instrucao F14" });
-  assert.equal(retryOut.status, "followup-attached", "replay deve conseguir dar ATTACH com sucesso sem ser bloqueado por index orfao");
+  const retryOut = await handler({ sessionID, messageID: "msg_F14a", objective: "instrucao F14a" });
+  assert.equal(retryOut.status, "followup-attached", "replay converge para followup-attached");
 
-  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14")));
-  assert.equal(rec.text, "instrucao F14");
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14a")));
+  assert.equal(rec.text, "instrucao F14a");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14a"]);
+});
+
+test("C14b [P1 2]: falha no write 2 (followupIndexKey) -> primeira tentativa falha -> replay do mesmo messageID converge deterministicamente", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14b", "msg_A");
+  const sessionID = "ses_c14b";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  // Injeta falha de escrita no write 2 (followupIndexKey)
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) {
+        if (key === followupIndexKey(activeRunID)) {
+          throw new Error("falha no write 2: followup index");
+        }
+        store.set(key, value);
+      },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Primeira tentativa falha de modo explicito
+  await assert.rejects(
+    () => handler({ sessionID, messageID: "msg_F14b", objective: "instrucao F14b" }),
+    (err) => err.code === "followup-persistence-failed",
+  );
+
+  // Repara a escrita
+  deps.storage.set = async (key, value) => { store.set(key, value); };
+
+  // Replay do MESMO messageID
+  const retryOut = await handler({ sessionID, messageID: "msg_F14b", objective: "instrucao F14b" });
+  assert.equal(retryOut.status, "followup-attached", "replay converge para followup-attached");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14b")));
+  assert.equal(rec.text, "instrucao F14b");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14b"]);
+});
+
+test("C14c [P1 2]: falha no write 3 (admissionRecordKey) -> primeira tentativa falha -> replay do mesmo messageID converge deterministicamente", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14c", "msg_A");
+  const sessionID = "ses_c14c";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  // Injeta falha de escrita no write 3 (admissionRecordKey)
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) {
+        if (key === admissionRecordKey(sessionID, "msg_F14c")) {
+          throw new Error("falha no write 3: admission record");
+        }
+        store.set(key, value);
+      },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Primeira tentativa falha de modo explicito
+  await assert.rejects(
+    () => handler({ sessionID, messageID: "msg_F14c", objective: "instrucao F14c" }),
+    (err) => err.code === "followup-persistence-failed",
+  );
+
+  // Repara a escrita
+  deps.storage.set = async (key, value) => { store.set(key, value); };
+
+  // Replay do MESMO messageID
+  const retryOut = await handler({ sessionID, messageID: "msg_F14c", objective: "instrucao F14c" });
+  assert.equal(retryOut.status, "followup-attached", "replay converge para followup-attached");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14c")));
+  assert.equal(rec.text, "instrucao F14c");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14c"]);
+  const admRec = store.get(admissionRecordKey(sessionID, "msg_F14c"));
+  assert.equal(admRec.state, "followup-attached");
+});
+
+test("C14d [P1 2]: orphan index de crash pos-write 2 nao causa duplicate-ignored e converge no replay", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14d", "msg_A");
+  const sessionID = "ses_c14d";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  // Simula crash de processo: index contem msg_F14d, mas o record followupKey nunca foi escrito
+  await store.set(followupIndexKey(activeRunID), ["msg_F14d"]);
+
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) { store.set(key, value); },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Replay deve reconciliar e gravar o record, NUNCA responder duplicate-ignored falso com F perdido
+  const retryOut = await handler({ sessionID, messageID: "msg_F14d", objective: "instrucao F14d recuperada" });
+  assert.equal(retryOut.status, "followup-attached", "reconcilia index orfao e anexa follow-up");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14d")));
+  assert.equal(rec.text, "instrucao F14d recuperada");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14d"]);
 });

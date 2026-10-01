@@ -15,7 +15,7 @@
 // arbitrarios — apenas a identidade do turno e o texto do prompt admitido.
 
 import { withKeyedLock } from "../lock.ts";
-import { OrchestrationError } from "./types.ts";
+import { OrchestrationError, type InputFrontier } from "./types.ts";
 
 export const FOLLOWUP_LIMITS = {
   /** Texto armazenado por follow-up (mesma cota do objective do kernel). */
@@ -29,7 +29,7 @@ export const FOLLOWUP_LIMITS = {
   runID: 200,
 } as const;
 
-const STATES = ["pending", "consumed", "unconsumed"] as const;
+const STATES = ["pending", "reserved", "consumed", "unconsumed"] as const;
 
 export type FollowupState = (typeof STATES)[number];
 
@@ -42,9 +42,11 @@ export interface FollowupRecord {
   runID: string;
   /** Texto admitido, truncado ao limite (input preservado, bounded). */
   text: string;
-  /** pending (aguarda boundary) | consumed (injetado no prompt da rodada) | unconsumed (run terminou sem consumir). */
+  /** pending | reserved (preparado/reservado para entrega) | consumed | unconsumed */
   state: FollowupState;
   at: number;
+  reservedAt?: number;
+  reservedRound?: number;
   consumedAt?: number;
   /** Boundary control-plane onde foi consumido (ex.: `round-2-worker-prompt`). */
   consumedBoundary?: string;
@@ -61,6 +63,11 @@ export function followupKey(runID: string, messageID: string): string {
 /** Index de attach por run (ordem de chegada, capped) — evita scan no storage. */
 export function followupIndexKey(runID: string): string {
   return `orchestration/followup-index/${slug(runID)}`;
+}
+
+/** Chave da revisao de input frontier por run — incrementada deterministicamente no attach. */
+export function followupRevisionKey(runID: string): string {
+  return `orchestration/followup-rev/${slug(runID)}`;
 }
 
 function slug(v: unknown): string {
@@ -130,6 +137,16 @@ export function normalizeFollowupRecord(raw: unknown): FollowupRecord {
     state: r.state as FollowupState,
     at: r.at,
   };
+  if (base.state === "reserved") {
+    const reservedAt = typeof r.reservedAt === "number" && Number.isFinite(r.reservedAt) ? r.reservedAt : undefined;
+    const reservedRound =
+      typeof r.reservedRound === "number" && Number.isInteger(r.reservedRound) ? r.reservedRound : undefined;
+    return {
+      ...base,
+      ...(reservedAt !== undefined ? { reservedAt } : {}),
+      ...(reservedRound !== undefined ? { reservedRound } : {}),
+    };
+  }
   if (base.state !== "pending") {
     if (typeof r.consumedAt !== "number" || !Number.isFinite(r.consumedAt)) fail("consumedAt obrigatorio fora de pending");
     if (typeof r.consumedBoundary !== "string" || r.consumedBoundary.length === 0) {
@@ -197,15 +214,72 @@ export interface FollowupStorage {
  * Registros ausentes/ilegiveis sao ignorados (bounded); pendentes continuam
  * pendentes se o take falhar no meio (nunca consumido sem retorno).
  */
+/**
+ * Snapshot bounded do input frontier de follow-ups pendentes do run.
+ * Capturado no control plane apos evidencias e antes do julgamento do Jev.
+ */
+export async function getInputFrontier(
+  deps: { storage: FollowupStorage },
+  runID: string,
+): Promise<InputFrontier> {
+  const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+  return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+    let index: string[] = [];
+    try {
+      index = readFollowupIndex(await deps.storage.get(followupIndexKey(safeRunID)));
+    } catch {
+      return { revision: 0, pendingCount: 0, pendingFollowups: [] };
+    }
+    const rawRev = await deps.storage.get(followupRevisionKey(safeRunID));
+    const revision = typeof rawRev === "number" && Number.isFinite(rawRev) ? rawRev : index.length;
+    const pendingFollowups: Array<{ messageID: string; text: string }> = [];
+    for (const messageID of index) {
+      const raw = await deps.storage.get(followupKey(safeRunID, messageID));
+      if (raw === undefined) continue;
+      let rec: FollowupRecord;
+      try {
+        rec = normalizeFollowupRecord(raw);
+      } catch {
+        continue;
+      }
+      if (rec.state === "pending" || rec.state === "reserved") {
+        pendingFollowups.push({
+          messageID: rec.messageID,
+          text: rec.text,
+        });
+      }
+    }
+    return {
+      revision,
+      pendingCount: pendingFollowups.length,
+      pendingFollowups: pendingFollowups.slice(0, FOLLOWUP_LIMITS.perRound),
+    };
+  });
+}
+
+export interface FollowupTakeSeam {
+  (runID: string, round: number): Promise<PendingFollowup[]>;
+  reserve(runID: string, round: number): Promise<PendingFollowup[]>;
+  confirm(runID: string, items: PendingFollowup[], round: number): Promise<void>;
+  getFrontier(runID: string): Promise<InputFrontier>;
+}
+
+/**
+ * Seam de consumo usado pelo dispatcher no boundary de cada rodada: suporta
+ * protocolo duravel em duas fases (pending -> reserved -> entrega real -> consumed)
+ * e tambem consumo atomico callable (exactly-once). Serializado por run via keyed
+ * lock. Registros ausentes/ilegiveis sao ignorados (bounded).
+ */
 export function createFollowupTakeSeam(deps: {
   storage: FollowupStorage;
   now?(): number;
   /** Cap de itens por take (default FOLLOWUP_LIMITS.perRound; injetavel para testes). */
   perRound?: number;
-}): (runID: string, round: number) => Promise<PendingFollowup[]> {
+}): FollowupTakeSeam {
   const now = deps.now ?? Date.now;
   const cap = Math.max(1, Math.trunc(Number(deps.perRound ?? FOLLOWUP_LIMITS.perRound)));
-  return async (runID: string, round: number): Promise<PendingFollowup[]> => {
+
+  const reserve = async (runID: string, round: number): Promise<PendingFollowup[]> => {
     const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
     if (typeof round !== "number" || !Number.isInteger(round) || round < 1) {
       throw new OrchestrationError("invalid-followup", `round invalido para take: ${String(round)}`);
@@ -216,12 +290,91 @@ export function createFollowupTakeSeam(deps: {
       for (const messageID of index) {
         if (targets.length >= cap) break;
         const raw = await deps.storage.get(followupKey(safeRunID, messageID));
-        if (raw === undefined) continue; // index sem record (crash window documentado)
+        if (raw === undefined) continue;
         let rec: FollowupRecord;
         try {
           rec = normalizeFollowupRecord(raw);
         } catch {
-          continue; // ilegivel: skip bounded (nunca consumido sem validar)
+          continue;
+        }
+        if (rec.state !== "pending") continue;
+        targets.push({ messageID, record: rec });
+      }
+
+      const out: PendingFollowup[] = [];
+      const updatedKeys: string[] = [];
+      const reservedAt = now();
+      try {
+        for (const t of targets) {
+          const key = followupKey(safeRunID, t.messageID);
+          await deps.storage.set(key, {
+            ...t.record,
+            state: "reserved",
+            reservedAt,
+            reservedRound: round,
+          });
+          updatedKeys.push(key);
+          out.push({ messageID: t.record.messageID, text: t.record.text });
+        }
+      } catch (err) {
+        for (let i = 0; i < updatedKeys.length; i++) {
+          try {
+            await deps.storage.set(updatedKeys[i], targets[i].record);
+          } catch {}
+        }
+        throw err;
+      }
+      return out;
+    });
+  };
+
+  const confirm = async (runID: string, items: PendingFollowup[], round: number): Promise<void> => {
+    if (!Array.isArray(items) || items.length === 0) return;
+    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+      const consumedAt = now();
+      const consumedBoundary = `round-${round}-worker-prompt`;
+      for (const it of items) {
+        if (!it?.messageID) continue;
+        const raw = await deps.storage.get(followupKey(safeRunID, it.messageID));
+        if (raw === undefined) continue;
+        try {
+          const rec = normalizeFollowupRecord(raw);
+          if (rec.state === "reserved" || rec.state === "pending") {
+            await deps.storage.set(followupKey(safeRunID, it.messageID), {
+              ...rec,
+              state: "consumed",
+              consumedAt,
+              consumedBoundary,
+              consumedRound: round,
+            });
+          }
+        } catch {}
+      }
+    });
+  };
+
+  const getFrontier = async (runID: string): Promise<InputFrontier> => {
+    return await getInputFrontier(deps, runID);
+  };
+
+  const take = async (runID: string, round: number): Promise<PendingFollowup[]> => {
+    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    if (typeof round !== "number" || !Number.isInteger(round) || round < 1) {
+      throw new OrchestrationError("invalid-followup", `round invalido para take: ${String(round)}`);
+    }
+    return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+      const index = readFollowupIndex(await deps.storage.get(followupIndexKey(safeRunID)));
+      const targets: Array<{ messageID: string; record: FollowupRecord }> = [];
+      for (const messageID of index) {
+        if (targets.length >= cap) break;
+        const raw = await deps.storage.get(followupKey(safeRunID, messageID));
+        if (raw === undefined) continue;
+        let rec: FollowupRecord;
+        try {
+          rec = normalizeFollowupRecord(raw);
+        } catch {
+          continue;
         }
         if (rec.state !== "pending") continue;
         targets.push({ messageID, record: rec });
@@ -255,10 +408,16 @@ export function createFollowupTakeSeam(deps: {
       return out;
     });
   };
+
+  take.reserve = reserve;
+  take.confirm = confirm;
+  take.getFrontier = getFrontier;
+
+  return take as FollowupTakeSeam;
 }
 
 /**
- * Reverte o consumo de follow-ups se a entrega no runtime (prompt) falhar
+ * Reverte o consumo/reserva de follow-ups se a entrega no runtime (prompt) falhar
  * antes do worker receber os inputs.
  */
 export async function revertFollowupConsumption(
@@ -275,7 +434,7 @@ export async function revertFollowupConsumption(
       if (raw === undefined) continue;
       try {
         const rec = normalizeFollowupRecord(raw);
-        if (rec.state === "consumed") {
+        if (rec.state === "consumed" || rec.state === "reserved") {
           const reverted: FollowupRecord = {
             messageID: rec.messageID,
             sessionID: rec.sessionID,

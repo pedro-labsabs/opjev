@@ -188,6 +188,13 @@ export function transitionRun(state: RunState, event: OrchestrationEvent): Trans
               "VERDICT accept incompativel com evidencia deterministica: deterministicChecks contem hard failure",
             );
           }
+          const pendingFollowups = event.frontier?.pendingCount ?? 0;
+          if (pendingFollowups > 0) {
+            throw new OrchestrationError(
+              "verdict-rejected",
+              `VERDICT accept incompativel com follow-ups pendentes no input frontier (${pendingFollowups} pendente(s))`,
+            );
+          }
           return next({ phase: "completed", lastVerdict: verdict, history }, [{ type: "complete" }]);
         }
         case "repair-same":

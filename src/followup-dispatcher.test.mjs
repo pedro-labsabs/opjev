@@ -103,10 +103,13 @@ function fakeDeps(over = {}, storageSeed) {
   const judgeAnswersSeq = over.judgeAnswersSeq ?? [ACCEPT_ANSWERS];
   const decisions = {
     selectExecutor: async () => ({ agent: "build", model: "opencode/big-pickle", via: "jev", route: "fast-coding", confidence: 0.9 }),
-    judgeRound: async () => {
+    judgeRound: async (input) => {
       effects.push("judge");
       const a = judgeAnswersSeq[judgeSeq] ?? judgeAnswersSeq[judgeAnswersSeq.length - 1];
       judgeSeq += 1;
+      if (input?.state?.pendingFollowupsCount > 0 && over.judgeRespectsPending !== false) {
+        return REPAIR_ANSWERS;
+      }
       return a;
     },
     selectModel: async () => ({ model: "opencode/mimo-v2.5-free" }),
@@ -280,4 +283,141 @@ test("D7 [RED P1 2]: falha no meio do take de 2 follow-ups NAO deixa o primeiro 
 
   const rec1 = normalizeFollowupRecord(await store.get(followupKey("r1", "m1")));
   assert.equal(rec1.state, "pending", "m1 deve permanecer PENDING se a operacao atomica do take falhar");
+});
+
+test("D8 [SCHEDULER / GOVERNANCE]: F chega apos prompt da rodada 1 -> Jev recebe snapshot com F e decide repair-same -> rodada 2 consome F -> worker recebe F no prompt -> run conclui; E tentativa de accept com F pendente e rejeitada pelo kernel", async () => {
+  const c = contract({ maxRounds: 3 });
+
+  // Parte 1: Se o Jev tentar emitir accept mesmo com F pendente no frontier, o kernel rejeita
+  {
+    const { deps, store } = fakeDeps({
+      judgeAnswersSeq: [ACCEPT_ANSWERS],
+      judgeRespectsPending: false, // Forca Jev a tentar accept mesmo com F pendente
+    }, {});
+    const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+    deps.followups = createFollowupTakeSeam({ storage, now: () => 5 });
+    deps.storage = storage;
+
+    // F chega apos prompt (durante wait) para permanecer pendente no frontier de julgamento
+    const origWait = deps.runtime.wait;
+    deps.runtime.wait = async (arg) => {
+      await seedFollowup(storage, c.runID, "msg_D8_bad");
+      return origWait(arg);
+    };
+
+    const res = await runOrchestrationOnce(c, deps);
+    assert.equal(res.phase, "failed", "run deve falhar bounded porque kernel rejeitou accept com follow-up pendente");
+    assert.ok(res.error?.includes("incompativel com follow-ups pendentes"), "diagnostico do kernel presente");
+  }
+
+  // Parte 2: Fluxo canonico — control plane captura frontier, Jev decide repair-same, rodada 2 consome F, run completa
+  {
+    const { deps, store, promptCalls } = fakeDeps({}, {});
+    const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+    deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+    deps.storage = storage;
+
+    // F chega apos o prompt da rodada 1 ter sido enviado (durante runtime.wait)
+    const origWait = deps.runtime.wait;
+    let waitCalls = 0;
+    deps.runtime.wait = async (arg) => {
+      waitCalls += 1;
+      if (waitCalls === 1) {
+        await seedFollowup(storage, c.runID, "msg_D8_late", "instrucao do follow-up tardio");
+      }
+      return origWait(arg);
+    };
+
+    let receivedJudgementState;
+    const origJudge = deps.decisions.judgeRound;
+    deps.decisions.judgeRound = async (arg) => {
+      if (arg.state.round === 1) {
+        receivedJudgementState = arg.state;
+      }
+      return origJudge(arg);
+    };
+
+    const res = await runOrchestrationOnce(c, deps);
+    assert.equal(res.phase, "completed", "run completa com sucesso na rodada 2");
+    assert.equal(res.rounds.length, 2, "executou exatamente 2 rodadas");
+
+    // Jev recebeu o snapshot contendo F no julgamento da rodada 1
+    assert.ok(receivedJudgementState, "Jev recebeu RoundJudgementState");
+    assert.equal(receivedJudgementState.pendingFollowupsCount, 1, "Jev conhecia a contagem de follow-ups pendentes");
+    assert.equal(receivedJudgementState.pendingFollowups?.[0]?.messageID, "msg_D8_late");
+    assert.equal(receivedJudgementState.pendingFollowups?.[0]?.text, "instrucao do follow-up tardio");
+
+    // Rodada 1 nao continha F no prompt; Rodada 2 continha F
+    assert.equal(promptCalls.length, 2);
+    assert.equal(promptCalls[0].text.includes("msg_D8_late"), false, "rodada 1 ja havia sido enviada");
+    assert.ok(promptCalls[1].text.includes("SESSION_FOLLOWUPS"), "rodada 2 contem follow-up");
+    assert.ok(promptCalls[1].text.includes("msg_D8_late"), "messageID presente na rodada 2");
+    assert.ok(promptCalls[1].text.includes("instrucao do follow-up tardio"));
+
+    // Follow-up verificado como consumed no storage
+    const rec = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D8_late")));
+    assert.equal(rec.state, "consumed");
+    assert.equal(rec.consumedRound, 2);
+    assert.equal(rec.consumedBoundary, "round-2-worker-prompt");
+  }
+});
+
+test("D9 [FENCING]: race onde F chega durante judgeRound invalida verdict stale e re-julga com frontier atualizado", async () => {
+  const c = contract({ maxRounds: 3 });
+  const { deps, store } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 15 });
+  deps.storage = storage;
+
+  let judgeCalls = 0;
+  const origJudge = deps.decisions.judgeRound;
+  deps.decisions.judgeRound = async (arg) => {
+    judgeCalls += 1;
+    if (judgeCalls === 1) {
+      // Simula a race: F chega no meio do primeiro julgamento (revision muda de 0 para 1)
+      await seedFollowup(storage, c.runID, "msg_D9_race", "race instruction");
+      // Jev responde com base no snapshot anterior (stale)
+      return ACCEPT_ANSWERS;
+    }
+    // Na segunda chamada (re-julgamento apos fencing detectar stale):
+    if (judgeCalls === 2) {
+      assert.equal(arg.state.pendingFollowupsCount, 1, "segundo julgamento recebe frontier atualizado");
+    }
+    return origJudge(arg); // retorna REPAIR_ANSWERS pois ha pending
+  };
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "completed");
+  assert.equal(res.rounds.length, 2, "rodada 1 re-julgou e abriu rodada 2");
+  assert.ok(judgeCalls >= 3, "judgeRound foi chamado pelo menos 3 vezes (2 na rodada 1 devido ao fencing, 1 na rodada 2)");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D9_race")));
+  assert.equal(rec.state, "consumed");
+  assert.equal(rec.consumedRound, 2);
+});
+
+test("D10 [TWO-PHASE DELIVERY]: protocolo reserve -> prompt -> confirm garante que falha no prompt nunca deixa estado como consumed", async () => {
+  const c = contract({ maxRounds: 2 });
+  const { deps, store } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  await seedFollowup(storage, c.runID, "msg_D10", "payload importante");
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 20 });
+  deps.storage = storage;
+
+  let promptAttempts = 0;
+  deps.runtime.prompt = async () => {
+    promptAttempts += 1;
+    // Antes da entrega do prompt, o record esta em estado reserved no storage (nao consumed!)
+    const midState = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D10")));
+    assert.equal(midState.state, "reserved", "durante a preparacao do prompt o estado e reserved, NUNCA consumed antecipado");
+    assert.equal(midState.reservedRound, 1);
+    throw new Error("falha fatal na entrega do prompt ao worker");
+  };
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "failed");
+
+  // Apos falha, record NAO mente que foi consumed
+  const finalState = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D10")));
+  assert.notEqual(finalState.state, "consumed", "nunca pode estar consumed se o worker nao recebeu");
 });

@@ -438,12 +438,18 @@ export type ExecutionOutcome = "succeeded" | "failed" | "interrupted";
  * Eventos explicitos do control plane. Conjunto minimo: nenhum framework
  * generico de eventos — so o que o loop de orquestracao precisa.
  */
+export interface InputFrontier {
+  revision: number;
+  pendingCount: number;
+  pendingFollowups: Array<{ messageID: string; text: string }>;
+}
+
 export type OrchestrationEvent =
   | { type: "CONTRACT_READY"; contract?: ExecutionContract }
   | { type: "EXECUTION_STARTED"; executor?: ExecutorRef }
   | { type: "EXECUTION_FINISHED"; outcome: ExecutionOutcome }
   | { type: "EVIDENCE_READY"; evidence: EvidencePacket }
-  | { type: "VERDICT_RECEIVED"; verdict: JevVerdict }
+  | { type: "VERDICT_RECEIVED"; verdict: JevVerdict; frontier?: InputFrontier }
   | { type: "HUMAN_DECISION_RECEIVED"; decision: HumanDecision }
   | { type: "COMMAND_FAILED"; command?: OrchestrationCommand["type"]; error?: string };
 
