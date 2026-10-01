@@ -34,7 +34,16 @@ import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFi
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
-import { formatFollowupsSection, revertFollowupConsumption, type PendingFollowup, type FollowupStorage } from "./followup.ts";
+import {
+  formatFollowupsSection,
+  revertFollowupConsumption,
+  followupKey,
+  followupIndexKey,
+  readFollowupIndex,
+  normalizeFollowupRecord,
+  type PendingFollowup,
+  type FollowupStorage,
+} from "./followup.ts";
 
 export const WORKER_TIMEOUT_MS = 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -1317,6 +1326,27 @@ async function executeSchedule(
     }
     // Terminal / boundary: accept => completed; stop => stopped; human
     // => pending command mapeado pelo kernel + checkpoint human-awaiting.
+    if ((out.state.phase === "completed" || out.state.phase === "stopped") && deps.followups && deps.storage && out.state.round < contract.maxRounds) {
+      try {
+        const index = readFollowupIndex(await deps.storage.get(followupIndexKey(contract.runID)));
+        let hasPending = false;
+        for (const mid of index) {
+          const raw = await deps.storage.get(followupKey(contract.runID, mid));
+          if (raw) {
+            const rec = normalizeFollowupRecord(raw);
+            if (rec.state === "pending") {
+              hasPending = true;
+              break;
+            }
+          }
+        }
+        if (hasPending) {
+          mode = "repair-same";
+          continue;
+        }
+      } catch {}
+    }
+
     pendingCommands = out.state.phase === "completed" ? [] : out.transition.commands.map((c) => c.type);
     if (out.state.phase === "awaiting-human") {
       // Boundary humano persistido explicitamente (PAUSE1): requestID
