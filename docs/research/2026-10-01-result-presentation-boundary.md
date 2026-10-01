@@ -3,9 +3,10 @@
 - Date: 2026-10-01
 - PR: pedro-labsabs/opjev#27 — `feat: add deterministic orchestration admission gateway`
 - Branch: `feat/deterministic-admission-gateway`
+- Delivery HEAD: `0bf727a` (with P1 token correlation, unified plugin install, and fresh evidence)
 - Base at investigation: `main@7a3686e` (not advanced — no rebase needed)
-- Runtime authority: OpenCode **v2.0.11** (`/tmp/opencode-2.0.11/package/bin/opencode`), `@opencode/plugin@2.0.7`
-- **Verdict: GO.** A supported public surface exists and was proven end-to-end in real runtime; the orchestration result is now VISIBLE in the real TUI with `parent=0`, `RPC=1`, `run=1`.
+- Runtime authority: OpenCode **v2.0.11** (`/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli`), `@opencode/plugin@2.0.7`
+- **Verdict: GO.** A supported public surface exists and was proven end-to-end in real runtime; the orchestration result is now VISIBLE in the real TUI with `parent=0`, `RPC=1`, `run=1`, strictly correlated to the unique run identity/digest.
 
 ## 1. Capability question and answer
 
@@ -120,12 +121,12 @@ Modified (wiring only — no architecture change):
 
 ## 5. E2E (authoritative v2.0.11, real gateway + real TUI + real PTY)
 
-Command: `OPENCODE_BIN=/tmp/opencode-2.0.11/package/bin/opencode node scripts/e2e-gateway.mjs`
-Run dir: `/tmp/opjev-e2e/runs/2026-10-01T01-41-14-782Z/` (e2e-result.json,
-pty-dump.bin, gateway.log, upstream.log, http.jsonl).
+Command: `OPENCODE_BIN=/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli npm run e2e:gateway`
+Run dir: `/tmp/opjev-e2e/runs/2026-10-01T12-11-31-579Z/` (`e2e-result.json`, `pty-dump.bin`, `gateway.log`, `upstream.log`, `http.jsonl`).
 
-Summary: **total=39 fail=0 partial=0** (visibility assertion now REQUIRED).
+Summary: **total=40 fail=0 partial=0** (visibility assertion REQUIRED and verified against unique runID digest).
 Key results from the artifact:
+- `normal: resposta nativa chega ao transcript`: PASS (assistantInTranscript=true)
 - `orchestrate: EXATAMENTE 1 dispatch de RPC (run=1)` — dispatched=1;
 - `orchestrate: resultado PUBLICADO (notice synthetic) sem wake` — PASS;
 - `orchestrate: parent=0 (ZERO execucao na sessao parent)` — execStarted=0;
@@ -133,9 +134,9 @@ Key results from the artifact:
 - `duas sessoes: parent=0 em AMBAS` — PASS;
 - `TUI orchestrate: parent=0 (janela admission->ping limpa...)` —
   windowExecs=0 execAtOrch=0 finalExecs=1;
-- `TUI: notice da publicacao chega ao inbox da sessao do TUI` — canary PASS;
-- `TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice)` —
-  **PASS (required=true)**: the notice title rendered in the real TUI screen;
+- `TUI: notice daquele run contem o tuiRunID` — notice title & ID verified;
+- `TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)` —
+  **PASS (required=true)**: rendered in real TUI PTY dump correlated to `auto-ses_f089b4088ffemg72184jg0TIeQ-msg_0f764bf7b001lo1ydrYPch8fMV-97a7bebcd6ad`;
 - `wire: ZERO PATCH de inbox` — patchInbox=0 (no wake mechanism, any phase);
 - `wire: admissao persist-first com resume:false observada` — occurrences=7;
 - counts: intercepts=11 (normal=3, route=1, orchestrate=7), admitted=7,

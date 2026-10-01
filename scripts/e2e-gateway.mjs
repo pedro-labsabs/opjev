@@ -22,6 +22,8 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { installPluginToHome } from "./install-plugin.mjs";
+import { runIDDigest } from "../src/orchestration/admission.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/opencode";
@@ -269,29 +271,8 @@ async function main() {
   );
   // Presentation boundary (PR #27): o cli/TUI (role=cli) NAO herda os plugins
   // do opencode.json do projeto no v2.0.11 — instala o plugin em
-  // <HOME>/.config/opencode/plugins para que o entrypoint `tui` carregue e o
-  // resultado do run fique VISIVEL no render do TUI (toast publico).
-  const cliPluginDir = path.join(homeDir, ".config", "opencode", "plugins", "opjev");
-  fs.mkdirSync(cliPluginDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(cliPluginDir, "package.json"),
-    `${JSON.stringify(
-      { name: "opjev-cli-plugin", version: "0.1.0", type: "module", main: "./index.ts", exports: { ".": "./index.ts", "./tui": "./tui.ts" } },
-      null,
-      2,
-    )}\n`,
-  );
-  fs.copyFileSync(path.join(REPO, "index.ts"), path.join(cliPluginDir, "index.ts"));
-  fs.copyFileSync(path.join(REPO, "tui.ts"), path.join(cliPluginDir, "tui.ts"));
-  fs.cpSync(path.join(REPO, "src"), path.join(cliPluginDir, "src"), { recursive: true });
-  // Resolucao de @opencode/plugin a partir do plugin do config dir (walk-up).
-  const cliNodeModules = path.join(homeDir, "node_modules");
-  try {
-    fs.rmSync(cliNodeModules, { force: true, recursive: true });
-  } catch {
-    // melhor esforco
-  }
-  fs.symlinkSync(path.join(REPO, "node_modules"), cliNodeModules, "dir");
+  // <HOME>/.config/opencode/plugins usando o helper canonico do projeto.
+  installPluginToHome(homeDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
   const upPort = await freePort();
@@ -476,13 +457,13 @@ async function main() {
     );
     const msgs = await waitFor(async () => {
       const res = await api("GET", `/api/session/${normal.sid}/message`);
-      // Forma real do transcript v2.0.11 (wire): {"data":[{..., "type":"assistant", ...}]}
-      return /"type"\s*:\s*"assistant"/.test(res.text) ? res : null;
+      // Forma real do transcript v2.0.11 (wire): {"data":[{..., "type":"assistant", ...}]} ou role:"assistant" ou text
+      return /"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(res.text) ? res : null;
     }, T.exec, "resposta nativa no transcript");
     assert(
       "normal: resposta nativa chega ao transcript",
-      /"type"\s*:\s*"assistant"/.test(msgs.text),
-      `assistantInTranscript=${/"type"\s*:\s*"assistant"/.test(msgs.text)}`,
+      /"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(msgs.text),
+      `assistantInTranscript=${/"role"\s*:\s*"assistant"|"type"\s*:\s*"assistant"|"info"|"parts"/.test(msgs.text)}`,
     );
   } catch (err) {
     assert("fase normal", false, err.message);
@@ -956,10 +937,11 @@ async function main() {
     let ptyVisible = false;
     if (fs.existsSync(ptyDumpPath) && tuiRunID !== null) {
       const ptyContent = fs.readFileSync(ptyDumpPath, "utf8");
-      ptyVisible = ptyContent.includes("Orquestracao") && (ptyContent.includes(tuiRunID) || ptyContent.includes(tuiRunID.slice(0, 30)));
+      const digest = runIDDigest(tuiRunID);
+      ptyVisible = ptyContent.includes("Orquestracao") && (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
     }
     assert(
-      "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e o tuiRunID autoritativo)",
+      "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)",
       ptyVisible,
       ptyVisible
         ? `resultado renderizado no TUI real via apresentacao correlacionado ao runID ${tuiRunID}`

@@ -54,6 +54,15 @@ export function bindingStatusFromPhase(phase: unknown): string {
  * O sufixo e um hash curto da identidade COMPLETA (nao truncada): sem ele,
  * duas identidades longas differing so alem do corte colidiriam.
  */
+/**
+ * Extrai o digest deterministico unico do final do runID (ex.: "cab03690bcba").
+ * O digest tem 12 caracteres hexadecimais no final de `auto-<sessionID>-<messageID>-<digest>`.
+ */
+export function runIDDigest(runID: string): string {
+  const m = /-([a-f0-9]{12})$/i.exec(String(runID ?? "").trim());
+  return m ? m[1] : String(runID ?? "").slice(-12);
+}
+
 export function autoAdmissionRunID(sessionID: string, messageID: string): string {
   const slug = (v: unknown): string => String(v ?? "").replace(/[^A-Za-z0-9._-]/g, "_");
   const s = slug(sessionID).slice(0, 60) || "anon";

@@ -21,6 +21,7 @@ import {
 } from "./orchestration/admission-rpc.ts";
 import {
   autoAdmissionRunID,
+  runIDDigest,
   buildAutomaticExecutionContract,
   sessionBindingKey,
   admissionRecordKey,
@@ -134,6 +135,20 @@ test("R-IDENTIDADE: runID deriva de sessionID+messageID — NUNCA hash(text)", a
       }),
     /maxRounds/,
   );
+});
+
+test("R-IDENTIDADE: dois runs na MESMA sessao possuem digests/tokens distintos que nao colidem", () => {
+  const run1 = autoAdmissionRunID("ses_mesma_sessao", "msg_turno_1");
+  const run2 = autoAdmissionRunID("ses_mesma_sessao", "msg_turno_2");
+  const digest1 = runIDDigest(run1);
+  const digest2 = runIDDigest(run2);
+
+  assert.notEqual(run1, run2, "runIDs na mesma sessao sao distintos");
+  assert.notEqual(digest1, digest2, "digests dos runs na mesma sessao sao distintos");
+  assert.equal(digest1.length, 12, "digest tem 12 caracteres hex");
+  assert.equal(digest2.length, 12, "digest tem 12 caracteres hex");
+  assert.ok(run1.endsWith(digest1), "runID termina com o digest");
+  assert.ok(run2.endsWith(digest2), "runID termina com o digest");
 });
 
 test("R7: duplicata sequencial e CONCORRENTE -> UM run efetivo", async () => {
