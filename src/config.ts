@@ -58,9 +58,10 @@ export interface RouterOptions {
 }
 
 export function resolveOptions(raw: Record<string, unknown> = {}): Required<RouterOptions> {
+  const envEndpoint = typeof process !== "undefined" && process.env?.OPJEV_JEV_ENDPOINT ? process.env.OPJEV_JEV_ENDPOINT : undefined;
   return {
     jevModel: (raw.jevModel as string) ?? "jev-1.13-free",
-    jevEndpoint: (raw.jevEndpoint as string) ?? "https://opencode.ai/zen/v1/systemone",
+    jevEndpoint: (raw.jevEndpoint as string) ?? envEndpoint ?? "https://opencode.ai/zen/v1/systemone",
     apiKeyEnv: (raw.apiKeyEnv as string) ?? "OPENCODE_API_KEY",
     confidenceThreshold: (raw.confidenceThreshold as number) ?? 0.55,
     enableAutoRoute: (raw.enableAutoRoute as boolean) ?? true,

@@ -46,7 +46,7 @@ import {
 import { withKeyedLock } from "../lock.ts";
 import { sessionBindingKey } from "./admission.ts";
 
-export const WORKER_TIMEOUT_MS = 60_000;
+export const WORKER_TIMEOUT_MS = Number(process?.env?.OPJEV_WORKER_TIMEOUT_MS) > 0 ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS) : 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
 export const MAX_FINAL_TEXT = 2000;
 
@@ -791,13 +791,13 @@ async function executeSchedule(
         try {
           takenFollowups = await followupsAny.reserve(contract.runID, state.round, {
             sessionID: workerSessionID,
-            checkDelivered: async (rec: any) => {
-              if (!rec?.reservedSessionID) return false;
+            checkDelivered: async (rec: any): Promise<"delivered" | "not-delivered" | "unknown"> => {
+              if (!rec?.reservedSessionID) return "not-delivered";
               try {
                 const ctxMsgs = await deps.runtime.context({ sessionID: rec.reservedSessionID });
-                return JSON.stringify(ctxMsgs).includes(rec.messageID);
+                return JSON.stringify(ctxMsgs).includes(rec.messageID) ? "delivered" : "not-delivered";
               } catch {
-                return false;
+                return "unknown"; // fail-closed!
               }
             },
           });

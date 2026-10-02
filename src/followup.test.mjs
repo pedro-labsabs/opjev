@@ -12,12 +12,14 @@ import {
   FOLLOWUP_LIMITS,
   followupKey,
   followupIndexKey,
+  followupRevisionKey,
   buildFollowupRecord,
   normalizeFollowupRecord,
   readFollowupIndex,
   formatFollowupsSection,
   createFollowupTakeSeam,
   closeFollowupsForRun,
+  getInputFrontier,
 } from "./orchestration/followup.ts";
 
 function fakeStorage(seed = {}) {
@@ -150,7 +152,111 @@ test("F6: take concorrente serializa por run — soma dos consumos = pendentes (
   assert.equal(all.length, ids.length, "todos os pendentes consumidos exatamente uma vez");
 });
 
+test("F6b [RESERVED CRASH RECOVERY]: crash apos reserve deixa record reserved -> reconcilia deterministicamente sem perder F nem autorizar redelivery ambigua", async () => {
+  let currentTime = 100;
+  const store = fakeStorage();
+  const seam = createFollowupTakeSeam({ storage: store, now: () => currentTime, leaseMs: 5000 });
+
+  await store.set(followupKey(R, "msg_crash"), buildFollowupRecord({ sessionID: "s", messageID: "msg_crash", runID: R, text: "t_crash", at: 1 }));
+  await store.set(followupIndexKey(R), ["msg_crash"]);
+
+  // 1. Processo reserva F para rodada 1
+  const reserved = await seam.reserve(R, 1, { sessionID: "worker_dead" });
+  assert.equal(reserved.length, 1);
+  assert.equal(reserved[0].messageID, "msg_crash");
+
+  const recReserved = normalizeFollowupRecord(await store.get(followupKey(R, "msg_crash")));
+  assert.equal(recReserved.state, "reserved");
+
+  // Input frontier conta reserved como pendente (fail-closed, nunca ignora trabalho pendente)
+  const frontierBefore = await seam.getFrontier(R);
+  assert.equal(frontierBefore.pendingCount, 1);
+
+  // 2. Simula crash: nenhum prompt aconteceu, lease expira
+  currentTime += 10000;
+
+  // 3. Proxima rodada (rodada 2) com outro worker: reconcile ou reserve re-adquire o item stale apos comprovado not-delivered
+  const checkDeliveryNotDelivered = async () => "not-delivered";
+  const recon = await seam.reconcile(R, 2, { checkDelivered: checkDeliveryNotDelivered });
+  assert.deepEqual(recon.reconciled, ["msg_crash"]);
+
+  const recReconciled = normalizeFollowupRecord(await store.get(followupKey(R, "msg_crash")));
+  assert.equal(recReconciled.state, "pending", "item stale sem entrega reverte para pending");
+
+  // 4. Nova reserva na rodada 2 tem sucesso
+  const reReserved = await seam.reserve(R, 2, { sessionID: "worker_alive" });
+  assert.equal(reReserved.length, 1);
+  assert.equal(reReserved[0].messageID, "msg_crash");
+
+  // 5. Teste de fail-closed: se checkDelivery for "unknown", NUNCA reverte nem re-reserva
+  currentTime += 10000;
+  const checkDeliveryUnknown = async () => "unknown";
+  const reconAmbiguous = await seam.reconcile(R, 3, { checkDelivered: checkDeliveryUnknown });
+  assert.deepEqual(reconAmbiguous.reconciled, [], "sob ambiguidade, reconcile nao toca no estado");
+});
+
+test("F6c [P1.4 RESERVED RECOVERY SUITE]: cobre crash pre-prompt, prompt failure, prompt sucesso + crash pre-confirm, confirm failure e restart/retry", async () => {
+  let currentTime = 1000;
+  const store = fakeStorage();
+  const seam = createFollowupTakeSeam({ storage: store, now: () => currentTime, leaseMs: 5000 });
+
+  // 1. Crash apos reserve antes de runtime.prompt:
+  await store.set(followupKey(R, "msg_pre_prompt"), buildFollowupRecord({ sessionID: "s", messageID: "msg_pre_prompt", runID: R, text: "t1", at: 1 }));
+  await store.set(followupIndexKey(R), ["msg_pre_prompt"]);
+  const res1 = await seam.reserve(R, 1, { sessionID: "worker_1" });
+  assert.equal(res1.length, 1);
+  // Simula crash antes do prompt: nenhum prompt enviado. Lease expira.
+  currentTime += 10000;
+  // Reconcile com checkDelivered confirmando que nao foi entregue reverte para pending
+  const rec1 = await seam.reconcile(R, 2, { checkDelivered: async () => "not-delivered" });
+  assert.deepEqual(rec1.reconciled, ["msg_pre_prompt"]);
+  assert.equal((await store.get(followupKey(R, "msg_pre_prompt"))).state, "pending");
+
+  // 2. Runtime.prompt falha (erro de rede/timeout antes do worker processar):
+  const res2 = await seam.reserve(R, 2, { sessionID: "worker_2" });
+  assert.equal(res2.length, 1);
+  // prompt falhou -> revertFollowupConsumption chamado
+  const { revertFollowupConsumption } = await import("./orchestration/followup.ts");
+  await revertFollowupConsumption({ storage: store }, R, res2);
+  assert.equal((await store.get(followupKey(R, "msg_pre_prompt"))).state, "pending");
+
+  // 3. Runtime.prompt sucesso + crash antes de confirm:
+  // Prompt tem sucesso -> markDelivered registra deliveredAt
+  const res3 = await seam.reserve(R, 2, { sessionID: "worker_3" });
+  await seam.markDelivered(R, res3, 2, "worker_3");
+  // Crash acontece antes do confirm(): record continua reserved mas com deliveredAt gravado
+  const recDelivered = await store.get(followupKey(R, "msg_pre_prompt"));
+  assert.equal(recDelivered.state, "reserved");
+  assert.ok(recDelivered.deliveredAt !== undefined);
+  // Reconcile/restart apos crash detecta deliveredAt ou checkDelivered e confirma como consumed sem redelivery
+  currentTime += 10000;
+  const rec3 = await seam.reconcile(R, 3, { checkDelivered: async () => "delivered" });
+  assert.deepEqual(rec3.confirmed, ["msg_pre_prompt"]);
+  const finalRec3 = await store.get(followupKey(R, "msg_pre_prompt"));
+  assert.equal(finalRec3.state, "consumed");
+
+  // 4. Confirm storage failure: prompt teve sucesso, markDelivered gravado, confirm falha com erro de storage
+  await store.set(followupKey(R, "msg_confirm_fail"), buildFollowupRecord({ sessionID: "s", messageID: "msg_confirm_fail", runID: R, text: "t2", at: 1 }));
+  await store.set(followupIndexKey(R), ["msg_pre_prompt", "msg_confirm_fail"]);
+  const res4 = await seam.reserve(R, 3, { sessionID: "worker_4" });
+  await seam.markDelivered(R, res4, 3, "worker_4");
+  // Na falha do confirm, o dispatcher NAO reverte para pending porque deliveredAt esta presente
+  await revertFollowupConsumption({ storage: store }, R, res4);
+  const recAfterRevertAttempt = await store.get(followupKey(R, "msg_confirm_fail"));
+  assert.notEqual(recAfterRevertAttempt.state, "pending", "nunca reverte para pending apos entrega confirmada");
+  // No restart/retry, reconcile confirma como consumed
+  const rec4 = await seam.reconcile(R, 4, { checkDelivered: async () => "delivered" });
+  assert.deepEqual(rec4.confirmed, ["msg_confirm_fail"]);
+  assert.equal((await store.get(followupKey(R, "msg_confirm_fail"))).state, "consumed");
+
+  // 5. Restart/retry com reserved existente:
+  // Novo reserve no run nunca devolve itens ja consumidos
+  const resEmpty = await seam.reserve(R, 5);
+  assert.equal(resEmpty.length, 0, "zero redelivery de follow-ups consumidos");
+});
+
 test("F7: closeFollowupsForRun — contabiliza consumidos e fecha pendentes como unconsumed", async () => {
+
   const store = fakeStorage();
   const take = createFollowupTakeSeam({ storage: store, now: () => 1 });
   await store.set(followupKey(R, "msg_1"), buildFollowupRecord({ sessionID: "s", messageID: "msg_1", runID: R, text: "t", at: 1 }));
@@ -174,6 +280,40 @@ test("F7: closeFollowupsForRun — contabiliza consumidos e fecha pendentes como
   assert.equal(rec2b.consumedAt, 42, "nunca re-carimba");
 });
 
+test("F7b: closeFollowupsForRun — follow-up com deliveredAt NUNCA fecha como unconsumed (reconcilia honestamente como consumed)", async () => {
+  const store = fakeStorage();
+  // msg_deliv foi entregue (deliveredAt presente, estado reserved)
+  await store.set(
+    followupKey(R, "msg_deliv"),
+    {
+      ...buildFollowupRecord({ sessionID: "s", messageID: "msg_deliv", runID: R, text: "t", at: 1 }),
+      state: "reserved",
+      deliveredAt: 10,
+      reservedRound: 1,
+    },
+  );
+  // msg_pending continua puramente pending
+  await store.set(
+    followupKey(R, "msg_pending"),
+    buildFollowupRecord({ sessionID: "s", messageID: "msg_pending", runID: R, text: "t", at: 2 }),
+  );
+  await store.set(followupIndexKey(R), ["msg_deliv", "msg_pending"]);
+
+  const counts = await closeFollowupsForRun({ storage: store, now: () => 50 }, R);
+  // msg_deliv virou consumed (+1), msg_pending virou unconsumed (+1)
+  assert.deepEqual(counts, { consumed: 1, pending: 1 });
+
+  const recDeliv = normalizeFollowupRecord(await store.get(followupKey(R, "msg_deliv")));
+  assert.equal(recDeliv.state, "consumed", "item entregue deve fechar como consumed, nunca unconsumed");
+  assert.equal(recDeliv.consumedRound, 1);
+  assert.equal(recDeliv.consumedBoundary, "round-1-worker-prompt");
+  assert.equal(recDeliv.consumedAt, 50);
+
+  const recPend = normalizeFollowupRecord(await store.get(followupKey(R, "msg_pending")));
+  assert.equal(recPend.state, "unconsumed");
+  assert.equal(recPend.consumedBoundary, "run-finished-without-consumption");
+});
+
 test("F8: formatFollowupsSection — bounded, com messageID e texto; vazio => string vazia", () => {
   const items = [
     { messageID: "msg_1", text: "também rode o teste Y" },
@@ -185,4 +325,54 @@ test("F8: formatFollowupsSection — bounded, com messageID e texto; vazio => st
   assert.ok(section.includes("também rode o teste Y"), "texto preservado");
   assert.ok(section.length < 6000, `secao bounded (${section.length})`);
   assert.equal(formatFollowupsSection([], 2), "");
+});
+
+test("F9 [P1.2 FAIL-CLOSED FRONTIER]: erros de leitura em index, revision ou record propagam e NUNCA viram pendingCount=0", async () => {
+  // 1. Falha de leitura em followup index read
+  const store1 = fakeStorage();
+  await store1.set(followupIndexKey(R), ["msg_1"]);
+  const failingIndexStore = {
+    async get(key) {
+      if (key === followupIndexKey(R)) throw new Error("storage disk error: index read");
+      return store1.get(key);
+    },
+    async set(key, value) { return store1.set(key, value); },
+  };
+  await assert.rejects(
+    () => getInputFrontier({ storage: failingIndexStore }, R),
+    (err) => err.message.includes("index read"),
+    "index read error DEVE propagar e nunca virar pendingCount=0",
+  );
+
+  // 2. Falha de leitura em followup revision read
+  const store2 = fakeStorage();
+  await store2.set(followupIndexKey(R), ["msg_1"]);
+  const failingRevStore = {
+    async get(key) {
+      if (key === followupRevisionKey(R)) throw new Error("storage disk error: revision read");
+      return store2.get(key);
+    },
+    async set(key, value) { return store2.set(key, value); },
+  };
+  await assert.rejects(
+    () => getInputFrontier({ storage: failingRevStore }, R),
+    (err) => err.message.includes("revision read"),
+    "revision read error DEVE propagar e nunca virar pendingCount=0",
+  );
+
+  // 3. Falha de leitura em followup record read
+  const store3 = fakeStorage();
+  await store3.set(followupIndexKey(R), ["msg_1"]);
+  const failingRecordStore = {
+    async get(key) {
+      if (key === followupKey(R, "msg_1")) throw new Error("storage disk error: record read");
+      return store3.get(key);
+    },
+    async set(key, value) { return store3.set(key, value); },
+  };
+  await assert.rejects(
+    () => getInputFrontier({ storage: failingRecordStore }, R),
+    (err) => err.message.includes("record read"),
+    "record read error DEVE propagar e nunca virar pendingCount=0",
+  );
 });

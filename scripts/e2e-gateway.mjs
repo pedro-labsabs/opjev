@@ -19,6 +19,7 @@
 // $E2E_ROOT/runs/<ts>/ (logs, JSONL do sniffer, dump do PTY, resultado JSON).
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -265,6 +266,10 @@ function readPluginKv(homeDir) {
     const db = new DatabaseSync(dbPath, { readOnly: true });
     const rows = db.prepare("SELECT key, value FROM kv WHERE key LIKE '%orchestration%'").all();
     db.close();
+    // Cada record e indexado UMA VEZ pela sua chave completa (`m[0]`, que
+    // sempre comeca em "orchestration/"). Indexar tambem pelo prefixo
+    // duplicaria o mesmo record e as contagens por provenance (1 record por F)
+    // deixariam de valer.
     const out = { followups: new Map(), bindings: new Map(), records: new Map(), runs: new Map() };
     for (const row of rows) {
       const m = /orchestration\/(followup|followup-index|session|admission|run)\/(.+)$/.exec(row.key);
@@ -276,13 +281,13 @@ function readPluginKv(homeDir) {
         value = row.value;
       }
       if (m[1] === "followup") {
-        out.followups.set(row.key, value);
+        out.followups.set(m[0], value);
       } else if (m[1] === "session") {
-        out.bindings.set(row.key, value);
+        out.bindings.set(m[0], value);
       } else if (m[1] === "admission") {
-        out.records.set(row.key, value);
+        out.records.set(m[0], value);
       } else if (m[1] === "run") {
-        out.runs.set(row.key, value);
+        out.runs.set(m[0], value);
       }
     }
     return out;
@@ -311,7 +316,75 @@ async function main() {
   const tuiCanaryPath = path.join(RUN_DIR, "tui-notice.canary");
   const resultPath = path.join(RUN_DIR, "e2e-result.json");
 
-  fs.copyFileSync(path.join(REPO, "opencode.jsonc.example"), path.join(projectDir, "opencode.json"));
+  // Jev SystemOne deterministico local para o E2E:
+  // Jev responde as perguntas de roteamento e as perguntas de julgamento de rodada
+  // com total fidelidade ao contrato arquitetural (#13):
+  // se pendingFollowupsCount > 0 -> done=false, next_action="repair-same"
+  // se pendingFollowupsCount === 0 -> done=true, next_action="accept"
+  const jevCalls = [];
+  const jevServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const body = tryParse(raw);
+      jevCalls.push({ path: req.url, body });
+      const q = body?.questions ?? {};
+      const st = body?.state ?? {};
+      const answers = {};
+
+      // 1. Perguntas de roteamento (router / auto-route)
+      if (q.route) answers.route = { type: "choice", choice: "fast-coding", confidence: 0.95 };
+      if (q.agent) answers.agent = { type: "choice", choice: "build" };
+      if (q.model) answers.model = { type: "choice", choice: "opencode/nemotron-3.5-lightning-free" };
+      if (q.is_risky) answers.is_risky = { type: "noul", noul: 0 };
+      if (q.complexity) answers.complexity = { type: "score", score: 0 };
+
+      // 2. Perguntas de julgamento de rodada (round judgement)
+      // O Jev e autoridade exclusiva do julgamento:
+      // Se ha follow-ups pendentes no frontier bounded recebido pelo Jev,
+      // ele autoriza reparacao pelo mesmo executor ("repair-same") para consumir F.
+      // Se nao ha follow-ups pendentes, ele autoriza aceitacao ("accept").
+      if (q.done && q.next_action) {
+        const hasPending = typeof st.pendingFollowupsCount === "number" && st.pendingFollowupsCount > 0;
+        if (hasPending) {
+          answers.done = { type: "noul", noul: 0 };
+          answers.failure_class = { type: "choice", choice: "implementation" };
+          answers.same_executor_can_repair = { type: "noul", noul: 1 };
+          answers.next_action = { type: "choice", choice: "repair-same", confidence: 0.95 };
+        } else {
+          answers.done = { type: "noul", noul: 1 };
+          answers.failure_class = { type: "choice", choice: "none" };
+          answers.same_executor_can_repair = { type: "noul", noul: 1 };
+          answers.next_action = { type: "choice", choice: "accept", confidence: 0.95 };
+        }
+      }
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ model: "jev-1.13-free", answers }));
+    });
+  });
+  await new Promise((resolve) => jevServer.listen(0, "127.0.0.1", resolve));
+  const jevPort = jevServer.address().port;
+  log(`Jev SystemOne mock deterministico em :${jevPort}`);
+
+  const opencodeConfig = {
+    $schema: "https://opencode.ai/config.json",
+    plugins: [
+      {
+        package: "./plugins/opencode-jev-free-router",
+        options: {
+          jevModel: "jev-1.13-free",
+          jevEndpoint: `http://127.0.0.1:${jevPort}/v1/systemone`,
+          apiKeyEnv: "OPENCODE_API_KEY",
+          confidenceThreshold: 0.55,
+          enableAutoRoute: true,
+          jevTimeoutMs: 15000,
+        },
+      },
+    ],
+  };
+  fs.writeFileSync(path.join(projectDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
   installServerPluginToProject(projectDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
@@ -319,6 +392,8 @@ async function main() {
   const upstreamEnv = {
     PATH: process.env.PATH ?? "",
     HOME: homeDir,
+    OPJEV_JEV_ENDPOINT: `http://127.0.0.1:${jevPort}/v1/systemone`,
+    OPJEV_WORKER_TIMEOUT_MS: process.env.OPJEV_WORKER_TIMEOUT_MS ?? "120000",
     ...(process.env.OPENCODE_API_KEY ? { OPENCODE_API_KEY: process.env.OPENCODE_API_KEY } : {}),
   };
   log(`subindo upstream v2.0.11 em :${upPort} (HOME ${homeDir})`);
@@ -643,6 +718,15 @@ async function main() {
       20000,
       "admitted x2",
     );
+    // A admissao e durable antes do RPC ao upstream: `admitted x2` NAO implica
+    // que o resultado do orchestrate ja voltou. Aguarda (bounded) a resposta
+    // do primeiro orchestrate antes de julgar a contagem de dispatch — sem
+    // isso a assercao mede a latencia do RPC, nao a idempotencia.
+    await waitFor(
+      () => since(mark).filter((e) => e.type === "rpc-dispatched").length >= 1,
+      T.dispatch,
+      "rpc-dispatched do run da duplicata",
+    );
     const runIds = since(mark).filter((e) => e.type === "admitted").map((e) => e.runID);
     const dispatched = since(mark).filter((e) => e.type === "rpc-dispatched");
     assert(
@@ -683,7 +767,7 @@ async function main() {
     const sidA = parseDataId(sa.text);
     const sidB = parseDataId(sb.text);
     if (!sidA || !sidB) throw new Error("criacao de sessoes falhou");
-    const text = "ORCH: mesmo texto nas duas sessoes";
+    const text = "ORCH: responda apenas com a palavra PRONTO (duas sessoes)";
     const [ra, rb] = await Promise.all([
       api("POST", `/api/session/${sidA}/prompt`, { text, id: "msg_e2esame000000A1" }),
       api("POST", `/api/session/${sidB}/prompt`, { text, id: "msg_e2esame000000B1" }),
@@ -764,7 +848,7 @@ async function main() {
     if (fu.sid2 === null) throw new Error("criacao da sessao 2 falhou");
     const rb = await api("POST", `/api/session/${fu.sid2}/prompt`, {
       id: "msg_e2efollowB00001",
-      text: "ORCH: tarefa da segunda sessao",
+      text: "ORCH: responda apenas com a palavra PRONTO (segunda sessao)",
     });
     assert("follow-up: sessao 2 turno 200", rb.status === 200, `status=${rb.status}`);
     await waitFor(() => since(mark2).some((e) => e.type === "rpc-dispatched"), T.dispatch, "dispatch do run B");
@@ -806,7 +890,7 @@ async function main() {
     // attach do follow-up, que usa o mesmo prefixo "Orquestracao <runA>"), e
     // entao um novo prompt (ID distinto) cria um NOVO run.
     const terminalRe = new RegExp(
-      `Orquestracao ${fu.runA.slice(0, 40)}[^\\n]*(?:fase (?:completed|failed|stopped)|falha)`,
+      `Orquestracao ${fu.runA.slice(0, 40)}[^\\n]*(?:fase (?:completed|failed|stopped|awaiting-human)|falha)`,
     );
     await waitFor(
       async () => {
@@ -815,6 +899,18 @@ async function main() {
       },
       T.notice,
       "notice do run A (terminal)",
+    );
+
+    const terminalReB = new RegExp(
+      `Orquestracao ${fu.runB.slice(0, 40)}[^\\n]*(?:fase (?:completed|failed|stopped|awaiting-human)|falha)`,
+    );
+    await waitFor(
+      async () => {
+        const res = await api("GET", `/api/session/${fu.sid2}/inbox`);
+        return terminalReB.test(res.text) ? res : null;
+      },
+      T.notice,
+      "notice do run B (terminal)",
     );
 
     // Evidencia CRUA do storage do plugin: provenance completa dos dois
@@ -897,9 +993,9 @@ async function main() {
     });
     assert("route: prompt 200", r.status === 200, `status=${r.status}`);
     await waitFor(
-      () => since(mark).some((e) => e.type === "intercept" && e.mode === "route"),
+      () => since(mark).some((e) => e.type === "route" || e.type === "route-fallback"),
       15000,
-      "intercept mode=route",
+      "route decision event",
     );
     const applied = since(mark).filter((e) => e.type === "route").length;
     const fallback = since(mark).filter((e) => e.type === "route-fallback").length;
@@ -1209,11 +1305,14 @@ async function main() {
         String(e.path).includes("/api/rpc/opjev.admission.v1/orchestrate") &&
         !String(e.body ?? "").includes('"input":{}'),
     );
-    const gwRpc = gwCount("rpc-dispatched");
+    const gwOrchCalls =
+      gwCount("rpc-dispatched") +
+      gwCount("rpc-followup-attached") +
+      gwCount("rpc-duplicate-ignored");
     assert(
-      "wire: dispatches RPC no sniffer == dispatches do gateway (RPC=1 por run)",
-      wireRpc === gwRpc,
-      `wire=${wireRpc} gw=${gwRpc}`,
+      "wire: chamadas de orchestrate no sniffer == chamadas de orchestrate do gateway (dispatched + attached + dup)",
+      wireRpc === gwOrchCalls,
+      `wire=${wireRpc} gw=${gwOrchCalls} (dispatched=${gwCount("rpc-dispatched")} attached=${gwCount("rpc-followup-attached")} dup=${gwCount("rpc-duplicate-ignored")})`,
     );
     const resumeFalse = sniffCount(
       (e) => e.dir === "req" && String(e.body ?? "").includes('"resume":false'),
@@ -1313,6 +1412,12 @@ async function main() {
   for (const r of requiredFails) log(`FALHOU: ${r.name} — ${r.detail}`);
 
   killAll();
+  try {
+    jevServer.closeAllConnections?.();
+    jevServer.close();
+  } catch {
+    // ja fechado
+  }
   await sleep(1500);
   for (const rec of children) {
     if (!rec.exited) {

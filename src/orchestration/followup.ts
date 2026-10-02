@@ -139,23 +139,26 @@ export function normalizeFollowupRecord(raw: unknown): FollowupRecord {
     state: r.state as FollowupState,
     at: r.at,
   };
+  // Comprovante de entrega e METADATA DE PROVENIENCE, nao estado: o mesmo
+  // recibo (reservedAt/reservedRound/reservedSessionID/deliveredAt) e preservado
+  // em TODOS os estados. Sem isso, normalizar um record consumed apagaria a
+  // prova de que o worker realmente recebeu o input — e a evidencia mentiria.
+  const reservedAt = typeof r.reservedAt === "number" && Number.isFinite(r.reservedAt) ? r.reservedAt : undefined;
+  const reservedRound =
+    typeof r.reservedRound === "number" && Number.isInteger(r.reservedRound) ? r.reservedRound : undefined;
+  const reservedSessionID =
+    typeof r.reservedSessionID === "string" && r.reservedSessionID.trim().length > 0
+      ? r.reservedSessionID.trim()
+      : undefined;
+  const deliveredAt = typeof r.deliveredAt === "number" && Number.isFinite(r.deliveredAt) ? r.deliveredAt : undefined;
+  const receipt = {
+    ...(reservedAt !== undefined ? { reservedAt } : {}),
+    ...(reservedRound !== undefined ? { reservedRound } : {}),
+    ...(reservedSessionID !== undefined ? { reservedSessionID } : {}),
+    ...(deliveredAt !== undefined ? { deliveredAt } : {}),
+  };
   if (base.state === "reserved") {
-    const reservedAt = typeof r.reservedAt === "number" && Number.isFinite(r.reservedAt) ? r.reservedAt : undefined;
-    const reservedRound =
-      typeof r.reservedRound === "number" && Number.isInteger(r.reservedRound) ? r.reservedRound : undefined;
-    const reservedSessionID =
-      typeof r.reservedSessionID === "string" && r.reservedSessionID.trim().length > 0
-        ? r.reservedSessionID.trim()
-        : undefined;
-    const deliveredAt =
-      typeof r.deliveredAt === "number" && Number.isFinite(r.deliveredAt) ? r.deliveredAt : undefined;
-    return {
-      ...base,
-      ...(reservedAt !== undefined ? { reservedAt } : {}),
-      ...(reservedRound !== undefined ? { reservedRound } : {}),
-      ...(reservedSessionID !== undefined ? { reservedSessionID } : {}),
-      ...(deliveredAt !== undefined ? { deliveredAt } : {}),
-    };
+    return { ...base, ...receipt };
   }
   if (base.state !== "pending") {
     if (typeof r.consumedAt !== "number" || !Number.isFinite(r.consumedAt)) fail("consumedAt obrigatorio fora de pending");
@@ -168,6 +171,7 @@ export function normalizeFollowupRecord(raw: unknown): FollowupRecord {
       typeof r.consumedRound === "number" && Number.isInteger(r.consumedRound) ? r.consumedRound : undefined;
     return {
       ...base,
+      ...receipt,
       consumedAt,
       consumedBoundary: truncateText(consumedBoundary, 120),
       ...(consumedRound !== undefined ? { consumedRound } : {}),
@@ -261,6 +265,8 @@ export async function getInputFrontier(
   });
 }
 
+export type DeliveryCheckResult = "delivered" | "not-delivered" | "unknown";
+
 export interface FollowupTakeSeam {
   (runID: string, round: number): Promise<PendingFollowup[]>;
   reserve(
@@ -269,7 +275,7 @@ export interface FollowupTakeSeam {
     options?: {
       leaseMs?: number;
       sessionID?: string;
-      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+      checkDelivered?: (item: FollowupRecord) => Promise<DeliveryCheckResult | boolean>;
     },
   ): Promise<PendingFollowup[]>;
   confirm(runID: string, items: PendingFollowup[], round: number): Promise<void>;
@@ -279,7 +285,7 @@ export interface FollowupTakeSeam {
     currentRound?: number,
     options?: {
       leaseMs?: number;
-      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+      checkDelivered?: (item: FollowupRecord) => Promise<DeliveryCheckResult | boolean>;
     },
   ): Promise<{ reconciled: string[]; confirmed?: string[] }>;
   getFrontier(runID: string): Promise<InputFrontier>;
@@ -308,7 +314,7 @@ export function createFollowupTakeSeam(deps: {
     options?: {
       leaseMs?: number;
       sessionID?: string;
-      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+      checkDelivered?: (item: FollowupRecord) => Promise<DeliveryCheckResult | boolean>;
     },
   ): Promise<PendingFollowup[]> => {
     const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
@@ -333,13 +339,23 @@ export function createFollowupTakeSeam(deps: {
 
         // Se está reserved: verificar se já foi entregue (deliveredAt ou checkDelivered)
         if (rec.state === "reserved") {
-          let alreadyDelivered = rec.deliveredAt !== undefined;
-          if (!alreadyDelivered && options?.checkDelivered) {
+          let deliveryStatus: DeliveryCheckResult = rec.deliveredAt !== undefined ? "delivered" : "not-delivered";
+          if (deliveryStatus !== "delivered" && options?.checkDelivered) {
             try {
-              alreadyDelivered = await options.checkDelivered(rec);
-            } catch {}
+              const res = await options.checkDelivered(rec);
+              if (res === "delivered" || res === true) {
+                deliveryStatus = "delivered";
+              } else if (res === "unknown") {
+                deliveryStatus = "unknown";
+              } else {
+                deliveryStatus = "not-delivered";
+              }
+            } catch {
+              // fail-closed: erro na verificação => unknown (NUNCA assume not-delivered)
+              deliveryStatus = "unknown";
+            }
           }
-          if (alreadyDelivered) {
+          if (deliveryStatus === "delivered") {
             // Já entregue ao worker: confirma como consumed diretamente e NÃO re-reserva nem re-entrega!
             await deps.storage.set(followupKey(safeRunID, messageID), {
               ...rec,
@@ -351,7 +367,12 @@ export function createFollowupTakeSeam(deps: {
             continue;
           }
 
-          // Elegivel para reserva se ficou reserved em crash/falha anterior sem entrega
+          if (deliveryStatus === "unknown") {
+            // fail-closed: estado de entrega ambíguo — NUNCA autoriza redelivery nem revert
+            continue;
+          }
+
+          // Elegivel para reserva apenas se comprovadamente "not-delivered" e lease expirou
           const isStaleReserved =
             rec.reservedRound === undefined ||
             rec.reservedRound < round ||
@@ -449,7 +470,7 @@ export function createFollowupTakeSeam(deps: {
     currentRound?: number,
     options?: {
       leaseMs?: number;
-      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+      checkDelivered?: (item: FollowupRecord) => Promise<DeliveryCheckResult | boolean>;
     },
   ): Promise<{ reconciled: string[]; confirmed?: string[] }> => {
     const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
@@ -464,13 +485,22 @@ export function createFollowupTakeSeam(deps: {
         if (raw === undefined) continue;
         const rec = normalizeFollowupRecord(raw);
         if (rec.state === "reserved") {
-          let alreadyDelivered = rec.deliveredAt !== undefined;
-          if (!alreadyDelivered && options?.checkDelivered) {
+          let deliveryStatus: DeliveryCheckResult = rec.deliveredAt !== undefined ? "delivered" : "not-delivered";
+          if (deliveryStatus !== "delivered" && options?.checkDelivered) {
             try {
-              alreadyDelivered = await options.checkDelivered(rec);
-            } catch {}
+              const res = await options.checkDelivered(rec);
+              if (res === "delivered" || res === true) {
+                deliveryStatus = "delivered";
+              } else if (res === "unknown") {
+                deliveryStatus = "unknown";
+              } else {
+                deliveryStatus = "not-delivered";
+              }
+            } catch {
+              deliveryStatus = "unknown";
+            }
           }
-          if (alreadyDelivered) {
+          if (deliveryStatus === "delivered") {
             await deps.storage.set(followupKey(safeRunID, messageID), {
               ...rec,
               state: "consumed",
@@ -481,6 +511,12 @@ export function createFollowupTakeSeam(deps: {
             confirmed.push(messageID);
             continue;
           }
+
+          if (deliveryStatus === "unknown") {
+            // fail-closed: não reverte para pending sob ambiguidade
+            continue;
+          }
+
           const isStale =
             currentRound === undefined ||
             rec.reservedRound === undefined ||
@@ -649,6 +685,19 @@ export async function closeFollowupsForRun(
       }
       if (rec.state === "unconsumed") {
         pending += 1;
+        continue;
+      }
+      // Follow-up que foi entregue ao worker (deliveredAt presente) NUNCA pode ser
+      // fechado como unconsumed: reconcilia honestamente como consumed.
+      if (rec.deliveredAt !== undefined) {
+        await deps.storage.set(followupKey(safeRunID, messageID), {
+          ...rec,
+          state: "consumed",
+          consumedAt: now(),
+          consumedBoundary: `round-${rec.reservedRound ?? 1}-worker-prompt`,
+          consumedRound: rec.reservedRound ?? 1,
+        });
+        consumed += 1;
         continue;
       }
       await deps.storage.set(followupKey(safeRunID, messageID), {

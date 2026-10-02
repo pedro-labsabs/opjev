@@ -58,10 +58,11 @@ export function buildRoundJudgementQuestions(): RoundJudgementQuestions {
   return {
     done: {
       type: "noul",
-      instructions: "Round complete: are ALL acceptance criteria satisfied by the produced evidence?",
+      instructions:
+        "Round complete: are ALL acceptance criteria satisfied by the produced evidence, AND are there ZERO pending user follow-ups waiting to be processed?",
       criteria: {
-        true: "Objective achieved; accept and finish",
-        false: "Objective not achieved; more work is needed",
+        true: "Objective achieved and zero pending follow-ups; accept and finish",
+        false: "Objective not achieved or pending follow-ups must be consumed in next round; more work is needed",
       },
     },
     failure_class: {
@@ -92,7 +93,8 @@ export function buildRoundJudgementQuestions(): RoundJudgementQuestions {
       instructions:
         "Which action must the scheduler take next? The scheduler applies this decision; models/agents are selected separately, never here.",
       criteria: {
-        accept: "Accept the result; the objective is complete (requires done=true)",
+        accept:
+          "Accept the result; the objective is complete and there are ZERO pending user follow-ups (requires done=true and pendingFollowupsCount=0)",
         "repair-same": "The SAME session/executor receives a correction contract and keeps going",
         "fresh-same": "Start a CLEAN new session, same agent/model (context contamination suspected)",
         "switch-model": "Same role/task, but a different model (current model is stuck/incapable)",

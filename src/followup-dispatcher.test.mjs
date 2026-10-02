@@ -12,6 +12,7 @@ import { runOrchestrationOnce, buildWorkerPrompt } from "./orchestration/dispatc
 import {
   followupKey,
   followupIndexKey,
+  followupRevisionKey,
   normalizeFollowupRecord,
   buildFollowupRecord,
   createFollowupTakeSeam,
@@ -609,6 +610,36 @@ test("D14 [FAIL-CLOSED]: erro de leitura no storage do frontier nunca vira pendi
   assert.ok(res.error?.includes("storage indisponivel"), "diagnostico de erro de storage presente");
 });
 
+test("D14b [FAIL-CLOSED GRANULAR]: falhas individuais em index read, revision read ou record read impedem completed e falham bounded", async () => {
+  const readTargets = [
+    { name: "index read", match: (k, id) => k === followupIndexKey(id) },
+    { name: "revision read", match: (k, id) => k === followupRevisionKey(id) },
+    { name: "record read", match: (k, id) => k === followupKey(id, "msg_p12") },
+  ];
+
+  for (const target of readTargets) {
+    const c = contract({ maxRounds: 2 });
+    const { deps, store } = fakeDeps({}, {});
+    await seedFollowup(store, c.runID, "msg_p12", "texto p12");
+    const storage = {
+      get: async (k) => {
+        if (target.match(k, c.runID)) {
+          throw new Error(`erro injetado de leitura: ${target.name}`);
+        }
+        return store.get(k);
+      },
+      set: async (k, v) => store.set(k, v),
+    };
+    deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+    deps.storage = storage;
+
+    const res = await runOrchestrationOnce(c, deps);
+    assert.equal(res.phase, "failed", `falha em ${target.name} DEVE falhar o run bounded e nunca virar completed`);
+    assert.ok(res.error?.includes(target.name), `diagnostico de ${target.name} presente`);
+  }
+});
+
+
 test("D15 [FAULT INJECTION / TERMINAL WRITE]: falha de storage ao gravar sessionBindingKey no commit terminal falha bounded e previne attach zumbi", async () => {
   const c = contract({ maxRounds: 2 });
   c.sessionID = "ses_D15";
@@ -649,4 +680,200 @@ test("D15 [FAULT INJECTION / TERMINAL WRITE]: falha de storage ao gravar session
     objective: "instrucao para run zumbi",
   });
   assert.notEqual(attachAttempt.status, "followup-attached", "nunca anexa a run cujo commit terminal falhou");
+});
+
+test("D16 [FAIL-CLOSED TRI-STATE]: erro transiente em runtime.context produz 'unknown' e NUNCA autoriza redelivery; retry bem-sucedido converge para consumed", async () => {
+  const c = contract({ maxRounds: 2 });
+  const { deps, store, promptCalls } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  await seedFollowup(storage, c.runID, "msg_D16", "instrucao D16");
+
+  // Simula crash após prompt ter sido recebido pelo worker mas antes do confirm/markDelivered
+  // Nesse cenário, o record ficou 'reserved' com lease expirado e sem deliveredAt gravado
+  const key = followupKey(c.runID, "msg_D16");
+  await storage.set(key, {
+    ...normalizeFollowupRecord(store.get(key)),
+    state: "reserved",
+    reservedAt: 1000,
+    reservedRound: 1,
+    reservedSessionID: "ses_worker_D16",
+  });
+
+  const seam = createFollowupTakeSeam({ storage, now: () => 100000 }); // lease expirado
+
+  // 1. runtime.context lanca erro transiente (timeout/rede) => checkDelivered retorna "unknown"
+  let contextShouldFail = true;
+  const mockCheckDelivered = async (rec) => {
+    if (!rec?.reservedSessionID) return "not-delivered";
+    if (contextShouldFail) {
+      throw new Error("timeout/rede no runtime.context"); // fail-closed!
+    }
+    return "delivered";
+  };
+
+  // Reconcile chamado sob erro transiente: NUNCA deve reverter para pending nem confirmar
+  const recResFail = await seam.reconcile(c.runID, 2, { leaseMs: 1000, checkDelivered: mockCheckDelivered });
+  assert.equal(recResFail.reconciled.length, 0, "nunca reverte para pending sob erro/ambiguidade");
+  assert.equal(recResFail.confirmed?.length ?? 0, 0);
+
+  // Reserve chamado sob erro transiente: NUNCA deve reservar para nova entrega (zero duplicate delivery)
+  const resReserveFail = await seam.reserve(c.runID, 2, { leaseMs: 1000, checkDelivered: mockCheckDelivered });
+  assert.equal(resReserveFail.length, 0, "fail-closed: nunca redeliver se status de entrega e unknown");
+
+  // Estado continua reserved (bloqueado para redelivery)
+  const recStillReserved = normalizeFollowupRecord(store.get(key));
+  assert.equal(recStillReserved.state, "reserved");
+
+  // 2. Erro transiente resolvido: runtime.context responde com sucesso confirmando entrega
+  contextShouldFail = false;
+  const recResSuccess = await seam.reconcile(c.runID, 2, { leaseMs: 1000, checkDelivered: mockCheckDelivered });
+  assert.deepEqual(recResSuccess.confirmed, ["msg_D16"], "confirmado para consumed");
+
+  const recFinal = normalizeFollowupRecord(store.get(key));
+  assert.equal(recFinal.state, "consumed", "convergiu para consumed");
+  assert.ok(recFinal.consumedBoundary?.includes("delivered-round-1"));
+
+  // Tentativa subsequente de reserve: continua zero entregas
+  const resReserveFinal = await seam.reserve(c.runID, 2, { leaseMs: 1000, checkDelivered: mockCheckDelivered });
+  assert.equal(resReserveFinal.length, 0, "zero redelivery apos convergencia");
+});
+
+test("D17 [INTEGRATED ADMISSION / CLOSE HONESTY]: confirm falha depois do prompt entregue e o CALLBACK REAL do admission fecha o run sem converter F entregue em unconsumed", async () => {
+  const store = new Map();
+  const sessionID = "ses_D17";
+
+  // Falha TRANSITORIA e one-shot no storage: apenas o confirm falha; o
+  // reconciliamento posterior do closeFollowupsForRun precisa conseguir gravar.
+  let failConfirmOnce = true;
+  const storage = {
+    get: async (k) => store.get(k),
+    set: async (k, v) => {
+      if (failConfirmOnce && v && v.state === "consumed") {
+        failConfirmOnce = false;
+        throw new Error("falha transitoria de storage durante confirm");
+      }
+      store.set(k, v);
+    },
+  };
+  const seam = createFollowupTakeSeam({ storage, now: () => 10 });
+
+  // O handler publica o notice terminal; a promise abaixo permite AGUARDAR o
+  // callback real (nao uma simulacao).
+  let resolveTerminal;
+  const terminalDone = new Promise((r) => {
+    resolveTerminal = r;
+  });
+  let runIDSeen;
+
+  const handler = createAdmissionOrchestrateHandler({
+    storage,
+    // Runner = a RODADA real. Reproduz o caminho de producao: F chega e e
+    // anexado ao run ATIVO enquanto ele executa, a rodada reserva F, entrega o
+    // prompt ao worker (sucesso) e o confirm falha no storage.
+    runner: async (executionContract) => {
+      runIDSeen = executionContract.runID;
+      // F anexado ao run ativo durante a execucao (o mesmo estado que
+      // attachFollowupToActiveRun produz: record + index).
+      await seedFollowup(storage, executionContract.runID, "msg_D17_followup", "instrucao entregue ao worker");
+      const taken = await seam.reserve(executionContract.runID, 1, { sessionID: "worker_D17" });
+      assert.equal(taken.length, 1, "F foi reservado para a rodada");
+      await seam.markDelivered(executionContract.runID, taken, 1, "worker_D17");
+      // confirm lanca => o runner propaga => o handler entra no callback terminal
+      await seam.confirm(executionContract.runID, taken, 1);
+      return { runID: executionContract.runID, phase: "completed" };
+    },
+    publish: async (_sessionID, text) => {
+      resolveTerminal(text);
+    },
+  });
+
+  // Sem binding previo => o handler DISPARA o runner de verdade (status started).
+  const res = await handler({
+    sessionID,
+    messageID: "msg_D17_dispatch",
+    objective: "tarefa que dispara o run ativo",
+  });
+  assert.equal(res.status, "started");
+  assert.ok(res.runID, "runID do run despachado");
+
+  // Aguarda o CALLBACK REAL do handler (fecha binding + closeFollowupsForRun).
+  const notice = await terminalDone;
+  assert.ok(String(notice).includes("failed"), `notice terminal deve refletir a falha do runner: ${notice}`);
+
+  const binding = await storage.get(sessionBindingKey(sessionID));
+  assert.equal(binding.phase, "failed", "callback terminal marcou o run como failed");
+
+  // Verificacao crucial (#13 review): F FOI entregue ao worker (deliveredAt
+  // gravado por markDelivered antes da falha do confirm). O fechamento do run
+  // NUNCA pode classificar delivery comprovado como "unconsumed".
+  const finalRecord = normalizeFollowupRecord(store.get(followupKey(runIDSeen, "msg_D17_followup")));
+  assert.equal(finalRecord.state, "consumed", "NUNCA fecha follow-up entregue como unconsumed");
+  assert.equal(finalRecord.consumedBoundary, "round-1-worker-prompt");
+  assert.equal(finalRecord.consumedRound, 1);
+  assert.ok(finalRecord.deliveredAt !== undefined, "prova de entrega preservada no record final");
+  assert.ok(String(notice).includes("follow-ups consumidos: 1"), `notice contabiliza F como consumido: ${notice}`);
+  assert.ok(String(notice).includes("nao consumidos: 0"), `notice nunca contabiliza delivery comprovado como nao consumido: ${notice}`);
+});
+
+test("D18 [TRANSIENT runtime.context]: F entregue e crash pre-receipt com leitura da sessao worker falhando NUNCA redelivera; convergencia apos recuperacao", async () => {
+  const c = contract({ maxRounds: 2 });
+  const { deps, store, promptCalls } = fakeDeps({ judgeAnswersSeq: [REPAIR_ANSWERS, ACCEPT_ANSWERS] }, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  await seedFollowup(storage, c.runID, "msg_D18", "instrucao entregue antes do crash");
+
+  // Estado pos-crash: runtime.prompt ENTREGOU F ao worker antigo, mas o
+  // processo caiu antes do markDelivered/confirm => record segue "reserved",
+  // sem deliveredAt, com lease expirado. A UNICA prova disponivel sobre a
+  // entrega e a leitura do contexto da sessao worker antiga.
+  const key = followupKey(c.runID, "msg_D18");
+  await storage.set(key, {
+    ...normalizeFollowupRecord(await storage.get(key)),
+    state: "reserved",
+    reservedAt: 1000,
+    reservedRound: 1,
+    reservedSessionID: "w_old_D18",
+  });
+
+  let contextBroken = true;
+  const realContext = deps.runtime.context;
+  deps.runtime.context = async ({ sessionID } = {}) => {
+    if (sessionID === "w_old_D18") {
+      if (contextBroken) throw new Error("timeout transitorio ao ler a sessao worker antiga");
+      return [{ type: "user", id: "msg_D18", content: [{ type: "text", text: "instrucao entregue antes do crash" }] }];
+    }
+    return await realContext({ sessionID });
+  };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 100000 });
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.notEqual(res.phase, "completed", "run nao pode completar enquanto F esta em estado ambiguo");
+
+  // Prova central: ZERO redelivery. Nenhum prompt entregue ao worker pode
+  // conter F de novo enquanto a entrega anterior nao pode ser verificada.
+  assert.ok(promptCalls.length > 0, "a rodada de ambiguidade executou");
+  for (const call of promptCalls) {
+    assert.ok(!call.text.includes("msg_D18"), "F jamais reentregue em prompt sob ambiguidade de entrega");
+    assert.ok(!call.text.includes("instrucao entregue antes do crash"), "texto de F jamais reentregue");
+  }
+  const duringAmbiguity = normalizeFollowupRecord(store.get(key));
+  assert.equal(duringAmbiguity.state, "reserved", "ambiguidade NUNCA reverte para pending (redelivery) nem marca consumed sem prova");
+  assert.equal(duringAmbiguity.deliveredAt, undefined, "nenhuma prova de entrega foi inventada");
+
+  // Recuperacao: a leitura da sessao worker antiga volta a responder e
+  // DETECTA que F ja estava no input do worker => convergencia para consumed,
+  // ainda sem reentregar F em nenhum prompt.
+  contextBroken = false;
+  const promptCallsBefore = promptCalls.length;
+  const res2 = await runOrchestrationOnce(c, deps);
+  const recoveryPrompts = promptCalls.slice(promptCallsBefore);
+  assert.ok(recoveryPrompts.length > 0, "a rodada de recuperacao executou");
+  for (const call of recoveryPrompts) {
+    assert.ok(!call.text.includes("msg_D18"), "convergencia sem redelivery: F nao volta ao prompt");
+  }
+  assert.equal(res2.phase, "completed", "run completa apos reconciliar F como consumido");
+
+  const finalRecord = normalizeFollowupRecord(store.get(key));
+  assert.equal(finalRecord.state, "consumed", "convergiu para consumed ao detectar a entrega anterior");
+  assert.equal(finalRecord.consumedRound, 1, "boundary aponta a rodada em que F foi realmente entregue");
+  assert.equal(finalRecord.consumedBoundary, "round-1-worker-prompt");
 });
