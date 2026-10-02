@@ -16,6 +16,8 @@ import {
   FOLLOWUP_LIMITS,
   followupKey,
   followupIndexKey,
+  followupRevisionKey,
+  getInputFrontier,
   normalizeFollowupRecord,
   buildFollowupRecord,
 } from "./orchestration/followup.ts";
@@ -515,4 +517,92 @@ test("C14d [P1 2]: orphan index de crash pos-write 2 nao causa duplicate-ignored
   const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14d")));
   assert.equal(rec.text, "instrucao F14d recuperada");
   assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14d"]);
+});
+
+test("C14e [P1 3]: falha no write 4 (inputRevision) faz rollback de todos os 4 writes e converge no replay", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14e", "msg_A");
+  const sessionID = "ses_c14e";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  // Injeta falha de escrita no write 4 (inputRevision)
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) {
+        if (key === followupRevisionKey(activeRunID)) {
+          throw new Error("falha fatal no write 4: inputRevision");
+        }
+        store.set(key, value);
+      },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Primeira tentativa falha de modo explicito
+  await assert.rejects(
+    () => handler({ sessionID, messageID: "msg_F14e", objective: "instrucao F14e" }),
+    (err) => err.code === "followup-persistence-failed",
+  );
+
+  // Verifica rollback completo: nenhum record, index restaurado, sem admission falso
+  assert.equal(store.get(followupKey(activeRunID, "msg_F14e")), undefined, "record revertido");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)) ?? [], [], "index revertido");
+  assert.equal(store.get(admissionRecordKey(sessionID, "msg_F14e")), undefined, "admission revertido");
+
+  // Repara a escrita
+  deps.storage.set = async (key, value) => { store.set(key, value); };
+
+  // Replay do mesmo messageID converge
+  const retryOut = await handler({ sessionID, messageID: "msg_F14e", objective: "instrucao F14e" });
+  assert.equal(retryOut.status, "followup-attached", "replay converge para followup-attached");
+
+  const rec = normalizeFollowupRecord(store.get(followupKey(activeRunID, "msg_F14e")));
+  assert.equal(rec.text, "instrucao F14e");
+  assert.deepEqual(store.get(followupIndexKey(activeRunID)), ["msg_F14e"]);
+  assert.equal(store.get(followupRevisionKey(activeRunID)), 1, "revision incrementada para 1");
+});
+
+test("C14f [P1 3]: atomicidade / interleaving — leitura concorrente do frontier durante attach ve estado integro", async () => {
+  const store = new Map();
+  const activeRunID = autoAdmissionRunID("ses_c14f", "msg_A");
+  const sessionID = "ses_c14f";
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  let delayAttach = true;
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) {
+        if (delayAttach && key === followupKey(activeRunID, "msg_F14f")) {
+          // Pequena pausa para garantir que o frontier read concorra com o attach em progresso
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        store.set(key, value);
+      },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+
+  // Inicia o attach e em paralelo requisita o frontier
+  const pAttach = handler({ sessionID, messageID: "msg_F14f", objective: "instrucao F14f" });
+  const pFrontier = (async () => {
+    await new Promise((r) => setTimeout(r, 5));
+    return await getInputFrontier({ storage: deps.storage }, activeRunID);
+  })();
+
+  const [out, f] = await Promise.all([pAttach, pFrontier]);
+  assert.equal(out.status, "followup-attached");
+
+  // Sob o lock compartilhado, getInputFrontier aguardou a conclusao do attach
+  // e observou o estado consistente (revision=1, pendingCount=1)
+  assert.equal(f.revision, 1, "frontier concorrente observou revision consistente");
+  assert.equal(f.pendingCount, 1, "frontier concorrente observou pendingCount consistente");
+  assert.equal(f.pendingFollowups[0].messageID, "msg_F14f");
 });

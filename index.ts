@@ -861,12 +861,22 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
+    storage: {
+      get: async (key: string) => {
+        return await ctx.storage.get(key);
+      },
+      set: async (key: string, value: unknown) => {
+        await ctx.storage.set(key, value);
+      },
+    },
     // Consumo de follow-ups (#13): o mesmo storage de admission alimenta o
     // boundary de rodada. Consumo exactly-once (registro consumido no record);
-    // storage indisponivel => degradacao bounded (rodada segue sem a secao).
+    // storage indisponivel => fail-closed.
     followups: createFollowupTakeSeam({
       storage: {
-        get: (key: string) => safeStorageGet(ctx, key),
+        get: async (key: string) => {
+          return await ctx.storage.get(key);
+        },
         set: async (key: string, value: unknown) => {
           await ctx.storage.set(key, value);
         },
@@ -1131,7 +1141,9 @@ export default Plugin.define({
         await ctx.rpc.register(AdmissionRpc, {
           orchestrate: createAdmissionOrchestrateHandler({
             storage: {
-              get: (key: string) => safeStorageGet(ctx, key),
+              get: async (key: string) => {
+                return await ctx.storage.get(key);
+              },
               set: async (key: string, value: unknown) => {
                 await ctx.storage.set(key, value);
               },

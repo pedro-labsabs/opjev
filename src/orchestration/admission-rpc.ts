@@ -125,103 +125,106 @@ export function buildFollowupAttachedNotice(input: { runID: string; messageID: s
 async function attachFollowupToActiveRun(
   deps: AdmissionHandlerDeps,
   input: { sessionID: string; messageID: string; objective: string; activeRunID: string },
-): Promise<{ runID: string; status: string }>
-{
+): Promise<{ runID: string; status: string }> {
   const { sessionID, messageID, objective, activeRunID } = input;
-  const fKey = followupKey(activeRunID, messageID);
-  const idxKey = followupIndexKey(activeRunID);
-  const admKey = admissionRecordKey(sessionID, messageID);
-  const revKey = followupRevisionKey(activeRunID);
+  const safeRunID = activeRunID.replace(/[^a-zA-Z0-9_-]/g, "_");
 
-  // 1. Idempotencia por record ANTES de qualquer escrita:
-  // Se o record existe e o followupKey realmente existe, e duplicate-ignored.
-  const prior = asRecord(await deps.storage.get(admKey));
-  const rawExisting = await deps.storage.get(fKey);
-  const existingFollowup = rawExisting !== undefined;
+  return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+    const fKey = followupKey(safeRunID, messageID);
+    const idxKey = followupIndexKey(safeRunID);
+    const admKey = admissionRecordKey(sessionID, messageID);
+    const revKey = followupRevisionKey(safeRunID);
 
-  if (prior && prior.state !== "binding-failed") {
-    if (prior.state !== "followup-attached" || existingFollowup) {
-      return { runID: activeRunID, status: "duplicate-ignored" };
-    }
-  }
+    // 1. Idempotencia por record ANTES de qualquer escrita:
+    // Se o record existe e o followupKey realmente existe, e duplicate-ignored.
+    const prior = asRecord(await deps.storage.get(admKey));
+    const rawExisting = await deps.storage.get(fKey);
+    const existingFollowup = rawExisting !== undefined;
 
-  // 2. Defesa em profundidade: index deduplica e cap
-  let index: string[];
-  try {
-    index = readFollowupIndex(await deps.storage.get(idxKey));
-  } catch (err) {
-    throw new OrchestrationError(
-      "followup-persistence-failed",
-      `index de follow-up ilegivel (nada escrito, runner nao executado): ${boundedError(err)}`,
-    );
-  }
-  if (index.includes(messageID)) {
-    if (existingFollowup) {
-      return { runID: activeRunID, status: "duplicate-ignored" };
-    }
-    // Orphan index de crash anterior sem record: reconcilia abaixo sem perda de F
-  }
-  if (index.length >= FOLLOWUP_LIMITS.perRun && !index.includes(messageID)) {
-    return { runID: activeRunID, status: "followup-limit-reached" };
-  }
-
-  const rawRev = await deps.storage.get(revKey);
-  const currentRev = typeof rawRev === "number" && Number.isFinite(rawRev) ? rawRev : index.length;
-  const nextRev = currentRev + 1;
-
-  let wroteFollowup = false;
-  let wroteIndex = false;
-  let wroteAdmission = false;
-  let wroteRev = false;
-
-  const newIndex = index.includes(messageID) ? index : [...index, messageID];
-
-  try {
-    // Write 1: followup record
-    await deps.storage.set(
-      fKey,
-      buildFollowupRecord({ sessionID, messageID, runID: activeRunID, text: objective, at: Date.now() }),
-    );
-    wroteFollowup = true;
-
-    // Write 2: followup index
-    if (!index.includes(messageID)) {
-      await deps.storage.set(idxKey, newIndex);
-      wroteIndex = true;
+    if (prior && prior.state !== "binding-failed") {
+      if (prior.state !== "followup-attached" || existingFollowup) {
+        return { runID: activeRunID, status: "duplicate-ignored" };
+      }
     }
 
-    // Write 3: admission record
-    await deps.storage.set(admKey, {
-      runID: activeRunID,
-      state: "followup-attached",
-      at: Date.now(),
-    });
-    wroteAdmission = true;
+    // 2. Defesa em profundidade: index deduplica e cap
+    let index: string[];
+    try {
+      index = readFollowupIndex(await deps.storage.get(idxKey));
+    } catch (err) {
+      throw new OrchestrationError(
+        "followup-persistence-failed",
+        `index de follow-up ilegivel (nada escrito, runner nao executado): ${boundedError(err)}`,
+      );
+    }
+    if (index.includes(messageID)) {
+      if (existingFollowup) {
+        return { runID: activeRunID, status: "duplicate-ignored" };
+      }
+      // Orphan index de crash anterior sem record: reconcilia abaixo sem perda de F
+    }
+    if (index.length >= FOLLOWUP_LIMITS.perRun && !index.includes(messageID)) {
+      return { runID: activeRunID, status: "followup-limit-reached" };
+    }
 
-    // Write 4: inputRevision
-    await deps.storage.set(revKey, nextRev);
-    wroteRev = true;
-  } catch (err) {
-    // Rollback explicito de qualquer write efetuado
-    if (wroteAdmission) {
-      try { await deps.storage.set(admKey, undefined); } catch {}
+    const rawRev = await deps.storage.get(revKey);
+    const currentRev = typeof rawRev === "number" && Number.isFinite(rawRev) ? rawRev : index.length;
+    const nextRev = currentRev + 1;
+
+    let wroteFollowup = false;
+    let wroteIndex = false;
+    let wroteAdmission = false;
+    let wroteRev = false;
+
+    const newIndex = index.includes(messageID) ? index : [...index, messageID];
+
+    try {
+      // Write 1: followup record
+      await deps.storage.set(
+        fKey,
+        buildFollowupRecord({ sessionID, messageID, runID: activeRunID, text: objective, at: Date.now() }),
+      );
+      wroteFollowup = true;
+
+      // Write 2: followup index
+      if (!index.includes(messageID)) {
+        await deps.storage.set(idxKey, newIndex);
+        wroteIndex = true;
+      }
+
+      // Write 3: admission record
+      await deps.storage.set(admKey, {
+        runID: activeRunID,
+        state: "followup-attached",
+        at: Date.now(),
+      });
+      wroteAdmission = true;
+
+      // Write 4: inputRevision
+      await deps.storage.set(revKey, nextRev);
+      wroteRev = true;
+    } catch (err) {
+      // Rollback explicito de qualquer write efetuado
+      if (wroteRev) {
+        try { await deps.storage.set(revKey, currentRev); } catch {}
+      }
+      if (wroteAdmission) {
+        try { await deps.storage.set(admKey, undefined); } catch {}
+      }
+      if (wroteIndex) {
+        try { await deps.storage.set(idxKey, index); } catch {}
+      }
+      if (wroteFollowup) {
+        try { await deps.storage.set(fKey, undefined); } catch {}
+      }
+      throw new OrchestrationError(
+        "followup-persistence-failed",
+        `persistencia do follow-up falhou (runner nao executado, binding intocado): ${boundedError(err)}`,
+      );
     }
-    if (wroteIndex) {
-      try { await deps.storage.set(idxKey, index); } catch {}
-    }
-    if (wroteFollowup) {
-      try { await deps.storage.set(fKey, undefined); } catch {}
-    }
-    if (wroteRev) {
-      try { await deps.storage.set(revKey, currentRev); } catch {}
-    }
-    throw new OrchestrationError(
-      "followup-persistence-failed",
-      `persistencia do follow-up falhou (runner nao executado, binding intocado): ${boundedError(err)}`,
-    );
-  }
-  await publishSafe(deps, sessionID, buildFollowupAttachedNotice({ runID: activeRunID, messageID }));
-  return { runID: activeRunID, status: "followup-attached" };
+    await publishSafe(deps, sessionID, buildFollowupAttachedNotice({ runID: activeRunID, messageID }));
+    return { runID: activeRunID, status: "followup-attached" };
+  });
 }
 
 /**

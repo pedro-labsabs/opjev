@@ -16,6 +16,7 @@ import {
   buildFollowupRecord,
   createFollowupTakeSeam,
 } from "./orchestration/followup.ts";
+import { sessionBindingKey } from "./orchestration/admission.ts";
 
 function fakeStorage(seed = {}) {
   const map = new Map(Object.entries(seed));
@@ -420,4 +421,120 @@ test("D10 [TWO-PHASE DELIVERY]: protocolo reserve -> prompt -> confirm garante q
   // Apos falha, record NAO mente que foi consumed
   const finalState = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D10")));
   assert.notEqual(finalState.state, "consumed", "nunca pode estar consumed se o worker nao recebeu");
+});
+
+test("D11 [TWO-PHASE DELIVERY / RECONCILIATION]: crash apos reserve antes do prompt deixa reserved, reconciliado deterministicamente na retomada", async () => {
+  const c = contract({ maxRounds: 3 });
+  const { deps, store, promptCalls } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+
+  // Followup ficou em estado 'reserved' na rodada 1 como se o processo tivesse caido
+  await seedFollowup(storage, c.runID, "msg_D11_crash", "conteudo preservado");
+  const seam = createFollowupTakeSeam({ storage, now: () => 5000, leaseMs: 1000 });
+  deps.followups = seam;
+  deps.storage = storage;
+
+  // Forca o record a ficar 'reserved' com timestamp antigo (lease expirado)
+  const reservedItem = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D11_crash")));
+  await storage.set(followupKey(c.runID, "msg_D11_crash"), {
+    ...reservedItem,
+    state: "reserved",
+    reservedAt: 1, // no passado (5000 - 1 > 1000)
+    reservedRound: 1,
+  });
+
+  // Na rodada 1, reserve detecta o reserved stale e o reconcilia
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "completed");
+
+  // Worker de fato recebeu o prompt com o follow-up recuperado
+  assert.ok(promptCalls[0].text.includes("conteudo preservado"), "worker recebeu o follow-up reconciliado");
+  const finalState = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D11_crash")));
+  assert.equal(finalState.state, "consumed", "follow-up consumido apos entrega real");
+  assert.equal(finalState.consumedRound, 1);
+});
+
+test("D12 [TWO-PHASE DELIVERY]: falha no confirm apos prompt com sucesso propaga erro e nao esconde inconsistencia", async () => {
+  const c = contract({ maxRounds: 2 });
+  const { deps, store } = fakeDeps({}, {});
+
+  let failConfirm = true;
+  const storage = {
+    get: (k) => store.get(k),
+    set: async (k, v) => {
+      // Falha ao confirmar gravacao do consumed no storage
+      if (failConfirm && v && v.state === "consumed") {
+        throw new Error("falha fatal no storage durante confirm");
+      }
+      store.set(k, v);
+    },
+  };
+  await seedFollowup(storage, c.runID, "msg_D12", "payload confirm");
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+  deps.storage = storage;
+
+  // Run deve falhar bounded porque confirm falhou (nao engolir silenciosamente)
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "failed", "run falha bounded quando confirm do follow-up falha");
+  assert.ok(res.error?.includes("storage durante confirm"));
+});
+
+test("D13 [LINEARIZATION / RACE]: F chega apos ultimo fence do judge e antes da persistencia terminal -> detectado no shared boundary, re-julga e consome em rodada 2", async () => {
+  const c = contract({ maxRounds: 3 });
+  c.sessionID = "ses_D13";
+  const { deps, store } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+  deps.storage = storage;
+
+  // Inicializa binding como running
+  await storage.set(sessionBindingKey(c.sessionID), { runID: c.runID, phase: "running", at: 1 });
+
+  let judgeCount = 0;
+  const origJudge = deps.decisions.judgeRound;
+  deps.decisions.judgeRound = async (arg) => {
+    judgeCount += 1;
+    if (judgeCount === 1) {
+      // Simula a janela exata: judgeRound terminou a avaliacao da rodada 1 e vai emitir accept.
+      // Nesse exato instante (antes do shared boundary persistir terminal), F linearizou no storage.
+      await seedFollowup(storage, c.runID, "msg_D13_late", "instrucao que chegou no fim");
+      return ACCEPT_ANSWERS; // primeira tentativa tenta accept baseado no snapshot inicial
+    }
+    if (judgeCount === 2) {
+      // Na segunda chamada (re-julgamento sob o shared boundary):
+      assert.equal(arg.state.pendingFollowupsCount, 1, "segundo julgamento conhecia F");
+      return origJudge(arg); // retorna REPAIR_ANSWERS pois ha pending
+    }
+    return origJudge(arg);
+  };
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "completed", "run deve completar apenas apos consumir F na rodada 2");
+  assert.equal(res.rounds.length, 2, "executou 2 rodadas completas");
+
+  // Follow-up consumido com boundary de entrega na rodada 2
+  const rec = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D13_late")));
+  assert.equal(rec.state, "consumed");
+  assert.equal(rec.consumedRound, 2);
+  assert.equal(rec.consumedBoundary, "round-2-worker-prompt");
+});
+
+test("D14 [FAIL-CLOSED]: erro de leitura no storage do frontier nunca vira pending=0 e falha o run bounded", async () => {
+  const c = contract({ maxRounds: 2 });
+  const { deps, store } = fakeDeps({}, {});
+  const storage = {
+    get: async (k) => {
+      if (k.includes("followup")) {
+        throw new Error("storage indisponivel / erro de rede");
+      }
+      return store.get(k);
+    },
+    set: async (k, v) => store.set(k, v),
+  };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+  deps.storage = storage;
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "failed", "run deve falhar bounded em estado ambiguo do storage");
+  assert.ok(res.error?.includes("storage indisponivel"), "diagnostico de erro de storage presente");
 });

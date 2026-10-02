@@ -846,6 +846,26 @@ async function main() {
         fuRec2[0].consumedBoundary !== "run-finished-without-consumption",
       kv === null ? "kv indisponivel" : `records=${fuRec2.length} sid=${fuRec2[0]?.sessionID} state=${fuRec2[0]?.state}`,
     );
+
+    // Prova E2E material (#13): o texto e messageID de F foram entregues no INPUT REAL da worker
+    const runAObj = kv ? kv.runs.get(`orchestration/run/${fu.runA}`) : null;
+    const workerSidA = runAObj?.workerSessionID ?? null;
+    let workerHasF = false;
+    let workerFCount = 0;
+    if (workerSidA) {
+      const wMsgs = await api("GET", `/api/session/${workerSidA}/message`);
+      if (wMsgs.status === 200 && wMsgs.text.includes(FU_MSG) && wMsgs.text.includes("timeout")) {
+        workerHasF = true;
+        const matches = (wMsgs.text.match(new RegExp(FU_MSG, "g")) || []).length;
+        workerFCount = matches;
+      }
+    }
+    assert(
+      "follow-up: texto e messageID de F entregues no INPUT REAL da worker exatamente 1x (OpenCode v2.0.11)",
+      workerHasF && workerFCount === 1,
+      `workerSid=${workerSidA} workerHasF=${workerHasF} count=${workerFCount}`,
+    );
+
     const termMark = gwEvents.length;
     const rt = await api("POST", `/api/session/${fu.sid}/prompt`, {
       id: "msg_e2efollowT0001",
