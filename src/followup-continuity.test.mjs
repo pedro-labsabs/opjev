@@ -606,3 +606,32 @@ test("C14f [P1 3]: atomicidade / interleaving — leitura concorrente do frontie
   assert.equal(f.pendingCount, 1, "frontier concorrente observou pendingCount consistente");
   assert.equal(f.pendingFollowups[0].messageID, "msg_F14f");
 });
+
+test("C14g [CANONICAL SLUG / DOTS IN IDS]: sessionID e messageID contendo '.' geram runID com '.' e attach/frontier usam exatamente a mesma chave", async () => {
+  const store = new Map();
+  const sessionID = "ses.user.v1";
+  const messageID = "msg.prompt.1";
+  const activeRunID = autoAdmissionRunID(sessionID, messageID);
+  assert.ok(activeRunID.includes("."), "autoAdmissionRunID preserva pontos");
+
+  await store.set(sessionBindingKey(sessionID), { runID: activeRunID, phase: "running", at: 1 });
+
+  const deps = {
+    storage: {
+      async get(key) { return store.get(key); },
+      async set(key, value) { store.set(key, value); },
+    },
+    async runner() {},
+    async publish() {},
+  };
+
+  const handler = createAdmissionOrchestrateHandler(deps);
+  const out = await handler({ sessionID, messageID: "msg.followup.2", objective: "instrucao com ponto" });
+  assert.equal(out.status, "followup-attached");
+
+  // Frontier lido com activeRunID contendo ponto encontra o record gravado pelo attach
+  const frontier = await getInputFrontier({ storage: deps.storage }, activeRunID);
+  assert.equal(frontier.pendingCount, 1, "frontier com ponto no runID encontra o follow-up");
+  assert.equal(frontier.pendingFollowups[0].messageID, "msg.followup.2");
+  assert.equal(frontier.revision, 1);
+});

@@ -47,6 +47,8 @@ export interface FollowupRecord {
   at: number;
   reservedAt?: number;
   reservedRound?: number;
+  reservedSessionID?: string;
+  deliveredAt?: number;
   consumedAt?: number;
   /** Boundary control-plane onde foi consumido (ex.: `round-2-worker-prompt`). */
   consumedBoundary?: string;
@@ -70,7 +72,7 @@ export function followupRevisionKey(runID: string): string {
   return `orchestration/followup-rev/${slug(runID)}`;
 }
 
-function slug(v: unknown): string {
+export function slug(v: unknown): string {
   return String(v ?? "")
     .replace(/[^A-Za-z0-9._-]/g, "_")
     .slice(0, FOLLOWUP_LIMITS.runID);
@@ -141,10 +143,18 @@ export function normalizeFollowupRecord(raw: unknown): FollowupRecord {
     const reservedAt = typeof r.reservedAt === "number" && Number.isFinite(r.reservedAt) ? r.reservedAt : undefined;
     const reservedRound =
       typeof r.reservedRound === "number" && Number.isInteger(r.reservedRound) ? r.reservedRound : undefined;
+    const reservedSessionID =
+      typeof r.reservedSessionID === "string" && r.reservedSessionID.trim().length > 0
+        ? r.reservedSessionID.trim()
+        : undefined;
+    const deliveredAt =
+      typeof r.deliveredAt === "number" && Number.isFinite(r.deliveredAt) ? r.deliveredAt : undefined;
     return {
       ...base,
       ...(reservedAt !== undefined ? { reservedAt } : {}),
       ...(reservedRound !== undefined ? { reservedRound } : {}),
+      ...(reservedSessionID !== undefined ? { reservedSessionID } : {}),
+      ...(deliveredAt !== undefined ? { deliveredAt } : {}),
     };
   }
   if (base.state !== "pending") {
@@ -225,7 +235,7 @@ export async function getInputFrontier(
   deps: { storage: FollowupStorage },
   runID: string,
 ): Promise<InputFrontier> {
-  const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+  const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
   return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
     const rawIndex = await deps.storage.get(followupIndexKey(safeRunID));
     const index = readFollowupIndex(rawIndex);
@@ -253,9 +263,25 @@ export async function getInputFrontier(
 
 export interface FollowupTakeSeam {
   (runID: string, round: number): Promise<PendingFollowup[]>;
-  reserve(runID: string, round: number, options?: { leaseMs?: number }): Promise<PendingFollowup[]>;
+  reserve(
+    runID: string,
+    round: number,
+    options?: {
+      leaseMs?: number;
+      sessionID?: string;
+      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+    },
+  ): Promise<PendingFollowup[]>;
   confirm(runID: string, items: PendingFollowup[], round: number): Promise<void>;
-  reconcile(runID: string, currentRound?: number, options?: { leaseMs?: number }): Promise<{ reconciled: string[] }>;
+  markDelivered?(runID: string, items: PendingFollowup[], round: number, sessionID?: string): Promise<void>;
+  reconcile(
+    runID: string,
+    currentRound?: number,
+    options?: {
+      leaseMs?: number;
+      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+    },
+  ): Promise<{ reconciled: string[]; confirmed?: string[] }>;
   getFrontier(runID: string): Promise<InputFrontier>;
 }
 
@@ -279,9 +305,13 @@ export function createFollowupTakeSeam(deps: {
   const reserve = async (
     runID: string,
     round: number,
-    options?: { leaseMs?: number },
+    options?: {
+      leaseMs?: number;
+      sessionID?: string;
+      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+    },
   ): Promise<PendingFollowup[]> => {
-    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
     if (typeof round !== "number" || !Number.isInteger(round) || round < 1) {
       throw new OrchestrationError("invalid-followup", `round invalido para take: ${String(round)}`);
     }
@@ -300,14 +330,37 @@ export function createFollowupTakeSeam(deps: {
         } catch {
           continue;
         }
-        // Elegivel para reserva se esta pending OU se ficou reserved em crash/falha anterior
-        const isStaleReserved =
-          rec.state === "reserved" &&
-          (rec.reservedRound === undefined ||
-            rec.reservedRound < round ||
-            (rec.reservedAt !== undefined && currentTime - rec.reservedAt > leaseMs));
 
-        if (rec.state === "pending" || isStaleReserved) {
+        // Se está reserved: verificar se já foi entregue (deliveredAt ou checkDelivered)
+        if (rec.state === "reserved") {
+          let alreadyDelivered = rec.deliveredAt !== undefined;
+          if (!alreadyDelivered && options?.checkDelivered) {
+            try {
+              alreadyDelivered = await options.checkDelivered(rec);
+            } catch {}
+          }
+          if (alreadyDelivered) {
+            // Já entregue ao worker: confirma como consumed diretamente e NÃO re-reserva nem re-entrega!
+            await deps.storage.set(followupKey(safeRunID, messageID), {
+              ...rec,
+              state: "consumed",
+              consumedAt: currentTime,
+              consumedBoundary: `round-${rec.reservedRound ?? round}-worker-prompt`,
+              consumedRound: rec.reservedRound ?? round,
+            });
+            continue;
+          }
+
+          // Elegivel para reserva se ficou reserved em crash/falha anterior sem entrega
+          const isStaleReserved =
+            rec.reservedRound === undefined ||
+            rec.reservedRound < round ||
+            (rec.reservedAt !== undefined && currentTime - rec.reservedAt > leaseMs);
+
+          if (isStaleReserved) {
+            targets.push({ messageID, record: rec });
+          }
+        } else if (rec.state === "pending") {
           targets.push({ messageID, record: rec });
         }
       }
@@ -323,6 +376,7 @@ export function createFollowupTakeSeam(deps: {
             state: "reserved",
             reservedAt,
             reservedRound: round,
+            ...(options?.sessionID ? { reservedSessionID: options.sessionID } : {}),
           });
           updatedKeys.push(key);
           out.push({ messageID: t.record.messageID, text: t.record.text });
@@ -339,9 +393,36 @@ export function createFollowupTakeSeam(deps: {
     });
   };
 
+  const markDelivered = async (
+    runID: string,
+    items: PendingFollowup[],
+    round: number,
+    sessionID?: string,
+  ): Promise<void> => {
+    if (!Array.isArray(items) || items.length === 0) return;
+    const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
+    await withKeyedLock(`followup-take/${safeRunID}`, async () => {
+      const deliveredTime = now();
+      for (const it of items) {
+        if (!it?.messageID) continue;
+        const raw = await deps.storage.get(followupKey(safeRunID, it.messageID));
+        if (raw === undefined) continue;
+        const rec = normalizeFollowupRecord(raw);
+        if (rec.state === "reserved" || rec.state === "pending") {
+          await deps.storage.set(followupKey(safeRunID, it.messageID), {
+            ...rec,
+            deliveredAt: deliveredTime,
+            ...(sessionID ? { reservedSessionID: sessionID } : {}),
+            reservedRound: round,
+          });
+        }
+      }
+    });
+  };
+
   const confirm = async (runID: string, items: PendingFollowup[], round: number): Promise<void> => {
     if (!Array.isArray(items) || items.length === 0) return;
-    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
     await withKeyedLock(`followup-take/${safeRunID}`, async () => {
       const consumedAt = now();
       const consumedBoundary = `round-${round}-worker-prompt`;
@@ -366,19 +447,40 @@ export function createFollowupTakeSeam(deps: {
   const reconcile = async (
     runID: string,
     currentRound?: number,
-    options?: { leaseMs?: number },
-  ): Promise<{ reconciled: string[] }> => {
-    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    options?: {
+      leaseMs?: number;
+      checkDelivered?: (item: FollowupRecord) => Promise<boolean>;
+    },
+  ): Promise<{ reconciled: string[]; confirmed?: string[] }> => {
+    const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
     const leaseMs = options?.leaseMs ?? defaultLeaseMs;
     const currentTime = now();
     return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
       const index = readFollowupIndex(await deps.storage.get(followupIndexKey(safeRunID)));
       const reconciled: string[] = [];
+      const confirmed: string[] = [];
       for (const messageID of index) {
         const raw = await deps.storage.get(followupKey(safeRunID, messageID));
         if (raw === undefined) continue;
         const rec = normalizeFollowupRecord(raw);
         if (rec.state === "reserved") {
+          let alreadyDelivered = rec.deliveredAt !== undefined;
+          if (!alreadyDelivered && options?.checkDelivered) {
+            try {
+              alreadyDelivered = await options.checkDelivered(rec);
+            } catch {}
+          }
+          if (alreadyDelivered) {
+            await deps.storage.set(followupKey(safeRunID, messageID), {
+              ...rec,
+              state: "consumed",
+              consumedAt: currentTime,
+              consumedBoundary: `reconciled-delivered-round-${rec.reservedRound ?? currentRound ?? 1}`,
+              consumedRound: rec.reservedRound ?? currentRound ?? 1,
+            });
+            confirmed.push(messageID);
+            continue;
+          }
           const isStale =
             currentRound === undefined ||
             rec.reservedRound === undefined ||
@@ -398,7 +500,7 @@ export function createFollowupTakeSeam(deps: {
           }
         }
       }
-      return { reconciled };
+      return { reconciled, confirmed };
     });
   };
 
@@ -407,7 +509,7 @@ export function createFollowupTakeSeam(deps: {
   };
 
   const take = async (runID: string, round: number): Promise<PendingFollowup[]> => {
-    const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+    const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
     if (typeof round !== "number" || !Number.isInteger(round) || round < 1) {
       throw new OrchestrationError("invalid-followup", `round invalido para take: ${String(round)}`);
     }
@@ -464,6 +566,7 @@ export function createFollowupTakeSeam(deps: {
 
   take.reserve = reserve;
   take.confirm = confirm;
+  take.markDelivered = markDelivered;
   take.reconcile = reconcile;
   take.getFrontier = getFrontier;
 
@@ -480,7 +583,7 @@ export async function revertFollowupConsumption(
   pending: PendingFollowup[],
 ): Promise<void> {
   if (!Array.isArray(pending) || pending.length === 0) return;
-  const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+  const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
   await withKeyedLock(`followup-take/${safeRunID}`, async () => {
     for (const item of pending) {
       if (!item?.messageID) continue;
@@ -488,6 +591,10 @@ export async function revertFollowupConsumption(
       if (raw === undefined) continue;
       try {
         const rec = normalizeFollowupRecord(raw);
+        if (rec.deliveredAt !== undefined) {
+          // Entregue ao worker: nunca reverter para pending
+          continue;
+        }
         if (rec.state === "consumed" || rec.state === "reserved") {
           const reverted: FollowupRecord = {
             messageID: rec.messageID,
@@ -517,7 +624,7 @@ export async function closeFollowupsForRun(
   runID: string,
 ): Promise<{ consumed: number; pending: number }> {
   const now = deps.now ?? Date.now;
-  const safeRunID = requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID");
+  const safeRunID = slug(requireBounded(runID, FOLLOWUP_LIMITS.runID, "runID"));
   return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
     let index: string[] = [];
     try {

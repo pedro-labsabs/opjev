@@ -789,7 +789,18 @@ async function executeSchedule(
       const followupsAny = deps.followups as any;
       if (typeof followupsAny?.reserve === "function") {
         try {
-          takenFollowups = await followupsAny.reserve(contract.runID, state.round);
+          takenFollowups = await followupsAny.reserve(contract.runID, state.round, {
+            sessionID: workerSessionID,
+            checkDelivered: async (rec: any) => {
+              if (!rec?.reservedSessionID) return false;
+              try {
+                const ctxMsgs = await deps.runtime.context({ sessionID: rec.reservedSessionID });
+                return JSON.stringify(ctxMsgs).includes(rec.messageID);
+              } catch {
+                return false;
+              }
+            },
+          });
           const section = formatFollowupsSection(takenFollowups, state.round);
           if (section) promptText = `${promptText}\n\n${section}`;
         } catch {
@@ -804,16 +815,34 @@ async function executeSchedule(
           // degradacao bounded: o follow-up permanece pendente no record
         }
       }
+      let promptDelivered = false;
       try {
         await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+        promptDelivered = true;
+        if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
+          try {
+            await followupsAny.markDelivered(contract.runID, takenFollowups, state.round, workerSessionID);
+          } catch {}
+        }
         if (typeof followupsAny?.confirm === "function" && takenFollowups.length > 0) {
           await followupsAny.confirm(contract.runID, takenFollowups, state.round);
         }
       } catch (promptErr) {
         if (deps.storage && takenFollowups.length > 0) {
-          try {
-            await revertFollowupConsumption({ storage: deps.storage }, contract.runID, takenFollowups);
-          } catch {}
+          if (!promptDelivered) {
+            // Prompt NUNCA alcançou o worker: revert para pending seguro
+            try {
+              await revertFollowupConsumption({ storage: deps.storage }, contract.runID, takenFollowups);
+            } catch {}
+          } else {
+            // Prompt TEVE SUCESSO: worker ja recebeu F no seu input real.
+            // confirm() falhou. NUNCA reverter para pending (evita duplicate redelivery).
+            try {
+              if (typeof followupsAny?.markDelivered === "function") {
+                await followupsAny.markDelivered(contract.runID, takenFollowups, state.round, workerSessionID);
+              }
+            } catch {}
+          }
         }
         throw promptErr;
       }
@@ -1119,9 +1148,9 @@ async function executeSchedule(
               frontier = currentFrontier;
               return false;
             }
-            // Shared boundary: commit terminal transition in kernel AND storage atomically
-            transitionResult = transitionRun(state, { type: "VERDICT_RECEIVED", verdict, frontier: currentFrontier });
-            state = transitionResult.state;
+            // Shared boundary: commit terminal transition in kernel AND storage atomically.
+            // Linearization point: computa transicao candidata SEM mutar state local antes do storage
+            const candidateTransition = transitionRun(state, { type: "VERDICT_RECEIVED", verdict, frontier: currentFrontier });
             if (deps.storage && contract.sessionID) {
               const nextPhase = verdict.nextAction === "accept" ? "completed" : "stopped";
               await deps.storage.set(sessionBindingKey(contract.sessionID), {
@@ -1130,10 +1159,21 @@ async function executeSchedule(
                 at: now(),
               });
             }
+            transitionResult = candidateTransition;
+            state = candidateTransition.state;
             frontier = currentFrontier;
             return true;
           });
         } catch (err) {
+          if (deps.storage && contract.sessionID) {
+            try {
+              await deps.storage.set(sessionBindingKey(contract.sessionID), {
+                runID: contract.runID,
+                phase: "failed",
+                at: now(),
+              });
+            } catch {}
+          }
           return {
             abort: true,
             result: await failRun(

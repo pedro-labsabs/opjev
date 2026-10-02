@@ -17,6 +17,7 @@ import {
   createFollowupTakeSeam,
 } from "./orchestration/followup.ts";
 import { sessionBindingKey } from "./orchestration/admission.ts";
+import { createAdmissionOrchestrateHandler } from "./orchestration/admission-rpc.ts";
 
 function fakeStorage(seed = {}) {
   const map = new Map(Object.entries(seed));
@@ -454,9 +455,9 @@ test("D11 [TWO-PHASE DELIVERY / RECONCILIATION]: crash apos reserve antes do pro
   assert.equal(finalState.consumedRound, 1);
 });
 
-test("D12 [TWO-PHASE DELIVERY]: falha no confirm apos prompt com sucesso propaga erro e nao esconde inconsistencia", async () => {
+test("D12 [TWO-PHASE DELIVERY / EXACTLY-ONCE]: falha no confirm apos prompt com sucesso propaga erro, preserva delivery receipt e reconcilia sem redelivery", async () => {
   const c = contract({ maxRounds: 2 });
-  const { deps, store } = fakeDeps({}, {});
+  const { deps, store, promptCalls } = fakeDeps({}, {});
 
   let failConfirm = true;
   const storage = {
@@ -477,9 +478,30 @@ test("D12 [TWO-PHASE DELIVERY]: falha no confirm apos prompt com sucesso propaga
   const res = await runOrchestrationOnce(c, deps);
   assert.equal(res.phase, "failed", "run falha bounded quando confirm do follow-up falha");
   assert.ok(res.error?.includes("storage durante confirm"));
+
+  // Verificacao pos-falha do ambiguity window:
+  // 1. Worker REALMENTE recebeu F no prompt
+  assert.ok(promptCalls[0].text.includes("payload confirm"), "worker recebeu F antes da falha do confirm");
+
+  // 2. F NUNCA volta para 'pending' (evita redelivery duplicate)
+  const recAfterFail = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D12")));
+  assert.notEqual(recAfterFail.state, "pending", "F nao pode ser revertido para pending apos entrega real");
+  assert.ok(recAfterFail.deliveredAt !== undefined, "delivery receipt gravado");
+
+  // 3. Reconciliacao/retomada: storage recuperado reconcilia para 'consumed' e ZERO redelivery
+  failConfirm = false;
+  const seam = createFollowupTakeSeam({ storage, now: () => 20 });
+  const recResult = await seam.reconcile(c.runID, 1);
+  assert.ok(recResult.confirmed?.includes("msg_D12") || recResult.reconciled?.length === 0);
+  const recState = normalizeFollowupRecord(store.get(followupKey(c.runID, "msg_D12")));
+  assert.equal(recState.state, "consumed", "reconciliado para consumed");
+
+  // 4. Nova tentativa de reserve nao devolve F
+  const secondReserve = await seam.reserve(c.runID, 2);
+  assert.equal(secondReserve.length, 0, "F nunca e redelivered");
 });
 
-test("D13 [LINEARIZATION / RACE]: F chega apos ultimo fence do judge e antes da persistencia terminal -> detectado no shared boundary, re-julga e consome em rodada 2", async () => {
+test("D13 [LINEARIZATION / RACE]: corrida real via admission handler durante terminal fence -> F attachado lineariza antes do commit, força re-julgamento e consumo na rodada 2", async () => {
   const c = contract({ maxRounds: 3 });
   c.sessionID = "ses_D13";
   const { deps, store } = fakeDeps({}, {});
@@ -490,19 +512,29 @@ test("D13 [LINEARIZATION / RACE]: F chega apos ultimo fence do judge e antes da 
   // Inicializa binding como running
   await storage.set(sessionBindingKey(c.sessionID), { runID: c.runID, phase: "running", at: 1 });
 
+  const admissionHandler = createAdmissionOrchestrateHandler({
+    storage,
+    runner: async () => {},
+    publish: async () => {},
+  });
+
   let judgeCount = 0;
   const origJudge = deps.decisions.judgeRound;
   deps.decisions.judgeRound = async (arg) => {
     judgeCount += 1;
     if (judgeCount === 1) {
-      // Simula a janela exata: judgeRound terminou a avaliacao da rodada 1 e vai emitir accept.
-      // Nesse exato instante (antes do shared boundary persistir terminal), F linearizou no storage.
-      await seedFollowup(storage, c.runID, "msg_D13_late", "instrucao que chegou no fim");
+      // Janela exata: avaliacao da rodada 1 completou e admission real de F chega antes do commit terminal
+      const attachRes = await admissionHandler({
+        sessionID: c.sessionID,
+        messageID: "msg_D13_late",
+        objective: "instrucao que chegou no fim via handler real",
+      });
+      assert.equal(attachRes.status, "followup-attached", "admission real anexou F ao run ativo");
       return ACCEPT_ANSWERS; // primeira tentativa tenta accept baseado no snapshot inicial
     }
     if (judgeCount === 2) {
-      // Na segunda chamada (re-julgamento sob o shared boundary):
-      assert.equal(arg.state.pendingFollowupsCount, 1, "segundo julgamento conhecia F");
+      // Re-julgamento sob o shared boundary:
+      assert.equal(arg.state.pendingFollowupsCount, 1, "segundo julgamento conhecia F anexado pelo handler");
       return origJudge(arg); // retorna REPAIR_ANSWERS pois ha pending
     }
     return origJudge(arg);
@@ -517,6 +549,44 @@ test("D13 [LINEARIZATION / RACE]: F chega apos ultimo fence do judge e antes da 
   assert.equal(rec.state, "consumed");
   assert.equal(rec.consumedRound, 2);
   assert.equal(rec.consumedBoundary, "round-2-worker-prompt");
+});
+
+test("D13b [LINEARIZATION / RACE]: admission apos commit terminal ve binding terminal e NUNCA anexa ao run concluido", async () => {
+  const c = contract({ maxRounds: 2 });
+  c.sessionID = "ses_D13b";
+  const { deps, store } = fakeDeps({}, {});
+  const storage = { get: (k) => store.get(k), set: (k, v) => store.set(k, v) };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+  deps.storage = storage;
+
+  await storage.set(sessionBindingKey(c.sessionID), { runID: c.runID, phase: "running", at: 1 });
+
+  let newRunDispatched = false;
+  const admissionHandler = createAdmissionOrchestrateHandler({
+    storage,
+    runner: async (contract) => {
+      newRunDispatched = true;
+      assert.notEqual(contract.runID, c.runID, "novo runID deve ser gerado, nunca anexar ao concluido");
+    },
+    publish: async () => {},
+  });
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "completed");
+
+  // Binding agora esta terminal (completed)
+  const binding = await storage.get(sessionBindingKey(c.sessionID));
+  assert.equal(binding.phase, "completed");
+
+  // Novo prompt chega apos terminalizacao: handler de admission DEVE iniciar novo fluxo, nunca followup-attached
+  const afterOut = await admissionHandler({
+    sessionID: c.sessionID,
+    messageID: "msg_after_terminal",
+    objective: "tarefa seguinte",
+  });
+  assert.notEqual(afterOut.status, "followup-attached", "nunca anexa follow-up a run terminal");
+  assert.equal(afterOut.status, "started");
+  assert.ok(newRunDispatched, "disparou nova execucao isolada");
 });
 
 test("D14 [FAIL-CLOSED]: erro de leitura no storage do frontier nunca vira pending=0 e falha o run bounded", async () => {
@@ -537,4 +607,46 @@ test("D14 [FAIL-CLOSED]: erro de leitura no storage do frontier nunca vira pendi
   const res = await runOrchestrationOnce(c, deps);
   assert.equal(res.phase, "failed", "run deve falhar bounded em estado ambiguo do storage");
   assert.ok(res.error?.includes("storage indisponivel"), "diagnostico de erro de storage presente");
+});
+
+test("D15 [FAULT INJECTION / TERMINAL WRITE]: falha de storage ao gravar sessionBindingKey no commit terminal falha bounded e previne attach zumbi", async () => {
+  const c = contract({ maxRounds: 2 });
+  c.sessionID = "ses_D15";
+  const { deps, store } = fakeDeps({}, {});
+
+  let failTerminalBindingWrite = true;
+  const storage = {
+    get: (k) => store.get(k),
+    set: async (k, v) => {
+      if (failTerminalBindingWrite && k === sessionBindingKey(c.sessionID) && (v?.phase === "completed" || v?.phase === "stopped")) {
+        throw new Error("storage falhou durante gravacao de binding terminal");
+      }
+      store.set(k, v);
+    },
+  };
+  deps.followups = createFollowupTakeSeam({ storage, now: () => 10 });
+  deps.storage = storage;
+
+  await storage.set(sessionBindingKey(c.sessionID), { runID: c.runID, phase: "running", at: 1 });
+
+  const res = await runOrchestrationOnce(c, deps);
+  assert.equal(res.phase, "failed", "run deve falhar bounded quando write do binding terminal falha");
+  assert.ok(res.error?.includes("binding terminal"));
+
+  // Verifica que o binding nao ficou como 'completed' mentiroso
+  const finalBinding = await storage.get(sessionBindingKey(c.sessionID));
+  assert.equal(finalBinding.phase, "failed", "binding marcado como failed para nao aceitar follow-up zumbi");
+
+  // Tentativa de attach via admission handler deve recusar anexar a run falhado
+  const admissionHandler = createAdmissionOrchestrateHandler({
+    storage,
+    runner: async () => {},
+    publish: async () => {},
+  });
+  const attachAttempt = await admissionHandler({
+    sessionID: c.sessionID,
+    messageID: "msg_D15_late",
+    objective: "instrucao para run zumbi",
+  });
+  assert.notEqual(attachAttempt.status, "followup-attached", "nunca anexa a run cujo commit terminal falhou");
 });

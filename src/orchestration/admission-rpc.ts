@@ -26,6 +26,7 @@ import {
   followupKey,
   followupRevisionKey,
   readFollowupIndex,
+  slug,
 } from "./followup.ts";
 
 export const NOTICE_LIMIT = 2000;
@@ -127,7 +128,7 @@ async function attachFollowupToActiveRun(
   input: { sessionID: string; messageID: string; objective: string; activeRunID: string },
 ): Promise<{ runID: string; status: string }> {
   const { sessionID, messageID, objective, activeRunID } = input;
-  const safeRunID = activeRunID.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeRunID = slug(activeRunID);
 
   return await withKeyedLock(`followup-take/${safeRunID}`, async () => {
     const fKey = followupKey(safeRunID, messageID);
