@@ -86,6 +86,9 @@ export default Plugin.define({
     const inflight = new Set<string>();
     /** Sessoes cuja historia ja foi marcada como vista (evita replay no TUI). */
     const baselined = new Set<string>();
+    // Cursor temporal da instalação para recuperar notices publicados antes
+    // do primeiro poll, sem reapresentar notices históricos da sessão.
+    const reconciliationStartedAt = Date.now();
 
     /**
      * Uma tentativa de render.
@@ -268,10 +271,9 @@ export default Plugin.define({
           const sessionID = String(route.sessionID);
           const items: unknown[] = ctx.data.session.pending.list(sessionID) ?? [];
           const isBaseline = !baselined.has(sessionID);
-          const toPresent = selectUnpresentedNotices({ sessionID, items, seen, baseline: baselined });
+          const toPresent = selectUnpresentedNotices({ sessionID, items, seen, baseline: baselined, startedAt: reconciliationStartedAt });
           if (isBaseline) {
-            trace("baseline", { sessionID, marked: toPresent.length });
-            return;
+            trace("baseline", { sessionID, marked: toPresent.length, recoveredFresh: toPresent.length });
           }
           for (const f of toPresent) {
             await present(f.runID, sessionID, f.phase, f.notice, "reconcile");

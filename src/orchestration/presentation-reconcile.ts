@@ -9,8 +9,8 @@
 // Invariantes (presentation = sem poder, igual ao resto da fronteira):
 //   - decide nada: nao aceita/recovery/phase/round/model; nao executa nada;
 //   - le SOMENTE o inbox da sessao corrente (nunca de outra sessao);
-//   - baseline POR SESSAO, uma unica vez: o que ja existia quando o TUI abriu a
-//     sessao e historico e nao e reapresentado;
+//   - baseline POR SESSAO: notices anteriores ao inicio do reconciliador sao
+//     historico; notices posteriores continuam recuperaveis no primeiro poll;
 //   - exatamente uma apresentacao por runID (dedupe compartilhado com o
 //     caminho do evento) — reconciliar nunca duplica o que o evento ja mostra.
 //
@@ -21,26 +21,21 @@
  * reconciliador so reconhece o formato emitido por buildAdmissionRunNotice
  * (`Orquestracao <runID>: fase <phase>, ...`) — nunca texto livre.
  */
-export const ORCHESTRATION_NOTICE_RE = /Orquestracao\s+([^\s:]+):\s+fase\s+([a-z-]+)/i;
+export const ORCHESTRATION_NOTICE_RE = /^Orquestracao\s+([^\s:]+):\s+fase\s+([a-z-]+),\s+rodada\s+\S+(?:,\s+worker\s+[^.]*)?(?:\.\s+Erro:\s+.*)?(?:\.\s+follow-ups consumidos:\s+\d+,\s+nao consumidos:\s+\d+)?$/i;
 
 export interface DurableNotice {
   runID: string;
   phase: string;
   notice: string;
+  createdAt: number;
 }
 
-/** Textos extraidos de um item de inbox de sessao (aceita `text` ou JSON). */
+/** Texto apenas do payload sintético authoritative do inbox do OpenCode. */
 export function extractNoticeText(item: unknown): string {
-  if (item !== null && typeof item === "object") {
-    const text = (item as { text?: unknown }).text;
-    if (typeof text === "string") return text;
-  }
-  if (typeof item === "string") return item;
-  try {
-    return JSON.stringify(item ?? "");
-  } catch {
-    return "";
-  }
+  if (item === null || typeof item !== "object") return "";
+  const entry = item as { type?: unknown; payload?: { text?: unknown } };
+  if (entry.type !== "synthetic" || entry.payload === null || typeof entry.payload !== "object") return "";
+  return typeof entry.payload.text === "string" ? entry.payload.text : "";
 }
 
 /** Notices de orquestracao presentes no inbox, em ordem de chegada. */
@@ -55,7 +50,10 @@ export function collectNotices(items: readonly unknown[]): DurableNotice[] {
     const runID = m[1] ?? "";
     const phase = m[2] ?? "";
     if (runID === "" || phase === "") continue;
-    out.push({ runID, phase, notice: text });
+    const time = (item as { time?: { created?: unknown } }).time;
+    const createdAt = time && typeof time.created === "number" && Number.isFinite(time.created) ? time.created : undefined;
+    if (createdAt === undefined) continue;
+    out.push({ runID, phase, notice: text, createdAt });
   }
   return out;
 }
@@ -63,10 +61,10 @@ export function collectNotices(items: readonly unknown[]): DurableNotice[] {
 /**
  * Decide o que apresentar a partir do inbox.
  *
- * `baseline` e mutado: na primeira observacao de uma sessao, TODOS os notices
- * ja presentes sao marcados como vistos (historico) e nada e apresentado. Nas
- * observacoes seguintes, apenas notices cujo runID ainda nao foi visto sao
- * devolvidos — do mais novo para o mais antigo (bounded pelo proprio inbox).
+ * `baseline` e mutado: na primeira observacao, notices anteriores a `startedAt`
+ * sao historico; os posteriores podem ser recuperados mesmo que ja estejam no
+ * inbox. Nas observacoes seguintes, notices ainda nao vistos sao devolvidos,
+ * do mais novo para o mais antigo (bounded pelo proprio inbox).
  *
  * Fail-closed: nao conhece o texto, nao filtra por papel (isso e do TUI via
  * isPresentableSession) e nao inventa resultado — um item sem o formato exato
@@ -77,13 +75,19 @@ export function selectUnpresentedNotices(input: {
   items: readonly unknown[];
   seen: Set<string>;
   baseline: Set<string>;
+  startedAt: number;
 }): DurableNotice[] {
-  const { sessionID, items, seen, baseline } = input;
+  const { sessionID, items, seen, baseline, startedAt } = input;
   const found = collectNotices(items);
   if (!baseline.has(sessionID)) {
     baseline.add(sessionID);
-    for (const f of found) seen.add(f.runID);
-    return []; // primeira observacao: historico, nada a apresentar
+    const fresh: DurableNotice[] = [];
+    for (const f of found) {
+      if (seen.has(f.runID)) continue; // o caminho RPC ja apresentou
+      if (f.createdAt >= startedAt) fresh.push(f);
+      else seen.add(f.runID); // histórico ou timestamp inválido: fail-closed
+    }
+    return fresh.reverse();
   }
   const out: DurableNotice[] = [];
   for (let i = found.length - 1; i >= 0; i--) {
