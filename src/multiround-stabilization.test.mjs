@@ -29,6 +29,7 @@ import {
   noul,
 } from "./harness.mjs";
 import { AdmissionRpc } from "./orchestration/admission-rpc.ts";
+import { resumeLockCount } from "./orchestration/resume-lock.ts";
 
 const PLUGIN_OPTS = {
   jevModel: "jev-1.13-free",
@@ -541,18 +542,90 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
     );
     assert.match(rejectRes.content, /chamada interna de orchestration.*somente um humano/, "caller interno rejeitado");
 
-    // 3. Concorrencia: duas chamadas simultaneas de humano sao serializadas
+    // 3. Concorrencia deterministica: duas chamadas simultaneas sobrepostas para o mesmo runID+requestID
     const humanContext = { sessionID: "user-human-session" };
-    const p1 = m.tools.orchestrate_resume.execute({ runID, decision: { requestID: reqID, action: "resume" } }, humanContext);
-    const p2 = m.tools.orchestrate_resume.execute({ runID, decision: { requestID: reqID, action: "resume" } }, humanContext);
-    const [r1, r2] = await Promise.all([p1, p2]);
+    let releaseGate;
+    const gate = new Promise((resolve) => { releaseGate = resolve; });
+    let enteredResolve;
+    const entered = new Promise((resolve) => { enteredResolve = resolve; });
+    let gated = false;
 
-    const winner = r1.content.startsWith("{") ? JSON.parse(r1.content) : null;
-    const loser = r2.content.startsWith("{") ? JSON.parse(r2.content) : null;
-    assert.ok(winner || loser, "um dos callers venceu a corrida");
-    const outcome = winner ?? loser;
-    assert.equal(outcome.phase, "completed", "retomada concluiu em completed");
-    assert.equal(outcome.round, 2, "concluido no round 2");
+    // Intercepta a criacao/prompt do worker da rodada 2 para segurar o winner na secao critica
+    const origPrompt = m.ctx.session.prompt;
+    m.ctx.session.prompt = async (args) => {
+      if (!gated && args?.metadata?.["jev-role"] === "worker" && args?.metadata?.["jev-round"] === 2) {
+        gated = true;
+        enteredResolve();
+        await gate;
+      }
+      return origPrompt(args);
+    };
+
+    const tool = m.tools.orchestrate_resume;
+    const origExecute = tool.execute;
+    const events = [];
+    let seq = 0;
+    tool.execute = async function (input, context) {
+      const id = events.filter((e) => e.t === "enter").length;
+      events.push({ t: "enter", id, s: seq++ });
+      try {
+        return await origExecute.call(this, input, context);
+      } finally {
+        events.push({ t: "exit", id, s: seq++ });
+      }
+    };
+
+    const resumePayload = { runID, decision: { requestID: reqID, action: "resume" } };
+    const both = Promise.all([
+      tool.execute(resumePayload, humanContext),
+      tool.execute(resumePayload, humanContext),
+    ]);
+
+    // Aguarda o winner entrar na execucao da rodada 2 enquanto o loser esta em voo
+    await entered;
+    releaseGate();
+    const [r1, r2] = await both;
+
+    const parseResume = (r) => {
+      try { return { ok: true, data: JSON.parse(r.content) }; }
+      catch { return { ok: false, content: String(r.content) }; }
+    };
+    const parsed1 = parseResume(r1);
+    const parsed2 = parseResume(r2);
+    const wins = [parsed1, parsed2].filter((p) => p.ok && p.data.phase === "completed");
+    const losses = [parsed1, parsed2].filter((p) => !p.ok || p.data.phase !== "completed");
+
+    // Prova de concorrencia real (overlap temporal comprovado)
+    const enters = events.filter((e) => e.t === "enter").map((e) => e.s).sort((a, b) => a - b);
+    const exits = events.filter((e) => e.t === "exit").map((e) => e.s).sort((a, b) => a - b);
+    assert.equal(enters.length, 2, "duas chamadas de resume entraram");
+    assert.equal(exits.length, 2, "duas chamadas de resume sairam");
+    assert.ok(enters[1] < exits[0], "a segunda chamada comecou ANTES da primeira terminar (overlap real)");
+
+    // Prova de resultado estrito
+    assert.equal(wins.length, 1, "exatamente 1 winner completou com sucesso");
+    assert.equal(losses.length, 1, "exatamente 1 loser rejeitado");
+    assert.equal(wins[0].data.phase, "completed", "winner concluiu em completed");
+    assert.equal(wins[0].data.round, 2, "round incrementado uma unica vez (1 -> 2)");
+    assert.match(losses[0].content, /invalid-resumable-run|invalid-human-decision/, "loser rejeitado bounded");
+
+    // Verificacao de persistencia e contagem de sessoes
+    const hdRecords = m.ctx.storage._log.filter(
+      (w) => w.key === `orchestration/run/${runID}` && w.value?.checkpoint === "human-decision"
+    );
+    assert.equal(hdRecords.length, 1, "exatamente 1 record human-decision persistido");
+
+    const r2Workers = m.workerCalls.create.filter(
+      (c) => c.metadata?.["jev-role"] === "worker" && c.metadata?.["jev-round"] === 2
+    );
+    assert.equal(r2Workers.length, 1, "exatamente 1 worker instanciado para o round 2");
+
+    const r2Critics = m.workerCalls.create.filter(
+      (c) => c.metadata?.["jev-role"] === "critic" && c.metadata?.["jev-round"] === 2
+    );
+    assert.equal(r2Critics.length, 1, "exatamente 1 critic instanciado para o round 2");
+
+    assert.equal(resumeLockCount(), 0, "lock de concorrencia devidamente liberado apos a conclusao");
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -774,6 +847,32 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
   // 15. Tentativa de recursão por sessão interna
   // ─────────────────────────────────────────────────────────────────────────────
   it("Cenário 15: tentativa de recursão por sessão interna (bypass em prompt hook, admission RPC e resume tool)", async () => {
+    // 15a: Prompt hook bypass para sessões internas (worker, critic, orchestrator)
+    const mPrompt = await bootCtx({
+      models: ALL_MODELS,
+      storage: makeStorage({}),
+      options: { ...PLUGIN_OPTS, enableAutoRoute: true },
+    });
+
+    for (const role of ["worker", "critic", "orchestrator"]) {
+      const s = await mPrompt.ctx.session.create({
+        metadata: {
+          "jev-role": role,
+          "jev-router": "orchestration-internal",
+        },
+      });
+      const promptEvent = {
+        sessionID: s.id,
+        prompt: { text: "execute recursion step" },
+        metadata: {},
+      };
+      await mPrompt.hooks.session.prompt(promptEvent);
+      assert.equal(promptEvent.metadata["jev-router"], "orchestration-internal", `hook seta jev-router para ${role}`);
+      assert.equal(promptEvent.metadata["jev-role"], role, `hook preserva jev-role para ${role}`);
+      const routeRecord = mPrompt.ctx.storage._map.get(`route/${s.id}`);
+      assert.equal(routeRecord, undefined, `zero storage route escrito para ${role}`);
+    }
+
     const storage = makeStorage({});
     const m = await bootCtx({
       models: ALL_MODELS,
@@ -790,7 +889,7 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
     });
     const internalSessionID = internalWorker.id;
 
-    // 15a: Admission RPC com sessao interna retorna internal-bypass sem criar run nem record
+    // 15b: Admission RPC com sessao interna retorna internal-bypass sem criar run nem record
     let dispatched = 0;
     const { createAdmissionOrchestrateHandler } = await import("./orchestration/admission-rpc.ts");
     const rpcHandler = createAdmissionOrchestrateHandler({
@@ -812,7 +911,7 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
     assert.equal(rpcRes.status, "internal-bypass", "admission rpc retorna internal-bypass");
     assert.equal(dispatched, 0, "zero runs disparados via sessao interna");
 
-    // 15b: orchestrate_resume com caller interno registrado e rejeitado com erro diagnostico
+    // 15c: orchestrate_resume com caller interno registrado e rejeitado com erro diagnostico
     const resumeRes = await m.tools.orchestrate_resume.execute(
       { runID: "any-run", decision: { requestID: "req-1", action: "resume" } },
       { sessionID: internalSessionID },
@@ -823,44 +922,171 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
   // ─────────────────────────────────────────────────────────────────────────────
   // 16. Agent / model candidate inválido
   // ─────────────────────────────────────────────────────────────────────────────
-  it("Cenário 16: agent/model candidate inválido (rejeita modelos pagos, modelos fora do pool e agentes invalidos)", async () => {
-    // switch-model com modelo fora do FREE_POOL (ex: gpt-4o pago)
-    const m = await bootCtx({
-      models: ALL_MODELS,
-      storage: makeStorage({}),
-      options: PLUGIN_OPTS,
-      workerBehavior: {
-        outcome: "failed",
-        messages: [{ id: "w-fail", type: "assistant", content: [{ type: "text", text: "FAIL" }] }],
-      },
-    });
+  it("Cenário 16: agent/model candidate inválido (rejeita modelos pagos, inexistentes, agentes desconhecidos e não primários)", async () => {
+    // 16a: switch-model com modelo fora do FREE_POOL (ex: gpt-4o pago)
+    {
+      const m = await bootCtx({
+        models: ALL_MODELS,
+        storage: makeStorage({}),
+        options: PLUGIN_OPTS,
+        workerBehavior: {
+          outcome: "failed",
+          messages: [{ id: "w-fail", type: "assistant", content: [{ type: "text", text: "FAIL" }] }],
+        },
+      });
 
-    stubFetch(async ({ body }) => {
-      if (body?.questions?.route) {
-        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" }));
-      }
-      if (body?.questions?.done) {
-        return okJev({
-          done: { type: "noul", noul: 0 },
-          failure_class: { type: "choice", choice: "wrong-model" },
-          same_executor_can_repair: { type: "noul", noul: 0 },
-          next_action: { type: "choice", choice: "switch-model", confidence: 0.9 },
-        });
-      }
-      if (body?.questions?.selected_model) {
-        // Jev seleciona modelo proibido fora do FREE_POOL
-        return okJev({
-          selected_model: { type: "choice", choice: "openai/gpt-4o", confidence: 0.99 },
-        });
-      }
-      return okJev(acceptAnswers());
-    });
+      stubFetch(async ({ body }) => {
+        if (body?.questions?.route) {
+          return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" }));
+        }
+        if (body?.questions?.done) {
+          return okJev({
+            done: { type: "noul", noul: 0 },
+            failure_class: { type: "choice", choice: "wrong-model" },
+            same_executor_can_repair: { type: "noul", noul: 0 },
+            next_action: { type: "choice", choice: "switch-model", confidence: 0.9 },
+          });
+        }
+        if (body?.questions?.selected_model) {
+          return okJev({
+            selected_model: { type: "choice", choice: "openai/gpt-4o", confidence: 0.99 },
+          });
+        }
+        return okJev(acceptAnswers());
+      });
 
-    const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
-    const out = JSON.parse(res.content);
+      const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
+      const out = JSON.parse(res.content);
 
-    assert.equal(out.phase, "failed");
-    assert.match(out.error ?? "", /fora dos candidatos validos/, "modelo fora do FREE_POOL rejeitado imediatamente");
+      assert.equal(out.phase, "failed");
+      assert.match(out.error ?? "", /fora dos candidatos validos|invalid-selection/, "modelo fora do FREE_POOL rejeitado");
+      const r2Workers = m.workerCalls.create.filter((c) => c.metadata?.["jev-round"] === 2);
+      assert.equal(r2Workers.length, 0, "zero workers criados na rodada 2 para modelo fora do pool");
+    }
+
+    // 16b: switch-model com modelo inexistente / não elegível no catálogo
+    {
+      const m = await bootCtx({
+        models: ALL_MODELS,
+        storage: makeStorage({}),
+        options: PLUGIN_OPTS,
+        workerBehavior: {
+          outcome: "failed",
+          messages: [{ id: "w-fail", type: "assistant", content: [{ type: "text", text: "FAIL" }] }],
+        },
+      });
+
+      stubFetch(async ({ body }) => {
+        if (body?.questions?.route) {
+          return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" }));
+        }
+        if (body?.questions?.done) {
+          return okJev({
+            done: { type: "noul", noul: 0 },
+            failure_class: { type: "choice", choice: "wrong-model" },
+            same_executor_can_repair: { type: "noul", noul: 0 },
+            next_action: { type: "choice", choice: "switch-model", confidence: 0.9 },
+          });
+        }
+        if (body?.questions?.selected_model) {
+          return okJev({
+            selected_model: { type: "choice", choice: "fake-provider/nonexistent-model", confidence: 0.99 },
+          });
+        }
+        return okJev(acceptAnswers());
+      });
+
+      const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
+      const out = JSON.parse(res.content);
+
+      assert.equal(out.phase, "failed");
+      assert.match(out.error ?? "", /fora dos candidatos validos|invalid-selection/, "modelo inexistente rejeitado");
+      const r2Workers = m.workerCalls.create.filter((c) => c.metadata?.["jev-round"] === 2);
+      assert.equal(r2Workers.length, 0, "zero workers criados na rodada 2 para modelo inexistente");
+    }
+
+    // 16c: switch-agent com agente desconhecido (não existe no runtime)
+    {
+      const m = await bootCtx({
+        models: ALL_MODELS,
+        storage: makeStorage({}),
+        options: PLUGIN_OPTS,
+        workerBehavior: {
+          outcome: "failed",
+          messages: [{ id: "w-fail", type: "assistant", content: [{ type: "text", text: "FAIL" }] }],
+        },
+      });
+
+      stubFetch(async ({ body }) => {
+        if (body?.questions?.route) {
+          return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" }));
+        }
+        if (body?.questions?.done) {
+          return okJev({
+            done: { type: "noul", noul: 0 },
+            failure_class: { type: "choice", choice: "wrong-agent" },
+            same_executor_can_repair: { type: "noul", noul: 0 },
+            next_action: { type: "choice", choice: "switch-agent", confidence: 0.9 },
+          });
+        }
+        if (body?.questions?.selected_agent) {
+          return okJev({
+            selected_agent: { type: "choice", choice: "unknown-rogue-agent", confidence: 0.99 },
+          });
+        }
+        return okJev(acceptAnswers());
+      });
+
+      const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
+      const out = JSON.parse(res.content);
+
+      assert.equal(out.phase, "failed");
+      assert.match(out.error ?? "", /nao existe no catalogo|invalid-selection/, "agente desconhecido rejeitado");
+      const r2Workers = m.workerCalls.create.filter((c) => c.metadata?.["jev-round"] === 2);
+      assert.equal(r2Workers.length, 0, "zero workers criados na rodada 2 para agente desconhecido");
+    }
+
+    // 16d: switch-agent com agente conhecido mas não primaryEligible (ex: mode: subagent)
+    {
+      const m = await bootCtx({
+        models: ALL_MODELS,
+        agents: ["build", "plan", { id: "explore", name: "explore", mode: "subagent" }],
+        storage: makeStorage({}),
+        options: PLUGIN_OPTS,
+        workerBehavior: {
+          outcome: "failed",
+          messages: [{ id: "w-fail", type: "assistant", content: [{ type: "text", text: "FAIL" }] }],
+        },
+      });
+
+      stubFetch(async ({ body }) => {
+        if (body?.questions?.route) {
+          return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle" }));
+        }
+        if (body?.questions?.done) {
+          return okJev({
+            done: { type: "noul", noul: 0 },
+            failure_class: { type: "choice", choice: "wrong-agent" },
+            same_executor_can_repair: { type: "noul", noul: 0 },
+            next_action: { type: "choice", choice: "switch-agent", confidence: 0.9 },
+          });
+        }
+        if (body?.questions?.selected_agent) {
+          return okJev({
+            selected_agent: { type: "choice", choice: "explore", confidence: 0.99 },
+          });
+        }
+        return okJev(acceptAnswers());
+      });
+
+      const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
+      const out = JSON.parse(res.content);
+
+      assert.equal(out.phase, "failed");
+      assert.match(out.error ?? "", /nao elegivel como primary|invalid-selection/, "agente nao-primary rejeitado");
+      const r2Workers = m.workerCalls.create.filter((c) => c.metadata?.["jev-round"] === 2);
+      assert.equal(r2Workers.length, 0, "zero workers criados na rodada 2 para agente nao-primary");
+    }
   });
 
   // ─────────────────────────────────────────────────────────────────────────────

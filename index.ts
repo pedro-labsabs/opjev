@@ -879,6 +879,18 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
+    workerTimeoutMs:
+      typeof process !== "undefined" && process.env.OPJEV_WORKER_TIMEOUT_MS
+        ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS)
+        : undefined,
+    criticTimeoutMs:
+      typeof process !== "undefined" && process.env.OPJEV_CRITIC_TIMEOUT_MS
+        ? Number(process.env.OPJEV_CRITIC_TIMEOUT_MS)
+        : undefined,
+    orchestratorTimeoutMs:
+      typeof process !== "undefined" && process.env.OPJEV_ORCHESTRATOR_TIMEOUT_MS
+        ? Number(process.env.OPJEV_ORCHESTRATOR_TIMEOUT_MS)
+        : undefined,
     storage: {
       get: async (key: string) => {
         return await ctx.storage.get(key);

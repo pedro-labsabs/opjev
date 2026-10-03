@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit -p ./tsconfig.json",
     "test": "node --test ./src/*.test.mjs",
     "e2e:gateway": "node scripts/e2e-gateway.mjs",
-    "e2e:matrix": "node scripts/e2e-multiround-matrix.mjs"
+    "e2e:matrix": "node scripts/e2e-multiround-matrix.mjs",
+    "e2e:multiround-real": "node scripts/e2e-multiround-real.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.7"

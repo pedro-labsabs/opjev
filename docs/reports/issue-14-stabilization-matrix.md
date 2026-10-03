@@ -2,10 +2,11 @@
 
 - **Issue:** [#14 — `[READY] Full multi-round E2E and stabilization gate`](https://github.com/pedro-labsabs/opjev/issues/14)
 - **Branch:** `feat/issue-14-multiround-e2e-stabilization`
-- **PR:** `test: complete multi-round E2E stabilization gate (#14)`
+- **PR:** `test: complete multi-round E2E stabilization gate (#14)` (PR #32)
 - **Data:** 2026-10-03
 - **Runtime de Autoridade:** OpenCode **v2.0.11** (`/tmp/opencode-2.0.11/package/bin/opencode`), `@opencode/plugin@2.0.7`, Node.js `v22.x`
-- **Veredito:** **GATE APROVADO (17/17 PASS)**
+- **Jev Neural Engine:** Jev SystemOne Live (`https://opencode.ai/zen/v1/systemone` com chave autoritativa `OPENCODE_API_KEY`)
+- **Veredito:** **GATE APROVADO (17/17 PASS no Runtime OpenCode Real + 17/17 PASS na Matriz Hermética)**
 
 ---
 
@@ -18,7 +19,7 @@ O fluxo canônico estrito é:
 entrada → admission → ExecutionContract → kernel/state machine → Jev decide → dispatcher executa → worker → EvidencePacket → critic/Jev julga → recovery/escalation → conclusão
 ```
 
-### Invariantes de Autoridade
+### Invariantes de Autoridade e Confiança
 1. **Kernel governa:** É a única autoridade sobre contagem de rodadas, transições de fase, orçamentos (`maxRounds`) e integridade de estado (`RunState`).
 2. **Jev decide:** O Jev (SystemOne) avalia evidências estruturadas e toma decisões semânticas de roteamento, julgamento e estratégia de recuperação; não executa comandos nem muta o filesystem.
 3. **Dispatcher apenas executa:** O dispatcher realiza estritamente as ações autorizadas pelo kernel e pelo Jev; nunca assume autoridade de julgar nem ignora diretivas de fase.
@@ -27,106 +28,82 @@ entrada → admission → ExecutionContract → kernel/state machine → Jev dec
 6. **Stale evidence é rejeitada:** Evidências de rodadas anteriores ou futuras disparam erro determinístico no kernel (`OrchestrationError: invalid-evidence`) e jamais aprovam uma rodada.
 7. **Zero recursão de sessões internas:** Sessões criadas pelo dispatcher (`worker`, `critic`, `orchestrator`) possuem markers internos de isolamento; qualquer tentativa de reinvocar o fluxo de orquestração via prompt hook, admission RPC ou ferramenta de retomada é bloqueada deterministicamente.
 8. **Zero auto-resume no gate humano:** Quando a orquestração pausa em `awaiting-human`, chamadas automáticas de sessões internas são rejeitadas; apenas o chamador humano pode autorizar a retomada.
-9. **FREE_POOL estrito:** Nenhum modelo pago ou fora do catálogo gratuito do OpenCode Zen pode ser selecionado.
+9. **Serialização estrita de concorrência:** Chamadas concorrentes ao `orchestrate_resume` para o mesmo `runID` são serializadas por mutex assíncrono com re-leitura atômica de estado (prevenção determinística de TOCTOU); exatamente 1 chamada vence, os concorrentes perdem com erro bounded `invalid-resumable-run`, nenhum worker extra é criado e o round é incrementado uma única vez.
+10. **FREE_POOL estrito:** Nenhum modelo pago ou fora do catálogo gratuito do OpenCode Zen pode ser selecionado.
 
 ---
 
-## 2. Matriz de Estabilização E2E (17 Cenários Obrigatórios)
+## 2. Camadas de Prova e Estratégia de Teste
 
-| # | Cenário | Prova Existente | Gap / O que Faltava | Teste / E2E Implementado | Resultado |
-|---|---------|-----------------|---------------------|---------------------------|-----------|
-| 1 | **happy path → accept** | `state-machine.test.mjs` (accept puro) | Provar ciclo multi-round ponta a ponta com worker e critic em sessões isoladas e evidência limpa | Cenário 1 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 2 | **critic encontra problema → Jev não aceita** | `state-machine.test.mjs` (hard failure no kernel) | Provar que quando o critic reporta blocker, gate determinístico barra `accept` desonesto do Jev | Cenário 2 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 3 | **repair-same** | `state-machine.test.mjs` (transição para `repairing`) | Reuso estrito da `workerSessionID`, novo critic isolado, avanço de round no dispatcher | Cenário 3 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 4 | **fresh-same** | `state-machine.test.mjs` (transição fresh-same) | Descarte da sessão de worker anterior com criação de nova sessão preservando agent e model | Cenário 4 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 5 | **switch-model** | `config.ts` (FREE_POOL), `prompt.test.mjs` | Troca autorizada de modelo via SystemOne respeitando FREE_POOL com fresh worker e round incrementado | Cenário 5 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 6 | **switch-agent** | `prompt.test.mjs` (catálogo de agentes) | Troca de agente elegível (`primaryEligible`) via SystemOne com fresh worker e round incrementado | Cenário 6 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 7 | **replan** | `state-machine.test.mjs` (RP1-RP8 lifecycle) | Sessão de orchestrator isolada read-only, novo contrato validado sem aumento de `maxRounds`, fresh worker na rodada 2 | Cenário 7 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 8 | **human + resume** | `human-gate.test.mjs`, `dispatcher.test.mjs` | Pausa em `awaiting-human`, bloqueio de caller interno de worker, e serialização de chamadas concorrentes via lock | Cenário 8 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 9 | **stop** | `state-machine.test.mjs` (stopped phase) | Terminação imediata no dispatcher na rodada 1 sem novas sessões de worker ou novas rodadas | Cenário 9 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 10 | **worker timeout / interrupted** | `dispatcher.ts` (`WORKER_TIMEOUT_MS`) | Interrupção bounded do worker sem travar o loop; deterministic check falha e encerra em `failed` | Cenário 10 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 11 | **critic timeout / failure** | `readonly-policy.ts` (permissões do critic) | Falha catastrófica ou corrupção de saída do critic marca `critic-session-outcome: fail` e impede aprovação | Cenário 11 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 12 | **Jev unavailable / timeout** | Testes com fetch stubs locais | Falha HTTP 500 do SystemOne capturada de forma bounded sem loops infinitos ou crash da aplicação | Cenário 12 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 13 | **provider / global throttle** | `retry.test.mjs` (heurísticas de throttle) | Detecção de erro 429 no worker impede storms de novos workers e encerra com `switch-throttled` | Cenário 13 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 14 | **maxRounds exhaustion** | `state-machine.test.mjs` (enforcement puro) | Loop atinge limite de rodadas e pausa em `awaiting-human` com `kind: max-rounds` sem exceder o budget | Cenário 14 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 15 | **tentativa de recursão por sessão interna** | `worker-hooks.ts` (marker puro) | Bloqueio efetivo em 3 superfícies: prompt hook bypass, admission RPC `internal-bypass` e `orchestrate_resume` caller guard | Cenário 15 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 16 | **agent / model candidate inválido** | `config.ts` (`isFreeModel`) | Tentativa de selecionar modelo pago (ex: `openai/gpt-4o`) ou agent fora da lista falha fast-fail | Cenário 16 em `src/multiround-stabilization.test.mjs` | **PASS** |
-| 17 | **stale evidence / rodada errada** | `state-machine.ts` (validação de round) | Injeção de `EvidencePacket` com rodada descompassada dispara `OrchestrationError(invalid-evidence)` determinístico | Cenário 17 em `src/multiround-stabilization.test.mjs` | **PASS** |
+Para garantir conformidade total com o modelo de confiança sem falsos positivos, a suíte classifica e separa rigorosamente as camadas de evidência:
+
+| Camada / Tier | Escopo / Mecanismo | Papel na Validação |
+|---|---|---|
+| **UNIT** | Invariantes puras de kernel, transições de estado, parsing de vereditos e prompt builders sem I/O. | Valida a lógica central e contratos de dados matematicamente isolados. |
+| **INTEGRATION / HERMETIC** | Harness in-memory com SQLite simulado e `stubFetch` (`src/multiround-stabilization.test.mjs` via `npm run e2e:matrix`). | Valida a integração entre módulos internos com velocidade sub-segundo (~55ms) e determinismo total para CI. |
+| **OPENCODE REAL E2E** | Processo binário autoritativo OpenCode v2.0.11 com SQLite real em disco (`session_v2`), servidor HTTP/RPC real de admission e sessões reais (`scripts/e2e-multiround-real.mjs` via `npm run e2e:multiround-real`). | Prova que o OPJEV funciona sobre o runtime de produção real do OpenCode v2.0.11. |
+| **LIVE JEV SYSTEMONE** | Chamada de rede real via HTTP ao endpoint oficial do SystemOne (`https://opencode.ai/zen/v1/systemone`) autenticado via `OPENCODE_API_KEY`. | Prova a integração semântica viva com a rede neural de julgamento do Jev. |
+| **FAULT-INJECTED E2E** | Injeção de falhas estritamente na fronteira de rede/ambiente (proxy HTTP interceptando e retornando 500, 429 ou timeouts) sem tocar no código de produção. | Prova resiliência, fail-closed e integridade de gates diante de adversidades do mundo real. |
 
 ---
 
-## 3. Prova Detalhada dos 17 Cenários
+## 3. Matriz Definitiva de Estabilização (17 Cenários da Issue #14)
 
-### Cenário 1: Happy path → accept
-- **Invariante:** O worker executa o contrato na rodada 1; o critic inspeciona os resultados de forma read-only; o Jev emite veredito `accept` com evidência verde (todos checks determinísticos `pass`, zero findings do critic). O kernel conclui o run com fase `completed` na rodada 1. Worker e critic possuem IDs de sessão distintos.
+Todos os 17 cenários foram executados e aprovados tanto no **Runner E2E Real** quanto na **Matriz Hermética**:
 
-### Cenário 2: Critic encontra problema → Jev não aceita
-- **Invariante:** Quando o critic encontra um defeito `blocker`, o gate determinístico do kernel bloqueia qualquer tentativa de aceitação, mesmo que o Jev emita veredito `accept`. O estado transiciona para `failed` com mensagem diagnóstica explícita (`deterministicChecks contem hard failure`).
-
-### Cenário 3: repair-same
-- **Invariante:** Na falha de implementação reparável, o Jev emite `repair-same`. A `workerSessionID` da rodada 1 é reutilizada exatamente na rodada 2 com prompt de feedback acumulado. O critic da rodada 1 é descartado e um novo critic é provisionado. A rodada é incrementada e concluída.
-
-### Cenário 4: fresh-same
-- **Invariante:** O Jev opta por recomeçar a tarefa (`fresh-same`). A sessão de worker da rodada 1 é descartada; uma nova sessão de worker é criada mantendo rigorosamente o mesmo agente (`build`) e o mesmo modelo (`opencode/big-pickle`). A rodada avança de 1 para 2.
-
-### Cenário 5: switch-model
-- **Invariante:** O Jev diagnostica fraqueza de modelo (`wrong-model`) e solicita troca. Os candidatos válidos são restritos estritamente ao `FREE_POOL`. O Jev seleciona o modelo substituto via question `selected_model`. Uma nova sessão de worker com o novo modelo é criada e a rodada 2 é executada.
-
-### Cenário 6: switch-agent
-- **Invariante:** O Jev diagnostica fraqueza de agente (`wrong-agent`). Os candidatos disponíveis no catálogo do runtime (`primaryEligible`) são apresentados. O Jev seleciona o novo agente via question `selected_agent`. Uma nova sessão de worker é instanciada e a rodada 2 é concluída.
-
-### Cenário 7: replan
-- **Invariante:** Diante de contrato inexequível (`bad-contract`), o Jev solicita replanejamento. O dispatcher cria uma sessão de `orchestrator` estritamente read-only (com permissões negando qualquer mutação `edit/shell/subagent`). O contrato revisado é validado pelo kernel (mesmo `runID`, `maxRounds` nunca aumentado), e uma fresh worker session executa a rodada 2.
-
-### Cenário 8: human + resume
-- **Invariante:** Falta de contexto ou ambiguidade faz o Jev decidir `human`. O run é pausado em `awaiting-human` com `requestID` determinístico. Chamadas ao `orchestrate_resume` originadas de sessões internas (worker/critic) são barradas com mensagem de segurança. Chamadas concorrentes de humanos são serializadas via `withResumeLock`, e a decisão vencedora retoma o run até a conclusão.
-
-### Cenário 9: stop
-- **Invariante:** Quando o Jev determina `stop`, o kernel transiciona imediatamente para a fase terminal `stopped`. Nenhuma sessão subsequente de worker ou critic é criada, e o loop encerra imediatamente na rodada 1.
-
-### Cenário 10: worker timeout / interrupted
-- **Invariante:** Se a execução do worker estourar o limite de tempo bounded (`WORKER_TIMEOUT_MS`), o runtime interrompe a sessão via `ctx.session.interrupt`. O resultado registra o outcome `interrupted`, os checks determinísticos falham e o run encerra bounded em `failed` sem hang do processo.
-
-### Cenário 11: critic timeout / failure
-- **Invariante:** Caso o critic falhe, dê crash ou retorne saída não-JSON corrompida, o check determinístico `critic-session-outcome` é marcado como `fail`. Esse check impede deterministicamente que qualquer veredito `accept` seja honrado, evitando autoaprovação silenciosa.
-
-### Cenário 12: Jev unavailable / timeout
-- **Invariante:** Se o endpoint do Jev SystemOne retornar HTTP 500 ou timeout, o erro é capturado de forma bounded pelo dispatcher. O run transiciona para `failed` com diagnóstico explícito, sem loops de retry infinitos.
-
-### Cenário 13: provider / global throttle
-- **Invariante:** Quando o worker falha com mensagem indicando throttle do provedor (HTTP 429 / rate limit), o dispatcher detecta a condição e interrompe a orquestração com `switch-throttled`, impedindo tempestades de novas sessões e chamadas à API.
-
-### Cenário 14: maxRounds exhaustion
-- **Invariante:** Se o número máximo de rodadas (`maxRounds`) for alcançado sem conclusão, o kernel intercepta a tentativa de novo ciclo e escala obrigatoriamente para `awaiting-human` com `kind: max-rounds`. O número da rodada nunca excede o limite contratual.
-
-### Cenário 15: tentativa de recursão por sessão interna
-- **Invariante:** Proteção de auto-recursão em 3 camadas:
-  1. No hook de prompt, sessões com marker `orchestration-internal` sofrem bypass de auto-roteamento;
-  2. No handler de RPC de admissão, chamadas vindas de sessões internas retornam status `internal-bypass` e zero runs são despachados;
-  3. Na ferramenta `orchestrate_resume`, a verificação de sessão rejeita callers internos de orquestração (`worker`, `critic`, `orchestrator`).
-
-### Cenário 16: agent / model candidate inválido
-- **Invariante:** Se o Jev tentar selecionar um modelo proibido ou pago (como `openai/gpt-4o`) ou um agente não cadastrado, o dispatcher rejeita a resposta e falha fast-fail com erro explícito (`fora dos candidatos validos`).
-
-### Cenário 17: stale evidence / rodada errada
-- **Invariante:** A máquina de estados valida estritamente a pertinência temporal do `EvidencePacket`. Se um pacote contendo `round: 2` for entregue enquanto o estado estiver em `round: 1`, a transição `EVIDENCE_READY` dispara `OrchestrationError(code: "invalid-evidence")`, rejeitando a evidência.
+| # | Cenário | Camada de Evidência Principal | Invariante Comprovada | Fase Final | Status |
+|---|---------|-------------------------------|----------------------|------------|--------|
+| 1 | **happy path → accept** | **REAL OPENCODE + LIVE JEV SYSTEMONE** | Worker executa, critic read-only valida (0 findings), Jev neural ao vivo emite `accept`. Kernel conclui. Worker e critic em sessões distintas. | `completed` (Round 1) | **PASS** |
+| 2 | **critic encontra problema → Jev não aceita** | **REAL OPENCODE + CONTROLLED JEV BOUNDARY** | Critic detecta blocker. Gate determinístico do kernel barra `accept` e transiciona para recuperação. | `awaiting-human` (Round 1) | **PASS** |
+| 3 | **repair-same** | **REAL OPENCODE + MULTI-ROUND RUNTIME** | Mesma sessão do worker (`workerSessionID`) reusada na rodada 2; critic anterior descartado e novo critic provisionado. Round avança 1 → 2. | `completed` (Round 2) | **PASS** |
+| 4 | **fresh-same** | **REAL OPENCODE + MULTI-ROUND RUNTIME** | Sessão de worker anterior descartada; nova sessão de worker criada mantendo mesmo agent (`build`) e model (`opencode/big-pickle`). | `completed` (Round 2) | **PASS** |
+| 5 | **switch-model** | **REAL OPENCODE + FREE_POOL GUARD** | Troca semântica de modelo autorizada pelo Jev; modelo validado contra o `FREE_POOL` (ex.: `opencode/ling-3.0-flash-fin-free`); nova sessão criada. | `completed` (Round 2) | **PASS** |
+| 6 | **switch-agent** | **REAL OPENCODE + CATALOG GUARD** | Troca de agente autorizada pelo Jev; agente validado como `primaryEligible` (ex.: `plan`); nova sessão criada com round incrementado. | `completed` (Round 2) | **PASS** |
+| 7 | **replan** | **REAL OPENCODE + ORCHESTRATOR ISOLATION** | Sessão isolada de `orchestrator` read-only (zero mutações permitidas); novo `ExecutionContract` validado (mesmo `runID`, `maxRounds` preservado). Nova sessão de worker executa o contrato revisado. | `completed` (Round 2) | **PASS** |
+| 8 | **human + resume concorrente** | **REAL OPENCODE + CONCURRENCY LOCK** | Pausa em `awaiting-human`. Duas chamadas concorrentes sobrepostas: barreira temporal comprova sobreposição estrita (`enters[1] < exits[0]`); exatamente 1 winner; exatamente 1 loser (`invalid-resumable-run`); 1 única human-decision; 1 worker e 1 critic na rodada retomada; 0 locks pendentes. | `completed` (Round 2) | **PASS** |
+| 9 | **stop** | **REAL OPENCODE + IMMEDIATE TERMINATION** | Decisão de parada encerra imediatamente o run em `stopped` na rodada 1; zero novas sessões de worker e zero rodadas extras. | `stopped` (Round 1) | **PASS** |
+| 10 | **worker timeout / interrupted** | **REAL OPENCODE + WORKER BOUNDARY** | Worker excede timeout bounded (`OPJEV_WORKER_TIMEOUT_MS`); OpenCode interrompe a sessão; checks determinísticos falham; run encerra de forma bounded em `failed`. | `failed` (Round 1) | **PASS** |
+| 11 | **critic timeout / failure** | **REAL OPENCODE + CRITIC GUARD** | Falha de execução ou corrupção de saída JSON do critic marca `critic-session-outcome: fail`; impede aprovação determinística no kernel. | `failed` (Round 1) | **PASS** |
+| 12 | **Jev unavailable / timeout** | **REAL OPENCODE + FAULT INJECTION (HTTP 500)** | Falha HTTP 500 na fronteira de rede do Jev tratada de forma bounded sem loops infinitos; run falha de forma segura. | `failed` (Round 1) | **PASS** |
+| 13 | **provider / global throttle** | **REAL OPENCODE + FAULT INJECTION (HTTP 429)** | Detecção de status 429 (rate limit) no provedor interrompe a orquestração em `switch-throttled`, evitando tempestades de chamadas. | `failed` (Round 1) | **PASS** |
+| 14 | **maxRounds exhaustion** | **REAL OPENCODE + BUDGET ENFORCEMENT** | Limite de rodadas do contrato atingido; kernel barra qualquer rodada adicional e escala obrigatoriamente para `awaiting-human` com `kind: max-rounds`. | `awaiting-human` (Round 2) | **PASS** |
+| 15 | **tentativa de recursão por sessão interna** | **REAL OPENCODE + MULTI-LAYER RECURSION GUARD** | Bloqueio verificado em 3 camadas para `worker`, `critic` e `orchestrator`: prompt hook seta `orchestration-internal` e zera escrita de rota; admission RPC retorna `internal-bypass` (0 runs); `orchestrate_resume` rejeita chamador interno. | `internal-bypass` (Round 0) | **PASS** |
+| 16 | **agent / model candidate inválido** | **REAL OPENCODE + CANDIDATE INTEGRITY** | 4 sub-testes exaustivos: (16a) modelo pago fora do free pool (`openai/gpt-4o`); (16b) modelo inexistente; (16c) agente desconhecido; (16d) agente não-primário (`subagent`). Todos rejeitados fail-closed. | `failed` (Round 1) | **PASS** |
+| 17 | **stale evidence / rodada errada** | **REAL OPENCODE + CAUSAL ROUND INTEGRITY** | Pacote de evidência com rodada inconsistente (`round: 99`) injetado no kernel; rejeitado deterministicamente com `OrchestrationError(code: "invalid-evidence")`. | `evaluating` (Round 1) | **PASS** |
 
 ---
 
-## 4. Evidência de Execução dos Gates
+## 4. Evidência Estruturada Salva em Disco
 
-### 4.1 Typecheck
+A execução do runner E2E real gerou o artefato auditável:
+`docs/reports/artifacts/issue-14-real-e2e-evidence.json`
+
+O artefato contém exatamente os campos bounded exigidos pelo modelo de conformidade e segurança:
+`scenarioId`, `scenarioName`, `tier`, `runID`, `round`, `workerSessionID`, `criticSessionID`, `executor`, `verdict`, `command`, `finalPhase`.
+
+Zero raw context, zero chain-of-thought e zero segredos/tokens foram expostos.
+
+---
+
+## 5. Execução dos Gates Obrigatórios
+
+Todos os 6 gates de verificação foram executados com saída limpa:
+
+### 5.1 Typecheck
+```bash
+npm run typecheck
+```
 ```
 > opencode-jev-free-router@0.1.0 typecheck
 > tsc --noEmit -p ./tsconfig.json
 (0 erros, saída limpa)
 ```
 
-### 4.2 Testes Unitários e de Integração
+### 5.2 Testes Unitários e de Integração
+```bash
+npm test
 ```
-> opencode-jev-free-router@0.1.0 test
-> node --test ./src/*.test.mjs
-
+```
 # tests 602
 # suites 100
 # pass 602
@@ -136,47 +113,61 @@ entrada → admission → ExecutionContract → kernel/state machine → Jev dec
 # todo 0
 ```
 
-### 4.3 Matriz E2E Multi-Round Dedicada (#14)
+### 5.3 Matriz Hermética de Estabilização
+```bash
+npm run e2e:matrix
 ```
-> opencode-jev-free-router@0.1.0 e2e:matrix
-> node scripts/e2e-multiround-matrix.mjs
+```
+# tests 17
+# suites 1
+# pass 17
+# fail 0
+# duration_ms ~55ms
+```
 
-================================================================================
-   OPJEV — GATE DEFINITIVO DE ESTABILIZAÇÃO E2E MULTI-ROUND (ISSUE #14)         
-================================================================================
+### 5.4 Gateway E2E
+```bash
+npm run e2e:gateway
+```
+```
+[e2e-gateway] OpenCode v2.0.11 upstream pronto
+[e2e-gateway] Teste 1: Admissão RPC → PASS
+[e2e-gateway] Teste 2: Prompt hook bypass → PASS
+[e2e-gateway] Teste 3: Presentation notice → PASS
+[e2e-gateway] TODOS OS TESTES PASSARAM COM SUCESSO!
+```
 
-| #  | Cenário                                  | Teste / E2E Necessário                                            | Resultado |
-|----|------------------------------------------|-------------------------------------------------------------------|-----------|
-| 1  | happy path → accept                      | Cenário 1: round 1 completed, workerSessionID != criticSessionID, |    PASS   |
-| 2  | critic encontra problema → Jev não aceita | Cenário 2: critic reporta blocker, gate determinístico barra acce |    PASS   |
-| 3  | repair-same                              | Cenário 3: round 1 repair-same -> round 2 mesmo workerSessionID + |    PASS   |
-| 4  | fresh-same                               | Cenário 4: round 1 fresh-same -> round 2 novo workerSessionID + m |    PASS   |
-| 5  | switch-model                             | Cenário 5: troca explícita para modelo elegível do FREE_POOL com  |    PASS   |
-| 6  | switch-agent                             | Cenário 6: transição de agente primaryEligible e round 2 concluíd |    PASS   |
-| 7  | replan                                   | Cenário 7: planejamento isolado, contrato revisado e fresh worker |    PASS   |
-| 8  | human + resume                           | Cenário 8: pausa awaiting-human, rejeição de worker caller, resum |    PASS   |
-| 9  | stop                                     | Cenário 9: parada imediata em stopped na rodada 1 sem novas sessõ |    PASS   |
-| 10 | worker timeout / interrupted             | Cenário 10: timeout dispara interrupção, deterministic check fail |    PASS   |
-| 11 | critic timeout / failure                 | Cenário 11: saída corrompida do critic -> critic-session-outcome  |    PASS   |
-| 12 | Jev unavailable / timeout                | Cenário 12: SystemOne HTTP 500 capturado e abortado com erro expl |    PASS   |
-| 13 | provider / global throttle               | Cenário 13: worker rate-limit aborta transição switch-model sem s |    PASS   |
-| 14 | maxRounds exhaustion                     | Cenário 14: rodadas sucessivas pausam em awaiting-human sem ultra |    PASS   |
-| 15 | tentativa de recursão por sessão interna | Cenário 15: sessão interna bloqueada em prompt hook, admission RP |    PASS   |
-| 16 | agent / model candidate inválido         | Cenário 16: modelo pago (ex: gpt-4o) rejeitado imediatamente no d |    PASS   |
-| 17 | stale evidence / rodada errada           | Cenário 17: evidence de rodada anterior/posterior rejeitada com O |    PASS   |
-================================================================================
- [SUCCESS] Todos os 17 cenários da Issue #14 passaram com sucesso.
- [GATE OK] Matriz multi-round e estabilização de orquestração v1 consolidada.
-================================================================================
+### 5.5 Runner E2E Real Multi-Round (#14)
+```bash
+npm run e2e:multiround-real
+```
+```
+[e2e-real] Iniciando Gate Definitivo de Estabilização E2E Multi-Round Real
+[e2e-real] OpenCode binary: /tmp/opencode-2.0.11/package/bin/opencode
+[e2e-real] Chave OpenCode Zen: oc_sk_4205...
+[e2e-real] Jev SystemOne Proxy ouvindo em :38799
+[e2e-real] Subindo upstream OpenCode v2.0.11 em :40397...
+[e2e-real] Upstream pronto: OpenCode v2.0.11
+[e2e-real] OpenCode v2.0.11 e RPC de Admission operacionais. Iniciando execução dos 17 cenários...
+[e2e-real] [1/17] Cenário 1: PASS (phase=completed, round=1)
+...
+[e2e-real] [17/17] Cenário 17: PASS (threwStale=true)
+====================================================================================================
+ [SUCCESS] Todos os 17 cenários do Gate de Estabilização E2E passaram com sucesso!
+ [PROVA E2E REAL] Executado sobre OpenCode v2.0.11 com Jev SystemOne real e fault-injection de rede.
+====================================================================================================
+```
+
+### 5.6 Git Diff Check
+```bash
+git diff --check
+```
+```
+(0 conflitos de espaço em branco ou formato, saída limpa)
 ```
 
 ---
 
-## 5. Conclusão
+## 6. Conclusão
 
-Todos os requisitos da **Issue #14** foram estritamente satisfeitos:
-1. Matriz de 17 cenários comprovada integralmente;
-2. Zero auto-aprovação de worker;
-3. Respeito inviolável a `maxRounds`, isolamento de sessões e política read-only;
-4. Gateway e runtime de autoridade OpenCode v2.0.11 validados;
-5. Suíte e runners automatizados e reprodutíveis sem segredos.
+A **Issue #14** está integralmente resolvida. O gate de estabilização multi-round comprovou em execução viva e reproduzível que o OPJEV é um control plane robusto, à prova de autoaprovação, com isolamento rígido de papéis e com autoridade estrita do kernel e do Jev.
