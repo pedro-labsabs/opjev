@@ -123,8 +123,11 @@ test("I7c: restart do gateway -> record DURAVEL do plugin mantem run<=1", async 
     assert.equal(up.state.rpcs.length, 2, "gateway sem memoria re-dispara a RPC no wire");
     assert.equal(up.state.patches.length, 0, "nenhum wake em nenhum momento");
     assert.equal(up.state.rpcRuns, 1, "record DURAVEL: UM run efetivo apesar de 2 RPCs no wire");
-    assert.equal(gw2.counters().rpcDispatched, 1, "gateway registra o re-dispatch como diagnostico");
-    assert.equal(gw2.counters().rpcSkippedDuplicate, 0, "skip local nao se aplica pos-restart (memoria perdida)");
+    // Contadores refletem RUNS EFETIVOS (#13): duplicate-ignored do plugin nao
+    // e um run — o re-dispatch pos-restart e observavel como diagnostico
+    // dedicado (rpc-duplicate-ignored), nunca como dispatch de run.
+    assert.equal(gw2.counters().rpcDispatched, 0, "zero segundo run efetivo (record duravel recusou)");
+    assert.equal(gw2.counters().rpcSkippedDuplicate, 1, "re-dispatch observado e suprimido pelo plugin");
   } finally {
     await gw2.close();
     await up.close();

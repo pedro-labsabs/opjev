@@ -23,6 +23,7 @@ import {
   type ExecutionOutcome,
   type HumanDecision,
   type HumanRequest,
+  type InputFrontier,
   type JevVerdict,
   type NextAction,
   type RunState,
@@ -34,8 +35,18 @@ import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFi
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
+import {
+  formatFollowupsSection,
+  revertFollowupConsumption,
+  getInputFrontier,
+  type FollowupTakeSeam,
+  type PendingFollowup,
+  type FollowupStorage,
+} from "./followup.ts";
+import { withKeyedLock } from "../lock.ts";
+import { sessionBindingKey } from "./admission.ts";
 
-export const WORKER_TIMEOUT_MS = 60_000;
+export const WORKER_TIMEOUT_MS = Number(process?.env?.OPJEV_WORKER_TIMEOUT_MS) > 0 ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS) : 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
 export const MAX_FINAL_TEXT = 2000;
 
@@ -200,6 +211,26 @@ export interface DispatcherDeps {
     at: number;
   }): Promise<void>;
   now?(): number;
+  /**
+   * Consumo de follow-ups (#13): seam opcional injetado pelo adapter. Chamado
+   * pelo scheduler no boundary de montagem do prompt de CADA rodada; suporta
+   * protocolo duravel em duas fases (reserve -> prompt -> confirm) e frontier.
+   */
+  followups?:
+    | FollowupTakeSeam
+    | ((runID: string, round: number) => Promise<PendingFollowup[]>);
+  storage?: FollowupStorage;
+}
+
+async function resolveFrontier(deps: DispatcherDeps, runID: string): Promise<InputFrontier> {
+  const followupsAny = deps.followups as any;
+  if (typeof followupsAny?.getFrontier === "function") {
+    return await followupsAny.getFrontier(runID);
+  }
+  if (deps.storage) {
+    return await getInputFrontier({ storage: deps.storage }, runID);
+  }
+  return { revision: 0, pendingCount: 0, pendingFollowups: [] };
 }
 
 export interface OrchestrationRunResult {
@@ -748,7 +779,73 @@ async function executeSchedule(
           ...(mode === "human-resume" && input.humanInstruction ? { humanInstruction: input.humanInstruction } : {}),
         });
       }
-      await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+      // Boundary de consumo de follow-ups (#13): a montagem do prompt da rodada
+      // e um boundary ja governado (ownership do control plane). Consumo
+      // exactly-once (registro consumido no admission storage), secao bounded;
+      // falha do seam => degradacao bounded (rodada segue sem a secao, follow-up
+      // continua pendente — nunca consumido sem retorno). NAO e nova rodada,
+      // comando ou transicao normativa: apenas entrada do prompt da rodada.
+      let takenFollowups: PendingFollowup[] = [];
+      const followupsAny = deps.followups as any;
+      if (typeof followupsAny?.reserve === "function") {
+        try {
+          takenFollowups = await followupsAny.reserve(contract.runID, state.round, {
+            sessionID: workerSessionID,
+            checkDelivered: async (rec: any): Promise<"delivered" | "not-delivered" | "unknown"> => {
+              if (!rec?.reservedSessionID) return "not-delivered";
+              try {
+                const ctxMsgs = await deps.runtime.context({ sessionID: rec.reservedSessionID });
+                return JSON.stringify(ctxMsgs).includes(rec.messageID) ? "delivered" : "not-delivered";
+              } catch {
+                return "unknown"; // fail-closed!
+              }
+            },
+          });
+          const section = formatFollowupsSection(takenFollowups, state.round);
+          if (section) promptText = `${promptText}\n\n${section}`;
+        } catch {
+          // degradacao bounded: o follow-up permanece pendente no record
+        }
+      } else if (typeof deps.followups === "function") {
+        try {
+          takenFollowups = await deps.followups(contract.runID, state.round);
+          const section = formatFollowupsSection(takenFollowups, state.round);
+          if (section) promptText = `${promptText}\n\n${section}`;
+        } catch {
+          // degradacao bounded: o follow-up permanece pendente no record
+        }
+      }
+      let promptDelivered = false;
+      try {
+        await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+        promptDelivered = true;
+        if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
+          try {
+            await followupsAny.markDelivered(contract.runID, takenFollowups, state.round, workerSessionID);
+          } catch {}
+        }
+        if (typeof followupsAny?.confirm === "function" && takenFollowups.length > 0) {
+          await followupsAny.confirm(contract.runID, takenFollowups, state.round);
+        }
+      } catch (promptErr) {
+        if (deps.storage && takenFollowups.length > 0) {
+          if (!promptDelivered) {
+            // Prompt NUNCA alcançou o worker: revert para pending seguro
+            try {
+              await revertFollowupConsumption({ storage: deps.storage }, contract.runID, takenFollowups);
+            } catch {}
+          } else {
+            // Prompt TEVE SUCESSO: worker ja recebeu F no seu input real.
+            // confirm() falhou. NUNCA reverter para pending (evita duplicate redelivery).
+            try {
+              if (typeof followupsAny?.markDelivered === "function") {
+                await followupsAny.markDelivered(contract.runID, takenFollowups, state.round, workerSessionID);
+              }
+            } catch {}
+          }
+        }
+        throw promptErr;
+      }
       await withTimeout(() => deps.runtime.wait({ sessionID: workerSessionID }), timeoutMs, () => deps.runtime.interrupt?.({ sessionID: workerSessionID }));
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
@@ -958,34 +1055,16 @@ async function executeSchedule(
     }
     await persist(deps, { kind: "evidence-ready", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
 
-    // 6. judge
+    // 6. judge + fencing / revision check
     let answers: unknown;
-    try {
-      const judgementState = buildRoundJudgementState(state.contract, state.evidence as EvidencePacket, state.lastVerdict);
-      const questions = buildRoundJudgementQuestions();
-      answers = await deps.decisions.judgeRound({ state: judgementState, questions });
-    } catch (err) {
-      return {
-        abort: true,
-        result: await failRun(
-          state,
-          contract.runID,
-          err,
-          {
-            evidence,
-            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
-            critic: criticProj,
-            rounds,
-          },
-          { deps, kind: "run-failed", workerSessionID, criticSessionID },
-        ),
-      };
-    }
-
-    // 7. parse + verdict
     let verdict: JevVerdict;
+    let transitionResult;
+    const MAX_JUDGE_REFRESH = 3;
+    let judgeAttempts = 0;
+
+    let frontier: InputFrontier;
     try {
-      verdict = parseRoundVerdict(answers);
+      frontier = await resolveFrontier(deps, contract.runID);
     } catch (err) {
       return {
         abort: true,
@@ -1004,28 +1083,208 @@ async function executeSchedule(
       };
     }
 
-    // 8. kernel transition (VERDICT_RECEIVED)
-    let transitionResult;
-    try {
-      transitionResult = transitionRun(state, { type: "VERDICT_RECEIVED", verdict });
-      state = transitionResult.state;
-    } catch (err) {
-      return {
-        abort: true,
-        result: await failRun(
-          state,
-          contract.runID,
-          err,
-          {
-            evidence,
-            worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
-            critic: criticProj,
-            verdict,
-            rounds,
-          },
-          { deps, kind: "run-failed", workerSessionID, criticSessionID },
-        ),
-      };
+    for (;;) {
+      judgeAttempts += 1;
+      const snapshotRevision = frontier.revision;
+      try {
+        const judgementState = buildRoundJudgementState(
+          state.contract,
+          state.evidence as EvidencePacket,
+          state.lastVerdict,
+          frontier,
+        );
+        const questions = buildRoundJudgementQuestions();
+        answers = await deps.decisions.judgeRound({ state: judgementState, questions });
+      } catch (err) {
+        return {
+          abort: true,
+          result: await failRun(
+            state,
+            contract.runID,
+            err,
+            {
+              evidence,
+              worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+              critic: criticProj,
+              rounds,
+            },
+            { deps, kind: "run-failed", workerSessionID, criticSessionID },
+          ),
+        };
+      }
+
+      // 7. parse + verdict
+      try {
+        verdict = parseRoundVerdict(answers);
+      } catch (err) {
+        return {
+          abort: true,
+          result: await failRun(
+            state,
+            contract.runID,
+            err,
+            {
+              evidence,
+              worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+              critic: criticProj,
+              rounds,
+            },
+            { deps, kind: "run-failed", workerSessionID, criticSessionID },
+          ),
+        };
+      }
+
+      // Fencing check: verify revision hasn't changed during judgeRound
+      // AND shared boundary with terminal commit if nextAction is terminal (accept/stop).
+      const sessionID = contract.sessionID ?? contract.runID;
+      const sessionLockKey = `admission/session/${sessionID}`;
+      let canCommit = true;
+
+      if (verdict.nextAction === "accept" || verdict.nextAction === "stop") {
+        try {
+          canCommit = await withKeyedLock(sessionLockKey, async () => {
+            const currentFrontier = await resolveFrontier(deps, contract.runID);
+            if (currentFrontier.revision !== snapshotRevision) {
+              frontier = currentFrontier;
+              return false;
+            }
+            // Shared boundary: commit terminal transition in kernel AND storage atomically.
+            // Linearization point: computa transicao candidata SEM mutar state local antes do storage
+            const candidateTransition = transitionRun(state, { type: "VERDICT_RECEIVED", verdict, frontier: currentFrontier });
+            if (deps.storage && contract.sessionID) {
+              const nextPhase = verdict.nextAction === "accept" ? "completed" : "stopped";
+              await deps.storage.set(sessionBindingKey(contract.sessionID), {
+                runID: contract.runID,
+                phase: nextPhase,
+                at: now(),
+              });
+            }
+            transitionResult = candidateTransition;
+            state = candidateTransition.state;
+            frontier = currentFrontier;
+            return true;
+          });
+        } catch (err) {
+          if (deps.storage && contract.sessionID) {
+            try {
+              await deps.storage.set(sessionBindingKey(contract.sessionID), {
+                runID: contract.runID,
+                phase: "failed",
+                at: now(),
+              });
+            } catch {}
+          }
+          return {
+            abort: true,
+            result: await failRun(
+              state,
+              contract.runID,
+              err,
+              {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                verdict,
+                rounds,
+              },
+              { deps, kind: "run-failed", workerSessionID, criticSessionID },
+            ),
+          };
+        }
+
+        if (!canCommit) {
+          if (judgeAttempts < MAX_JUDGE_REFRESH) {
+            continue;
+          }
+          return {
+            abort: true,
+            result: await failRun(
+              state,
+              contract.runID,
+              new OrchestrationError(
+                "stale-verdict-refresh-exhausted",
+                `revision mudou repetidamente durante julgamento (${snapshotRevision} -> ${frontier.revision})`,
+              ),
+              {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                rounds,
+              },
+              { deps, kind: "run-failed", workerSessionID, criticSessionID },
+            ),
+          };
+        }
+      } else {
+        let currentFrontier: InputFrontier;
+        try {
+          currentFrontier = await resolveFrontier(deps, contract.runID);
+        } catch (err) {
+          return {
+            abort: true,
+            result: await failRun(
+              state,
+              contract.runID,
+              err,
+              {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                verdict,
+                rounds,
+              },
+              { deps, kind: "run-failed", workerSessionID, criticSessionID },
+            ),
+          };
+        }
+        if (currentFrontier.revision !== snapshotRevision) {
+          if (judgeAttempts < MAX_JUDGE_REFRESH) {
+            frontier = currentFrontier;
+            continue;
+          }
+          return {
+            abort: true,
+            result: await failRun(
+              state,
+              contract.runID,
+              new OrchestrationError(
+                "stale-verdict-refresh-exhausted",
+                `revision mudou repetidamente durante julgamento (${snapshotRevision} -> ${currentFrontier.revision})`,
+              ),
+              {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                rounds,
+              },
+              { deps, kind: "run-failed", workerSessionID, criticSessionID },
+            ),
+          };
+        }
+        frontier = currentFrontier;
+        try {
+          transitionResult = transitionRun(state, { type: "VERDICT_RECEIVED", verdict, frontier });
+          state = transitionResult.state;
+        } catch (err) {
+          return {
+            abort: true,
+            result: await failRun(
+              state,
+              contract.runID,
+              err,
+              {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                verdict,
+                rounds,
+              },
+              { deps, kind: "run-failed", workerSessionID, criticSessionID },
+            ),
+          };
+        }
+      }
+      break;
     }
     await persist(deps, { kind: "verdict-applied", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
 
@@ -1036,7 +1295,7 @@ async function executeSchedule(
       critic: criticProj,
       evidence,
       verdict,
-      transition: { commands: transitionResult.commands },
+      transition: { commands: transitionResult ? transitionResult.commands : [] },
     };
   }
 
@@ -1280,8 +1539,7 @@ async function executeSchedule(
       mode = "replan";
       continue;
     }
-    // Terminal / boundary: accept => completed; stop => stopped; human
-    // => pending command mapeado pelo kernel + checkpoint human-awaiting.
+
     pendingCommands = out.state.phase === "completed" ? [] : out.transition.commands.map((c) => c.type);
     if (out.state.phase === "awaiting-human") {
       // Boundary humano persistido explicitamente (PAUSE1): requestID

@@ -30,6 +30,7 @@ export class OrchestrationError extends Error {
  */
 export interface ExecutionContract {
   runID: string;
+  sessionID?: string;
   objective: string;
   scope: {
     include?: string[];
@@ -43,6 +44,7 @@ export interface ExecutionContract {
 
 export const CONTRACT_LIMITS = {
   runID: 200,
+  sessionID: 200,
   objective: 2000,
   phrase: 500, // constraint / acceptance criterion
   evidence: 300, // requiredEvidence item
@@ -58,6 +60,9 @@ export function validateExecutionContract(contract: unknown): asserts contract i
   const c = contract as Record<string, unknown>;
 
   assertBoundedString(c.runID, CONTRACT_LIMITS.runID, "runID", fail);
+  if (c.sessionID !== undefined) {
+    assertBoundedString(c.sessionID, CONTRACT_LIMITS.sessionID, "sessionID", fail);
+  }
   assertBoundedString(c.objective, CONTRACT_LIMITS.objective, "objective", fail);
   assertStringArray(c.acceptanceCriteria, CONTRACT_LIMITS.array, CONTRACT_LIMITS.phrase, "acceptanceCriteria", fail, true);
   assertStringArray(c.constraints, CONTRACT_LIMITS.array, CONTRACT_LIMITS.phrase, "constraints", fail, false);
@@ -438,12 +443,18 @@ export type ExecutionOutcome = "succeeded" | "failed" | "interrupted";
  * Eventos explicitos do control plane. Conjunto minimo: nenhum framework
  * generico de eventos — so o que o loop de orquestracao precisa.
  */
+export interface InputFrontier {
+  revision: number;
+  pendingCount: number;
+  pendingFollowups: Array<{ messageID: string; text: string }>;
+}
+
 export type OrchestrationEvent =
   | { type: "CONTRACT_READY"; contract?: ExecutionContract }
   | { type: "EXECUTION_STARTED"; executor?: ExecutorRef }
   | { type: "EXECUTION_FINISHED"; outcome: ExecutionOutcome }
   | { type: "EVIDENCE_READY"; evidence: EvidencePacket }
-  | { type: "VERDICT_RECEIVED"; verdict: JevVerdict }
+  | { type: "VERDICT_RECEIVED"; verdict: JevVerdict; frontier?: InputFrontier }
   | { type: "HUMAN_DECISION_RECEIVED"; decision: HumanDecision }
   | { type: "COMMAND_FAILED"; command?: OrchestrationCommand["type"]; error?: string };
 

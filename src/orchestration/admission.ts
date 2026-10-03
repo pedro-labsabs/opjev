@@ -112,6 +112,7 @@ export function buildAutomaticExecutionContract(input: AutomaticAdmissionInput):
   }
   const contract: ExecutionContract = {
     runID: autoAdmissionRunID(input.sessionID, input.messageID),
+    sessionID: input.sessionID,
     objective: boundText(input.objective, CONTRACT_LIMITS.objective),
     scope: {},
     constraints: [

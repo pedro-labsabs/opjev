@@ -19,9 +19,11 @@
 // $E2E_ROOT/runs/<ts>/ (logs, JSONL do sniffer, dump do PTY, resultado JSON).
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
 import { runIDDigest } from "../src/orchestration/admission.ts";
 
@@ -37,6 +39,10 @@ const T = {
   exec: 120000,
   notice: 300000,
   tuiTotal: 540000,
+  // Janela para o follow-up F ser consumido no boundary de rodada (r-2) de um
+  // run A em re_execucao (prompt inicial re-admitido apos timeout de worker):
+  // admission persiste, binding running, dispatcher monta prompt da r-2.
+  fuConsume: 60000,
 };
 
 // ---------------------------------------------------------------- utilidades
@@ -246,6 +252,66 @@ function extractMsgId(text) {
 
 const sesIds = (text) => [...text.matchAll(/"id"\s*:\s*"(ses_[A-Za-z0-9]+)"/g)].map((m) => m[1]);
 
+/**
+ * Texto efetivamente RENDERIZADO no PTY: remove sequencias de controle (SGR/CUP)
+ * e as bordas laterais das caixas do TUI, para que um texto quebrado em varias
+ * linhas pela largura do toast volte a ser contiguo no stream. Sem isso a
+ * verificacao de identidade depende de ONDE a quebra de linha caiu.
+ */
+function rebuildRenderedText(raw) {
+  return String(raw)
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][^\x07]*\x07/g, "")
+    .replace(/\x1b[()][B0]/g, "")
+    .replace(/\x1b[=>]/g, "")
+    .replace(/[ \t]*┃[ \t]*┃[ \t]*/g, "");
+}
+
+/**
+ * Evidencia CRUA do storage do plugin (#13): le os records de follow-up e o
+ * binding de admission direto do opencode.db do HOME efemero do E2E. Nao e
+ * mock: e o mesmo KV duravel que o control plane escreveu no runtime real.
+ */
+function readPluginKv(homeDir) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  if (!fs.existsSync(dbPath)) return null;
+  try {
+    const require = createRequire(import.meta.url);
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare("SELECT key, value FROM kv WHERE key LIKE '%orchestration%'").all();
+    db.close();
+    // Cada record e indexado UMA VEZ pela sua chave completa (`m[0]`, que
+    // sempre comeca em "orchestration/"). Indexar tambem pelo prefixo
+    // duplicaria o mesmo record e as contagens por provenance (1 record por F)
+    // deixariam de valer.
+    const out = { followups: new Map(), bindings: new Map(), records: new Map(), runs: new Map() };
+    for (const row of rows) {
+      const m = /orchestration\/(followup|followup-index|session|admission|run)\/(.+)$/.exec(row.key);
+      if (!m) continue;
+      let value;
+      try {
+        value = JSON.parse(row.value);
+      } catch {
+        value = row.value;
+      }
+      if (m[1] === "followup") {
+        out.followups.set(m[0], value);
+      } else if (m[1] === "session") {
+        out.bindings.set(m[0], value);
+      } else if (m[1] === "admission") {
+        out.records.set(m[0], value);
+      } else if (m[1] === "run") {
+        out.runs.set(m[0], value);
+      }
+    }
+    return out;
+  } catch (err) {
+    log(`aviso: leitura do plugin kv falhou (${err.message})`);
+    return null;
+  }
+}
+
 // ==================================================================== E2E
 async function main() {
   if (!fs.existsSync(BIN)) {
@@ -263,9 +329,78 @@ async function main() {
   const ptyDumpPath = path.join(RUN_DIR, "pty-dump.bin");
   const tuiSpecPath = path.join(RUN_DIR, "tui-spec.json");
   const tuiCanaryPath = path.join(RUN_DIR, "tui-notice.canary");
+  const tuiTracePath = path.join(RUN_DIR, "tui-presentation.trace.jsonl");
   const resultPath = path.join(RUN_DIR, "e2e-result.json");
 
-  fs.copyFileSync(path.join(REPO, "opencode.jsonc.example"), path.join(projectDir, "opencode.json"));
+  // Jev SystemOne deterministico local para o E2E:
+  // Jev responde as perguntas de roteamento e as perguntas de julgamento de rodada
+  // com total fidelidade ao contrato arquitetural (#13):
+  // se pendingFollowupsCount > 0 -> done=false, next_action="repair-same"
+  // se pendingFollowupsCount === 0 -> done=true, next_action="accept"
+  const jevCalls = [];
+  const jevServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const body = tryParse(raw);
+      jevCalls.push({ path: req.url, body });
+      const q = body?.questions ?? {};
+      const st = body?.state ?? {};
+      const answers = {};
+
+      // 1. Perguntas de roteamento (router / auto-route)
+      if (q.route) answers.route = { type: "choice", choice: "fast-coding", confidence: 0.95 };
+      if (q.agent) answers.agent = { type: "choice", choice: "build" };
+      if (q.model) answers.model = { type: "choice", choice: "opencode/nemotron-3.5-lightning-free" };
+      if (q.is_risky) answers.is_risky = { type: "noul", noul: 0 };
+      if (q.complexity) answers.complexity = { type: "score", score: 0 };
+
+      // 2. Perguntas de julgamento de rodada (round judgement)
+      // O Jev e autoridade exclusiva do julgamento:
+      // Se ha follow-ups pendentes no frontier bounded recebido pelo Jev,
+      // ele autoriza reparacao pelo mesmo executor ("repair-same") para consumir F.
+      // Se nao ha follow-ups pendentes, ele autoriza aceitacao ("accept").
+      if (q.done && q.next_action) {
+        const hasPending = typeof st.pendingFollowupsCount === "number" && st.pendingFollowupsCount > 0;
+        if (hasPending) {
+          answers.done = { type: "noul", noul: 0 };
+          answers.failure_class = { type: "choice", choice: "implementation" };
+          answers.same_executor_can_repair = { type: "noul", noul: 1 };
+          answers.next_action = { type: "choice", choice: "repair-same", confidence: 0.95 };
+        } else {
+          answers.done = { type: "noul", noul: 1 };
+          answers.failure_class = { type: "choice", choice: "none" };
+          answers.same_executor_can_repair = { type: "noul", noul: 1 };
+          answers.next_action = { type: "choice", choice: "accept", confidence: 0.95 };
+        }
+      }
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ model: "jev-1.13-free", answers }));
+    });
+  });
+  await new Promise((resolve) => jevServer.listen(0, "127.0.0.1", resolve));
+  const jevPort = jevServer.address().port;
+  log(`Jev SystemOne mock deterministico em :${jevPort}`);
+
+  const opencodeConfig = {
+    $schema: "https://opencode.ai/config.json",
+    plugins: [
+      {
+        package: "./plugins/opencode-jev-free-router",
+        options: {
+          jevModel: "jev-1.13-free",
+          jevEndpoint: `http://127.0.0.1:${jevPort}/v1/systemone`,
+          apiKeyEnv: "OPENCODE_API_KEY",
+          confidenceThreshold: 0.55,
+          enableAutoRoute: true,
+          jevTimeoutMs: 15000,
+        },
+      },
+    ],
+  };
+  fs.writeFileSync(path.join(projectDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
   installServerPluginToProject(projectDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
@@ -273,6 +408,10 @@ async function main() {
   const upstreamEnv = {
     PATH: process.env.PATH ?? "",
     HOME: homeDir,
+    OPJEV_JEV_ENDPOINT: `http://127.0.0.1:${jevPort}/v1/systemone`,
+    OPJEV_WORKER_TIMEOUT_MS: process.env.OPJEV_WORKER_TIMEOUT_MS ?? "120000",
+    // Trace da apresentacao (lado server: registro do RPC e resultado do emit).
+    OPJEV_TUI_TRACE: tuiTracePath,
     ...(process.env.OPENCODE_API_KEY ? { OPENCODE_API_KEY: process.env.OPENCODE_API_KEY } : {}),
   };
   log(`subindo upstream v2.0.11 em :${upPort} (HOME ${homeDir})`);
@@ -597,6 +736,15 @@ async function main() {
       20000,
       "admitted x2",
     );
+    // A admissao e durable antes do RPC ao upstream: `admitted x2` NAO implica
+    // que o resultado do orchestrate ja voltou. Aguarda (bounded) a resposta
+    // do primeiro orchestrate antes de julgar a contagem de dispatch — sem
+    // isso a assercao mede a latencia do RPC, nao a idempotencia.
+    await waitFor(
+      () => since(mark).filter((e) => e.type === "rpc-dispatched").length >= 1,
+      T.dispatch,
+      "rpc-dispatched do run da duplicata",
+    );
     const runIds = since(mark).filter((e) => e.type === "admitted").map((e) => e.runID);
     const dispatched = since(mark).filter((e) => e.type === "rpc-dispatched");
     assert(
@@ -637,7 +785,7 @@ async function main() {
     const sidA = parseDataId(sa.text);
     const sidB = parseDataId(sb.text);
     if (!sidA || !sidB) throw new Error("criacao de sessoes falhou");
-    const text = "ORCH: mesmo texto nas duas sessoes";
+    const text = "ORCH: responda apenas com a palavra PRONTO (duas sessoes)";
     const [ra, rb] = await Promise.all([
       api("POST", `/api/session/${sidA}/prompt`, { text, id: "msg_e2esame000000A1" }),
       api("POST", `/api/session/${sidB}/prompt`, { text, id: "msg_e2esame000000B1" }),
@@ -666,6 +814,192 @@ async function main() {
     assert("fase duas sessoes", false, err.message);
   }
 
+  // ------------------------------- 9b. fase FOLLOW-UP (#13: continuidade)
+  // Causal E2E: session S -> message A -> run R; message F (messageID distinto)
+  // durante R ativo -> binding R detectado -> zero novo run -> F associado a R.
+  // Isolamento: S1 != S2 com follows proprios. Terminal: R terminal + novo
+  // prompt -> novo run permitido. Evidencia crua do storage do plugin.
+  const fu = { sid: null, runA: null, runF: null, sid2: null, runB: null };
+  try {
+    const FU_MSG = "msg_e2efollowup0001";
+    const mark = gwEvents.length;
+    const mk = await api("POST", "/api/session", {});
+    fu.sid = parseDataId(mk.text);
+    if (fu.sid === null) throw new Error("criacao de sessao falhou");
+    const ra = await api("POST", `/api/session/${fu.sid}/prompt`, {
+      id: "msg_e2efollowA00001",
+      text: "ORCH: responda apenas com a palavra PRONTO.",
+    });
+    assert("follow-up: turno inicial 200 com identidade", ra.status === 200 && extractMsgId(ra.text) !== null, `status=${ra.status}`);
+    await waitFor(() => since(mark).some((e) => e.type === "admitted" && e.sessionID === fu.sid), T.dispatch, "admitted do turno A");
+    const admittedA = since(mark).find((e) => e.type === "admitted" && e.sessionID === fu.sid);
+    fu.runA = admittedA?.runID ?? null;
+    await waitFor(() => since(mark).some((e) => e.type === "rpc-dispatched"), T.dispatch, "dispatch do run A");
+    const runADispatches = since(mark).filter((e) => e.type === "rpc-dispatched").length;
+    assert("follow-up: run R despachado exatamente 1x", runADispatches === 1, `dispatches=${runADispatches}`);
+
+    // F chega ENQUANTO R esta ativo (sem esperar o notice de conclusao)
+    const rf = await api("POST", `/api/session/${fu.sid}/prompt`, {
+      id: FU_MSG,
+      text: "ORCH: FOLLOW-UP: cubra tambem o caso de timeout",
+    });
+    assert("follow-up: F admitido 200 com o mesmo messageID", rf.status === 200 && extractMsgId(rf.text) === FU_MSG, `status=${rf.status} msg=${extractMsgId(rf.text)}`);
+    await waitFor(
+      () => since(mark).some((e) => e.type === "rpc-followup-attached" && e.messageID === FU_MSG),
+      T.dispatch,
+      "rpc-followup-attached",
+    );
+    const attachEvents = since(mark).filter((e) => e.type === "rpc-followup-attached");
+    fu.runF = attachEvents[0]?.runID ?? null;
+    assert("follow-up: F associado ao run ATIVO R (evento carrega o dono)", fu.runF === fu.runA, `owner=${fu.runF} R=${fu.runA}`);
+    assert(
+      "follow-up: ZERO segundo run (rpc-dispatched continua 1)",
+      since(mark).filter((e) => e.type === "rpc-dispatched").length === 1,
+      `dispatches=${since(mark).filter((e) => e.type === "rpc-dispatched").length}`,
+    );
+    assert("follow-up: parent=0 na sessao", execStartedCount(fu.sid) === 0, `execStarted=${execStartedCount(fu.sid)}`);
+
+    // Isolamento S1 != S2: segunda sessao com run proprio e follow-up proprio.
+    const mark2 = gwEvents.length;
+    const mk2 = await api("POST", "/api/session", {});
+    fu.sid2 = parseDataId(mk2.text);
+    if (fu.sid2 === null) throw new Error("criacao da sessao 2 falhou");
+    const rb = await api("POST", `/api/session/${fu.sid2}/prompt`, {
+      id: "msg_e2efollowB00001",
+      text: "ORCH: responda apenas com a palavra PRONTO (segunda sessao)",
+    });
+    assert("follow-up: sessao 2 turno 200", rb.status === 200, `status=${rb.status}`);
+    await waitFor(() => since(mark2).some((e) => e.type === "rpc-dispatched"), T.dispatch, "dispatch do run B");
+    const admittedB = since(mark2).find((e) => e.type === "admitted" && e.sessionID === fu.sid2);
+    fu.runB = admittedB?.runID ?? null;
+    const rf2 = await api("POST", `/api/session/${fu.sid2}/prompt`, {
+      id: "msg_e2efollowB0002",
+      text: "ORCH: FOLLOW-UP da sessao 2",
+    });
+    await waitFor(
+      () => since(mark2).some((e) => e.type === "rpc-followup-attached" && e.sessionID === fu.sid2),
+      T.dispatch,
+      "rpc-followup-attached da sessao 2",
+    );
+    const attach2 = since(mark2).filter((e) => e.type === "rpc-followup-attached");
+    assert(
+      "follow-up: S1 != S2 — cada F associado ao run da PROPRIA sessao",
+      attach2.length === 1 && attach2[0].runID === fu.runB && attach2[0].runID !== fu.runA,
+      `ownerB=${attach2[0]?.runID} R2=${fu.runB} R1=${fu.runA}`,
+    );
+
+    // Replay de F: zero attach adicional, zero dispatch (plugin dedupe)
+    const replayMark = gwEvents.length;
+    const rr = await api("POST", `/api/session/${fu.sid}/prompt`, {
+      id: FU_MSG,
+      text: "ORCH: FOLLOW-UP: cubra tambem o caso de timeout",
+    });
+    await sleep(3000);
+    assert(
+      "follow-up: replay(F) => 200 + nenhum attach/dispatch adicional",
+      rr.status === 200 &&
+        since(replayMark).filter((e) => e.type === "rpc-followup-attached").length === 0 &&
+        since(replayMark).filter((e) => e.type === "rpc-dispatched").length === 0,
+      `attached=${since(replayMark).filter((e) => e.type === "rpc-followup-attached").length} dispatched=${since(replayMark).filter((e) => e.type === "rpc-dispatched").length}`,
+    );
+
+    // Terminal(R) + novo prompt => novo run permitido: espera o run A terminar
+    // (notice de FASE publicada na sessao — nao confundir com o notice de
+    // attach do follow-up, que usa o mesmo prefixo "Orquestracao <runA>"), e
+    // entao um novo prompt (ID distinto) cria um NOVO run.
+    const terminalRe = new RegExp(
+      `Orquestracao ${fu.runA.slice(0, 40)}[^\\n]*(?:fase (?:completed|failed|stopped|awaiting-human)|falha)`,
+    );
+    await waitFor(
+      async () => {
+        const res = await api("GET", `/api/session/${fu.sid}/inbox`);
+        return terminalRe.test(res.text) ? res : null;
+      },
+      T.notice,
+      "notice do run A (terminal)",
+    );
+
+    const terminalReB = new RegExp(
+      `Orquestracao ${fu.runB.slice(0, 40)}[^\\n]*(?:fase (?:completed|failed|stopped|awaiting-human)|falha)`,
+    );
+    await waitFor(
+      async () => {
+        const res = await api("GET", `/api/session/${fu.sid2}/inbox`);
+        return terminalReB.test(res.text) ? res : null;
+      },
+      T.notice,
+      "notice do run B (terminal)",
+    );
+
+    // Evidencia CRUA do storage do plugin: provenance completa dos dois
+    // records (messageID, sessionID, runID) — exatamente 1 record por F,
+    // sem vazamento cruzado entre sessoes.
+    const kv = readPluginKv(homeDir);
+    const fuRec1 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === FU_MSG) : [];
+    const fuRec2 = kv ? [...kv.followups.values()].filter((v) => v && v.messageID === "msg_e2efollowB0002") : [];
+    assert(
+      "follow-up: 1 record duravel por F com provenance completa, state === consumed e consumedBoundary (storage real)",
+      fuRec1.length === 1 &&
+        fuRec1[0].sessionID === fu.sid &&
+        fuRec1[0].runID === fu.runA &&
+        typeof fuRec1[0].text === "string" &&
+        fuRec1[0].text.includes("timeout") &&
+        fuRec1[0].state === "consumed" &&
+        typeof fuRec1[0].consumedBoundary === "string" &&
+        fuRec1[0].consumedBoundary.length > 0 &&
+        fuRec1[0].consumedBoundary !== "run-finished-without-consumption",
+      kv === null ? "kv indisponivel" : `records=${fuRec1.length} state=${fuRec1[0]?.state} boundary=${fuRec1[0]?.consumedBoundary}`,
+    );
+    assert(
+      "follow-up: isolamento no storage (record de S2 pertence a S2/R2 e consumido)",
+      fuRec2.length === 1 &&
+        fuRec2[0].sessionID === fu.sid2 &&
+        fuRec2[0].runID === fu.runB &&
+        fuRec2[0].state === "consumed" &&
+        typeof fuRec2[0].consumedBoundary === "string" &&
+        fuRec2[0].consumedBoundary !== "run-finished-without-consumption",
+      kv === null ? "kv indisponivel" : `records=${fuRec2.length} sid=${fuRec2[0]?.sessionID} state=${fuRec2[0]?.state}`,
+    );
+
+    // Prova E2E material (#13): o texto e messageID de F foram entregues no INPUT REAL da worker
+    const runAObj = kv ? kv.runs.get(`orchestration/run/${fu.runA}`) : null;
+    const workerSidA = runAObj?.workerSessionID ?? null;
+    let workerHasF = false;
+    let workerFCount = 0;
+    if (workerSidA) {
+      const wMsgs = await api("GET", `/api/session/${workerSidA}/message`);
+      if (wMsgs.status === 200 && wMsgs.text.includes(FU_MSG) && wMsgs.text.includes("timeout")) {
+        workerHasF = true;
+        const matches = (wMsgs.text.match(new RegExp(FU_MSG, "g")) || []).length;
+        workerFCount = matches;
+      }
+    }
+    assert(
+      "follow-up: texto e messageID de F entregues no INPUT REAL da worker exatamente 1x (OpenCode v2.0.11)",
+      workerHasF && workerFCount === 1,
+      `workerSid=${workerSidA} workerHasF=${workerHasF} count=${workerFCount}`,
+    );
+
+    const termMark = gwEvents.length;
+    const rt = await api("POST", `/api/session/${fu.sid}/prompt`, {
+      id: "msg_e2efollowT0001",
+      text: "ORCH: nova tarefa apos run terminal",
+    });
+    await waitFor(
+      () => since(termMark).some((e) => e.type === "rpc-dispatched"),
+      T.dispatch,
+      "dispatch do run pos-terminal",
+    );
+    const termDispatch = since(termMark).filter((e) => e.type === "rpc-dispatched");
+    assert(
+      "follow-up: run terminal + nova mensagem => NOVO run (admission normal)",
+      rt.status === 200 && termDispatch.length === 1 && termDispatch[0].runID !== fu.runA,
+      `dispatches=${termDispatch.length} newRun=${termDispatch[0]?.runID} oldRun=${fu.runA}`,
+    );
+  } catch (err) {
+    assert("fase follow-up", false, err.message);
+  }
+
   // --------------------------------------------------- 10. fase ROUTE (API)
   try {
     const mark = gwEvents.length;
@@ -677,9 +1011,9 @@ async function main() {
     });
     assert("route: prompt 200", r.status === 200, `status=${r.status}`);
     await waitFor(
-      () => since(mark).some((e) => e.type === "intercept" && e.mode === "route"),
+      () => since(mark).some((e) => e.type === "route" || e.type === "route-fallback"),
       15000,
-      "intercept mode=route",
+      "route decision event",
     );
     const applied = since(mark).filter((e) => e.type === "route").length;
     const fallback = since(mark).filter((e) => e.type === "route-fallback").length;
@@ -765,7 +1099,14 @@ async function main() {
       bin: BIN,
       args: ["--server", gwOrigin],
       cwd: projectDir,
-      env: { OPENCODE_PASSWORD: pw, HOME: homeDir, PATH: process.env.PATH ?? "" },
+      env: {
+        OPENCODE_PASSWORD: pw,
+        HOME: homeDir,
+        PATH: process.env.PATH ?? "",
+        // Trace da apresentacao do TUI: evidencia bruta de POR QUE o toast
+        // renderizou ou nao (usado quando o canario de apresentacao falha).
+        OPJEV_TUI_TRACE: tuiTracePath,
+      },
       boot_ms: 20000,
       steps: [
         { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
@@ -779,6 +1120,11 @@ async function main() {
           },
         },
         { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
+        // Prova DETERMINISTA da apresentacao: o driver so segue quando o render
+        // real (toast) ja apareceu no dump do PTY. O assert required no fim
+        // continua exigindo notice + identidade do run — apenas o harness deixa
+        // de torcer por um toast transitorio.
+        { wait_dump: { regex: "Orquestracao", min_extra: 1, timeout_ms: 180000 } },
         { sleep_ms: 8000 },
         { type: "ping normal pelo tui atraves do gateway", enter: true, after_enter_ms: 500 },
         {
@@ -950,9 +1296,16 @@ async function main() {
 
     let ptyVisible = false;
     if (fs.existsSync(ptyDumpPath) && tuiRunID !== null) {
-      const ptyContent = fs.readFileSync(ptyDumpPath, "utf8");
       const digest = runIDDigest(tuiRunID);
-      ptyVisible = ptyContent.includes("Orquestracao") && (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
+      // O TUI renderiza o notice como toast estreito: o runID QUEBRA entre
+      // linhas e o padding da caixa interrompe a sequencia no stream bruto.
+      // Reconstroi o texto renderizado (sem sequencias ANSI/CUP e sem as bordas
+      // laterais do toast) para provar a identidade REAL independente de onde a
+      // quebra caiu. Aceita o digest como evidencia equivalente.
+      const ptyContent = rebuildRenderedText(fs.readFileSync(ptyDumpPath, "utf8"));
+      ptyVisible =
+        ptyContent.includes("Orquestracao") &&
+        (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
     }
     assert(
       "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)",
@@ -989,11 +1342,14 @@ async function main() {
         String(e.path).includes("/api/rpc/opjev.admission.v1/orchestrate") &&
         !String(e.body ?? "").includes('"input":{}'),
     );
-    const gwRpc = gwCount("rpc-dispatched");
+    const gwOrchCalls =
+      gwCount("rpc-dispatched") +
+      gwCount("rpc-followup-attached") +
+      gwCount("rpc-duplicate-ignored");
     assert(
-      "wire: dispatches RPC no sniffer == dispatches do gateway (RPC=1 por run)",
-      wireRpc === gwRpc,
-      `wire=${wireRpc} gw=${gwRpc}`,
+      "wire: chamadas de orchestrate no sniffer == chamadas de orchestrate do gateway (dispatched + attached + dup)",
+      wireRpc === gwOrchCalls,
+      `wire=${wireRpc} gw=${gwOrchCalls} (dispatched=${gwCount("rpc-dispatched")} attached=${gwCount("rpc-followup-attached")} dup=${gwCount("rpc-duplicate-ignored")})`,
     );
     const resumeFalse = sniffCount(
       (e) => e.dir === "req" && String(e.body ?? "").includes('"resume":false'),
@@ -1064,6 +1420,15 @@ async function main() {
       },
     },
     runIDs: gwEvents.filter((e) => e.type === "rpc-dispatched").map((e) => e.runID),
+    followup: {
+      attached: gwCount("rpc-followup-attached"),
+      duplicateIgnored: gwCount("rpc-duplicate-ignored"),
+      session: fu.sid,
+      runA: fu.runA,
+      runFOwner: fu.runF,
+      session2: fu.sid2,
+      runB: fu.runB,
+    },
     notices: { orchestrate: orch.notice },
     results,
     eventsTail: gwEvents.slice(-400),
@@ -1084,6 +1449,12 @@ async function main() {
   for (const r of requiredFails) log(`FALHOU: ${r.name} — ${r.detail}`);
 
   killAll();
+  try {
+    jevServer.closeAllConnections?.();
+    jevServer.close();
+  } catch {
+    // ja fechado
+  }
   await sleep(1500);
   for (const rec of children) {
     if (!rec.exited) {

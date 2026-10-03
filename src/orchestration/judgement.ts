@@ -14,6 +14,7 @@ import {
   type EvidencePacket,
   type ExecutionContract,
   type FailureClass,
+  type InputFrontier,
   type JevVerdict,
   type NextAction,
 } from "./types.ts";
@@ -57,10 +58,11 @@ export function buildRoundJudgementQuestions(): RoundJudgementQuestions {
   return {
     done: {
       type: "noul",
-      instructions: "Round complete: are ALL acceptance criteria satisfied by the produced evidence?",
+      instructions:
+        "Round complete: are ALL acceptance criteria satisfied by the produced evidence, AND are there ZERO pending user follow-ups waiting to be processed?",
       criteria: {
-        true: "Objective achieved; accept and finish",
-        false: "Objective not achieved; more work is needed",
+        true: "Objective achieved and zero pending follow-ups; accept and finish",
+        false: "Objective not achieved or pending follow-ups must be consumed in next round; more work is needed",
       },
     },
     failure_class: {
@@ -91,7 +93,8 @@ export function buildRoundJudgementQuestions(): RoundJudgementQuestions {
       instructions:
         "Which action must the scheduler take next? The scheduler applies this decision; models/agents are selected separately, never here.",
       criteria: {
-        accept: "Accept the result; the objective is complete (requires done=true)",
+        accept:
+          "Accept the result; the objective is complete and there are ZERO pending user follow-ups (requires done=true and pendingFollowupsCount=0)",
         "repair-same": "The SAME session/executor receives a correction contract and keeps going",
         "fresh-same": "Start a CLEAN new session, same agent/model (context contamination suspected)",
         "switch-model": "Same role/task, but a different model (current model is stuck/incapable)",
@@ -132,6 +135,9 @@ export interface RoundJudgementState {
   criticFindings: EvidencePacket["criticFindings"];
   resultSummary: string;
   previousVerdict?: JevVerdict;
+  inputRevision?: number;
+  pendingFollowupsCount?: number;
+  pendingFollowups?: Array<{ messageID: string; text: string }>;
 }
 
 /**
@@ -143,6 +149,7 @@ export function buildRoundJudgementState(
   contract: ExecutionContract,
   evidence: EvidencePacket,
   previousVerdict?: JevVerdict,
+  frontier?: InputFrontier,
 ): RoundJudgementState {
   const c = contract as unknown as Record<string, unknown> | undefined;
   const ev = evidence as unknown as Record<string, unknown> | undefined;
@@ -195,6 +202,14 @@ export function buildRoundJudgementState(
     criticFindings,
     resultSummary: truncate(asString(ev?.resultSummary), EVIDENCE_LIMITS.resultSummary),
   };
+  if (frontier) {
+    state.inputRevision = frontier.revision;
+    state.pendingFollowupsCount = frontier.pendingCount;
+    state.pendingFollowups = (frontier.pendingFollowups ?? []).slice(0, 5).map((f) => ({
+      messageID: truncate(asString(f.messageID), 200),
+      text: truncate(asString(f.text), 2000),
+    }));
+  }
   if (previousVerdict) return { ...state, previousVerdict };
   return state;
 }

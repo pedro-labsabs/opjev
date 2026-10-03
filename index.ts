@@ -24,6 +24,7 @@ import {
   type WorkerSessionView,
 } from "./src/orchestration/dispatcher.ts";
 import { OrchestrationError, validateExecutionContract, type ExecutionContract } from "./src/orchestration/types.ts";
+import { createFollowupTakeSeam } from "./src/orchestration/followup.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { withResumeLock } from "./src/orchestration/resume-lock.ts";
 import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
@@ -214,6 +215,24 @@ function isGlobalThrottle(error: any): boolean {
   const code = Number(error?.status ?? error?.statusCode ?? error?.code ?? 0);
   const text = `${String(error?.type ?? "")} ${String(error?.message ?? "")}`.toLowerCase();
   return code === 429 || code === 529 || text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
+}
+
+/**
+ * Trace DIAGNOSTICO opcional da apresentacao (off por padrao): append de uma
+ * linha JSON por evento. Habilitado apenas por OPJEV_TUI_TRACE=<arquivo>.
+ * Nao altera comportamento — existe para tornar a prova de apresentacao
+ * auditavel quando o canario do E2E falha (ver tui.ts, lado cliente).
+ */
+function tracePresentation(event: string, detail?: Record<string, unknown>): void {
+  try {
+    const path = process.env?.OPJEV_TUI_TRACE;
+    if (!path) return;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require("node:fs");
+    fs.appendFileSync(path, `${JSON.stringify({ t: Date.now(), side: "server", event, ...detail })}\n`);
+  } catch {
+    // trace nunca pode derrubar a admissao
+  }
 }
 
 // G1: detecta follow-up trivial (continuacao sem mudanca de intencao).
@@ -860,6 +879,27 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
+    storage: {
+      get: async (key: string) => {
+        return await ctx.storage.get(key);
+      },
+      set: async (key: string, value: unknown) => {
+        await ctx.storage.set(key, value);
+      },
+    },
+    // Consumo de follow-ups (#13): o mesmo storage de admission alimenta o
+    // boundary de rodada. Consumo exactly-once (registro consumido no record);
+    // storage indisponivel => fail-closed.
+    followups: createFollowupTakeSeam({
+      storage: {
+        get: async (key: string) => {
+          return await ctx.storage.get(key);
+        },
+        set: async (key: string, value: unknown) => {
+          await ctx.storage.set(key, value);
+        },
+      },
+    }),
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
   };
 }
@@ -1112,14 +1152,20 @@ export default Plugin.define({
           ) {
             presentationEmit = presentationReg.events as any;
           }
-        } catch {
+          tracePresentation("server-presentation-registered", { ok: true });
+        } catch (err) {
+          tracePresentation("server-presentation-registration-failed", {
+            error: String((err as Error)?.message ?? err).slice(0, 300),
+          });
           // Superficie sem suporte a RPC so-eventos: apresentacao fica
           // indisponivel (degradacao bounded); admission segue integralmente.
         }
         await ctx.rpc.register(AdmissionRpc, {
           orchestrate: createAdmissionOrchestrateHandler({
             storage: {
-              get: (key: string) => safeStorageGet(ctx, key),
+              get: async (key: string) => {
+                return await ctx.storage.get(key);
+              },
               set: async (key: string, value: unknown) => {
                 await ctx.storage.set(key, value);
               },
@@ -1149,9 +1195,20 @@ export default Plugin.define({
             // run concluido por evento RPC publico. SEM autoridade: o emit
             // e fire-and-forget; falha nunca altera record/binding/publicacao.
             notify: (event) => {
-              void presentationEmit?.emit(ORCHESTRATION_RESULT_EVENT, event).catch(() => {
-                // TUI indisponivel: degradacao bounded (estado authoritative preservado)
-              });
+              if (!presentationEmit) {
+                tracePresentation("server-emit-skipped", { runID: event?.runID, reason: "sem emit" });
+                return;
+              }
+              void presentationEmit
+                .emit(ORCHESTRATION_RESULT_EVENT, event)
+                .then(() => tracePresentation("server-emit-ok", { runID: event?.runID }))
+                .catch((err) => {
+                  tracePresentation("server-emit-failed", {
+                    runID: event?.runID,
+                    error: String((err as Error)?.message ?? err).slice(0, 300),
+                  });
+                  // TUI indisponivel: degradacao bounded (estado authoritative preservado)
+                });
             },
           }),
         });
