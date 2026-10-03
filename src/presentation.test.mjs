@@ -24,6 +24,12 @@ import {
   ORCHESTRATION_RESULT_EVENT,
   NOTICE_EVENT_LIMIT,
 } from "./orchestration/presentation.ts";
+import {
+  ORCHESTRATION_NOTICE_RE,
+  collectNotices,
+  extractNoticeText,
+  selectUnpresentedNotices,
+} from "./orchestration/presentation-reconcile.ts";
 
 // ───────────────────────────── helpers ─────────────────────────────
 
@@ -249,4 +255,162 @@ test("V8: evento registrado no schema publico do RPC (id/define/events)", () => 
   assert.deepEqual(Object.keys(props).sort(), ["notice", "phase", "round", "runID", "sessionID"]);
   assert.equal(ev.schema.additionalProperties, false);
   assert.equal(props.notice.maxLength, NOTICE_EVENT_LIMIT);
+});
+
+// ────────────── R: reconciliacao DURAVEL da apresentacao (TUI) ──────────────
+// O evento RPC e fire-and-forget e pode se perder; o RESULTADO e duravel no
+// inbox. O reconciliador precisa presentar o que o evento perdeu, sem repetir
+// o que o evento ja mostrou e sem reapresentar historico.
+
+const RUN_A = "auto-ses_parent000001-msg_abc-1a2b3c4d5e6f";
+const RUN_B = "auto-ses_parent000001-msg_def-9f8e7d6c5b4a";
+
+function inboxItem(runID, phase = "failed") {
+  return { id: "msg_notice", text: `Orquestracao ${runID}: fase ${phase}, rodada 1, worker succeeded. Erro: X` };
+}
+
+test("R1: collectNotices extrai runID+fase do notice duravel e ignora qualquer outro texto", () => {
+  const found = collectNotices([
+    inboxItem(RUN_A, "failed"),
+    { text: "resposta normal do modelo, sem relacao com orquestracao" },
+    { text: "Orquestracao sem runID nem fase" },
+    inboxItem(RUN_B, "completed"),
+  ]);
+  assert.deepEqual(
+    found.map((f) => [f.runID, f.phase]),
+    [
+      [RUN_A, "failed"],
+      [RUN_B, "completed"],
+    ],
+  );
+  assert.ok(found[0].notice.includes(RUN_A), "texto do notice preservado para o toast");
+});
+
+test("R2: extractNoticeText aceita item com `text`, string crua e cai para JSON sem quebrar", () => {
+  assert.equal(extractNoticeText({ text: "abc" }), "abc");
+  assert.equal(extractNoticeText("abc"), "abc");
+  assert.ok(extractNoticeText({ body: "abc" }).includes("abc"));
+  assert.equal(extractNoticeText(null), '""');
+  assert.equal(extractNoticeText(undefined), '""');
+});
+
+test("R3: baseline por sessao — a primeira observacao nunca reapresenta historico", () => {
+  const seen = new Set();
+  const baseline = new Set();
+  const out = selectUnpresentedNotices({
+    sessionID: "ses_parent000001",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(out, [], "primeira observacao e baseline: nada a apresentar");
+  assert.ok(seen.has(RUN_A), "historico marcado como visto");
+  assert.ok(baseline.has("ses_parent000001"));
+});
+
+test("R4: notice CHEGADO depois da baseline e apresentado exatamente uma vez (evento perdido)", () => {
+  const seen = new Set();
+  const baseline = new Set();
+  selectUnpresentedNotices({ sessionID: "ses_p", items: [], seen, baseline });
+
+  const out = selectUnpresentedNotices({
+    sessionID: "ses_p",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(
+    out.map((f) => f.runID),
+    [RUN_A],
+    "notice duravel ausente no evento path e recuperado",
+  );
+  seen.add(RUN_A); // o apresentador marca como visto ao renderizar
+
+  const again = selectUnpresentedNotices({
+    sessionID: "ses_p",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(again, [], "exactly-once: reconciliar nao duplica o ja apresentado");
+});
+
+test("R5: reconciliar NUNCA duplica o que o caminho do evento ja apresentou", () => {
+  const seen = new Set([RUN_A]); // o evento RPC ja renderizou
+  const baseline = new Set(["ses_p"]);
+  const out = selectUnpresentedNotices({
+    sessionID: "ses_p",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(out, [], "mesmo runID ja visto pelo evento => sem segundo toast");
+});
+
+test("R6: multiplos notices novos sao apresentados do mais novo para o mais antigo", () => {
+  const seen = new Set();
+  const baseline = new Set();
+  selectUnpresentedNotices({ sessionID: "ses_p", items: [], seen, baseline });
+  const out = selectUnpresentedNotices({
+    sessionID: "ses_p",
+    items: [inboxItem(RUN_A), inboxItem(RUN_B)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(
+    out.map((f) => f.runID),
+    [RUN_B, RUN_A],
+  );
+});
+
+test("R7: baseline e POR SESSAO — sessoes diferentes nao se contaminam", () => {
+  const seen = new Set();
+  const baseline = new Set();
+  // Sessao A ja observada (vazia).
+  selectUnpresentedNotices({ sessionID: "ses_A", items: [], seen, baseline });
+  // Sessao B ja tem notice no inbox ao ser aberta => historico, nao apresenta.
+  const b = selectUnpresentedNotices({
+    sessionID: "ses_B",
+    items: [inboxItem(RUN_B)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(b, [], "historico da sessao B nao e apresentado");
+  assert.ok(seen.has(RUN_B));
+  // Notice NOVO na sessao A continua sendo apresentado.
+  const a = selectUnpresentedNotices({
+    sessionID: "ses_A",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(
+    a.map((f) => f.runID),
+    [RUN_A],
+  );
+});
+
+test("R8: reentrar na sessao NAO re-marca a base (notice chegada enquanto o TUI estava fora ainda aparece)", () => {
+  const seen = new Set();
+  const baseline = new Set();
+  selectUnpresentedNotices({ sessionID: "ses_p", items: [], seen, baseline });
+  // TUI sai da sessao; o notice chega nesse intervalo.
+  const back = selectUnpresentedNotices({
+    sessionID: "ses_p",
+    items: [inboxItem(RUN_A)],
+    seen,
+    baseline,
+  });
+  assert.deepEqual(
+    back.map((f) => f.runID),
+    [RUN_A],
+    "voltar a sessao apresenta o que chegou enquanto fora",
+  );
+});
+
+test("R9: regex do notice e estrito — nunca casa texto livre", () => {
+  assert.equal(ORCHESTRATION_NOTICE_RE.test("Orquestracao auto-x: fase failed, r1"), true);
+  assert.equal(ORCHESTRATION_NOTICE_RE.test("Orquestracao"), false);
+  assert.equal(ORCHESTRATION_NOTICE_RE.test("fase failed sem prefixo"), false);
+  assert.equal(ORCHESTRATION_NOTICE_RE.test("Orquestracao sem-fase"), false);
 });

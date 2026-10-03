@@ -253,6 +253,21 @@ function extractMsgId(text) {
 const sesIds = (text) => [...text.matchAll(/"id"\s*:\s*"(ses_[A-Za-z0-9]+)"/g)].map((m) => m[1]);
 
 /**
+ * Texto efetivamente RENDERIZADO no PTY: remove sequencias de controle (SGR/CUP)
+ * e as bordas laterais das caixas do TUI, para que um texto quebrado em varias
+ * linhas pela largura do toast volte a ser contiguo no stream. Sem isso a
+ * verificacao de identidade depende de ONDE a quebra de linha caiu.
+ */
+function rebuildRenderedText(raw) {
+  return String(raw)
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][^\x07]*\x07/g, "")
+    .replace(/\x1b[()][B0]/g, "")
+    .replace(/\x1b[=>]/g, "")
+    .replace(/[ \t]*┃[ \t]*┃[ \t]*/g, "");
+}
+
+/**
  * Evidencia CRUA do storage do plugin (#13): le os records de follow-up e o
  * binding de admission direto do opencode.db do HOME efemero do E2E. Nao e
  * mock: e o mesmo KV duravel que o control plane escreveu no runtime real.
@@ -314,6 +329,7 @@ async function main() {
   const ptyDumpPath = path.join(RUN_DIR, "pty-dump.bin");
   const tuiSpecPath = path.join(RUN_DIR, "tui-spec.json");
   const tuiCanaryPath = path.join(RUN_DIR, "tui-notice.canary");
+  const tuiTracePath = path.join(RUN_DIR, "tui-presentation.trace.jsonl");
   const resultPath = path.join(RUN_DIR, "e2e-result.json");
 
   // Jev SystemOne deterministico local para o E2E:
@@ -394,6 +410,8 @@ async function main() {
     HOME: homeDir,
     OPJEV_JEV_ENDPOINT: `http://127.0.0.1:${jevPort}/v1/systemone`,
     OPJEV_WORKER_TIMEOUT_MS: process.env.OPJEV_WORKER_TIMEOUT_MS ?? "120000",
+    // Trace da apresentacao (lado server: registro do RPC e resultado do emit).
+    OPJEV_TUI_TRACE: tuiTracePath,
     ...(process.env.OPENCODE_API_KEY ? { OPENCODE_API_KEY: process.env.OPENCODE_API_KEY } : {}),
   };
   log(`subindo upstream v2.0.11 em :${upPort} (HOME ${homeDir})`);
@@ -1081,7 +1099,14 @@ async function main() {
       bin: BIN,
       args: ["--server", gwOrigin],
       cwd: projectDir,
-      env: { OPENCODE_PASSWORD: pw, HOME: homeDir, PATH: process.env.PATH ?? "" },
+      env: {
+        OPENCODE_PASSWORD: pw,
+        HOME: homeDir,
+        PATH: process.env.PATH ?? "",
+        // Trace da apresentacao do TUI: evidencia bruta de POR QUE o toast
+        // renderizou ou nao (usado quando o canario de apresentacao falha).
+        OPJEV_TUI_TRACE: tuiTracePath,
+      },
       boot_ms: 20000,
       steps: [
         { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
@@ -1095,6 +1120,11 @@ async function main() {
           },
         },
         { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
+        // Prova DETERMINISTA da apresentacao: o driver so segue quando o render
+        // real (toast) ja apareceu no dump do PTY. O assert required no fim
+        // continua exigindo notice + identidade do run — apenas o harness deixa
+        // de torcer por um toast transitorio.
+        { wait_dump: { regex: "Orquestracao", min_extra: 1, timeout_ms: 180000 } },
         { sleep_ms: 8000 },
         { type: "ping normal pelo tui atraves do gateway", enter: true, after_enter_ms: 500 },
         {
@@ -1266,9 +1296,16 @@ async function main() {
 
     let ptyVisible = false;
     if (fs.existsSync(ptyDumpPath) && tuiRunID !== null) {
-      const ptyContent = fs.readFileSync(ptyDumpPath, "utf8");
       const digest = runIDDigest(tuiRunID);
-      ptyVisible = ptyContent.includes("Orquestracao") && (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
+      // O TUI renderiza o notice como toast estreito: o runID QUEBRA entre
+      // linhas e o padding da caixa interrompe a sequencia no stream bruto.
+      // Reconstroi o texto renderizado (sem sequencias ANSI/CUP e sem as bordas
+      // laterais do toast) para provar a identidade REAL independente de onde a
+      // quebra caiu. Aceita o digest como evidencia equivalente.
+      const ptyContent = rebuildRenderedText(fs.readFileSync(ptyDumpPath, "utf8"));
+      ptyVisible =
+        ptyContent.includes("Orquestracao") &&
+        (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
     }
     assert(
       "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)",

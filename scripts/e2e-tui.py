@@ -16,7 +16,8 @@ Spec (JSON):
     {"key": "\\u001b"},
     {"wait_log": {"file": "/caminho/gateway.log",
                   "regex": "rpc-dispatched", "min_extra": 1,
-                  "timeout_ms": 60000}}
+                  "timeout_ms": 60000}},
+    {"wait_dump": {"regex": "Orquestracao", "min_extra": 1, "timeout_ms": 120000}}
   ],
   "dump_to": "/caminho/pty-dump.bin"
 }
@@ -126,6 +127,27 @@ def main() -> int:
                     sys.stderr.write(
                         f"driver: wait_log '{wl['regex']}' nao alcancou {target} "
                         f"(baseline {baseline}) no passo {idx}\n"
+                    )
+                    return 1
+            elif "wait_dump" in step:
+                # Espera o render REAL aparecer no proprio dump do PTY (o
+                # arquivo que o driver esta escrevendo). Sem isso o harness
+                # torceria por um toast transitorio e o gate de apresentacao
+                # viraria flaky por construcao.
+                wd = step["wait_dump"]
+                target = int(wd.get("min_extra", 1))
+                deadline = time.time() + wd.get("timeout_ms", 30000) / 1000.0
+                ok = False
+                while time.time() < deadline:
+                    if count_in_file(spec["dump_to"], wd["regex"]) >= target:
+                        ok = True
+                        break
+                    if not pump(0.5):
+                        break
+                if not ok:
+                    sys.stderr.write(
+                        f"driver: wait_dump '{wd['regex']}' nao apareceu no dump "
+                        f"no passo {idx}\n"
                     )
                     return 1
             else:

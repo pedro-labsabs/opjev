@@ -217,6 +217,24 @@ function isGlobalThrottle(error: any): boolean {
   return code === 429 || code === 529 || text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
 }
 
+/**
+ * Trace DIAGNOSTICO opcional da apresentacao (off por padrao): append de uma
+ * linha JSON por evento. Habilitado apenas por OPJEV_TUI_TRACE=<arquivo>.
+ * Nao altera comportamento — existe para tornar a prova de apresentacao
+ * auditavel quando o canario do E2E falha (ver tui.ts, lado cliente).
+ */
+function tracePresentation(event: string, detail?: Record<string, unknown>): void {
+  try {
+    const path = process.env?.OPJEV_TUI_TRACE;
+    if (!path) return;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require("node:fs");
+    fs.appendFileSync(path, `${JSON.stringify({ t: Date.now(), side: "server", event, ...detail })}\n`);
+  } catch {
+    // trace nunca pode derrubar a admissao
+  }
+}
+
 // G1: detecta follow-up trivial (continuacao sem mudanca de intencao).
 // Curto e composto so por palavras de continuacao -> nao re-rerrota.
 const FOLLOW_UP_RE =
@@ -1134,7 +1152,11 @@ export default Plugin.define({
           ) {
             presentationEmit = presentationReg.events as any;
           }
-        } catch {
+          tracePresentation("server-presentation-registered", { ok: true });
+        } catch (err) {
+          tracePresentation("server-presentation-registration-failed", {
+            error: String((err as Error)?.message ?? err).slice(0, 300),
+          });
           // Superficie sem suporte a RPC so-eventos: apresentacao fica
           // indisponivel (degradacao bounded); admission segue integralmente.
         }
@@ -1173,9 +1195,20 @@ export default Plugin.define({
             // run concluido por evento RPC publico. SEM autoridade: o emit
             // e fire-and-forget; falha nunca altera record/binding/publicacao.
             notify: (event) => {
-              void presentationEmit?.emit(ORCHESTRATION_RESULT_EVENT, event).catch(() => {
-                // TUI indisponivel: degradacao bounded (estado authoritative preservado)
-              });
+              if (!presentationEmit) {
+                tracePresentation("server-emit-skipped", { runID: event?.runID, reason: "sem emit" });
+                return;
+              }
+              void presentationEmit
+                .emit(ORCHESTRATION_RESULT_EVENT, event)
+                .then(() => tracePresentation("server-emit-ok", { runID: event?.runID }))
+                .catch((err) => {
+                  tracePresentation("server-emit-failed", {
+                    runID: event?.runID,
+                    error: String((err as Error)?.message ?? err).slice(0, 300),
+                  });
+                  // TUI indisponivel: degradacao bounded (estado authoritative preservado)
+                });
             },
           }),
         });
