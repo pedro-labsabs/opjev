@@ -263,7 +263,7 @@ const SCENARIO_DEFS = [
   { id: 4, name: "fresh-same", tier: "REAL OPENCODE + MULTI-ROUND RUNTIME" },
   { id: 5, name: "switch-model", tier: "REAL OPENCODE + FREE_POOL GUARD" },
   { id: 6, name: "switch-agent", tier: "REAL OPENCODE + CATALOG GUARD" },
-  { id: 7, name: "replan", tier: "REAL OPENCODE + ORCHESTRATOR ISOLATION" },
+  { id: 7, name: "replan", tier: "REAL OPENCODE + PROVIDER TOOL VISIBILITY" },
   { id: 8, name: "human + resume", tier: "REAL OPENCODE + CONCURRENCY LOCK" },
   { id: 9, name: "stop", tier: "REAL OPENCODE + IMMEDIATE TERMINATION" },
   { id: 10, name: "worker timeout / interrupted", tier: "REAL OPENCODE + WORKER BOUNDARY" },
@@ -1071,7 +1071,20 @@ async function main() {
     const orchestratorCreated = orchestratorSessions.length === 1;
     const orchestrator = orchestratorSessions[0];
     const orchestratorRoleCorrect = orchestrator?.role === "orchestrator" && orchestrator?.agentRole === "orchestrator";
-    const readOnlyPolicyReal = orchestrator?.permissions && orchestrator.permissions.includes('"action":"edit","resource":"*","effect":"deny"');
+    // A restrictive SessionCreateInput permission would remove tools from the
+    // Zen-facing request and trigger provider.auth 403. Read-only authority is
+    // enforced by the plugin's execute.before hook; this field only proves
+    // provider compatibility, never local authorization.
+    let providerToolCompatibilityReal = false;
+    try {
+      const providerPermissions = typeof orchestrator?.permissions === "string"
+        ? JSON.parse(orchestrator.permissions)
+        : orchestrator?.permissions;
+      providerToolCompatibilityReal = Array.isArray(providerPermissions) &&
+        providerPermissions.some((rule) => rule?.action === "*" && rule?.resource === "*" && rule?.effect === "allow");
+    } catch {
+      providerToolCompatibilityReal = false;
+    }
     const freshWorkerRound2 = workerSessions.length === 2 && workerSessions[0].id !== workerSessions[1].id;
     const sameRunId = runState.state.contract.runID === runID;
     const maxRoundsNotIncreased = runState.state.contract.maxRounds <= 2;
@@ -1080,7 +1093,7 @@ async function main() {
       runState.state.round === 2 &&
       orchestratorCreated &&
       orchestratorRoleCorrect &&
-      readOnlyPolicyReal &&
+      providerToolCompatibilityReal &&
       freshWorkerRound2 &&
       sameRunId &&
       maxRoundsNotIncreased;
@@ -1100,7 +1113,7 @@ async function main() {
       command: "none",
       finalPhase: runState.state.phase,
     });
-    log(`  -> Cenário 7: ${pass ? "PASS" : "FAIL"} (orchestrator=${orchestratorCreated}, readOnly=${Boolean(readOnlyPolicyReal)}, freshWorker=${freshWorkerRound2})`);
+    log(`  -> Cenário 7: ${pass ? "PASS" : "FAIL"} (orchestrator=${orchestratorCreated}, providerToolsVisible=${providerToolCompatibilityReal}, localBoundary=execute.before-unit-tested, freshWorker=${freshWorkerRound2})`);
   }
 
   // --- Cenário 8: human + resume ---
