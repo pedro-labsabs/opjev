@@ -25,7 +25,7 @@ import {
   buildDefaultContextInstruction,
   buildCriticContextInstruction,
 } from "./worker-hooks.ts";
-import { buildCriticPermissionRules } from "./orchestration/readonly-policy.ts";
+import { buildCriticProviderPermissions } from "./orchestration/readonly-policy.ts";
 import * as workerHooks from "./worker-hooks.ts";
 import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
 import { aggregateUsage } from "./resource-governor/usage-ledger.ts";
@@ -1714,19 +1714,32 @@ describe("critic tool-level: read-only runtime, anti-rerouting, role instruction
         [{ action: "subagent", resource: "*", effect: "deny" }],
         "worker nao herda read-only do critic: boundary propria de implementer (so nega subagent)",
       );
-      assert.ok(Array.isArray(criticCreate.permissions) && criticCreate.permissions.length > 0, "critic com permission rules");
-      const actions = criticCreate.permissions.map((r) => `${r.action}:${r.effect}`);
-      for (const a of ["edit:deny", "shell:deny", "subagent:deny", "skill:deny", "question:deny", "webfetch:deny", "websearch:deny", "external_directory:deny", "execute:deny"]) {
-        assert.ok(actions.includes(a), `critic policy nega ${a}`);
-      }
-      for (const a of ["read:allow", "glob:allow", "grep:allow"]) {
-        assert.ok(actions.includes(a), `critic policy permite ${a}`);
-      }
-      assert.ok(!actions.some((a) => a.endsWith(":ask")), "nenhuma regra em ask");
+      assert.deepEqual(
+        criticCreate.permissions,
+        buildCriticProviderPermissions(),
+        "critic recebe toolset provider-compatible; permissões não são sua autoridade local",
+      );
       assert.equal(criticCreate.metadata["jev-role"], "critic");
       assert.equal(criticCreate.metadata["jev-router"], "orchestration-internal");
       assert.equal(criticCreate.metadata["jev-round"], 1);
       assert.notEqual(out.worker.sessionID, out.critic.sessionID, "IDs distintos");
+
+      let sideEffects = 0;
+      for (const tool of ["bash", "edit", "write", "task", "execute", "question", "webfetch", "mcp:mutable-tool"]) {
+        await assert.rejects((async () => {
+          await m.hooks.tool["execute.before"]({ sessionID: out.critic.sessionID, tool });
+          sideEffects += 1;
+        })(), /OPJEV_INTERNAL_TOOL_DENIED/, `critic deve bloquear ${tool} antes do side effect`);
+      }
+      assert.equal(sideEffects, 0, "nenhum executor mutável foi chamado para o critic");
+      const callsBeforeDeniedRecovery = stub.calls.length;
+      await m.hooks.tool["execute.after"]({
+        tool: "bash",
+        sessionID: out.critic.sessionID,
+        status: "error",
+        error: { message: "OPJEV_INTERNAL_TOOL_DENIED: local read-only authority" },
+      });
+      assert.equal(stub.calls.length, callsBeforeDeniedRecovery, "deny read-only não consulta Jev nem abre retry/recovery loop");
     } finally {
       stub.restore();
     }
@@ -1819,7 +1832,7 @@ describe("critic tool-level: read-only runtime, anti-rerouting, role instruction
       const criticCreate = m.workerCalls.create.find((c) => c.metadata?.["jev-role"] === "critic");
       assert.equal(criticCreate.metadata["jev-role"], "critic", "metadata de role NAO mudou");
       assert.equal(criticCreate.metadata["jev-router"], "orchestration-internal");
-      assert.deepEqual(criticCreate.permissions, buildCriticPermissionRules(), "policy read-only intacta");
+      assert.deepEqual(criticCreate.permissions, buildCriticProviderPermissions(), "provider recebe permissões de compatibilidade; enforcement read-only é local");
       // Instrucao de contexto do critic permanece a fixa (nao absorve injecao).
       const cev = { sessionID: out.critic.sessionID, agent: "build", model: { providerID: "opencode", id: "big-pickle" }, system: [], messages: [], tools: {}, options: {} };
       await m.hooks.session.context(cev);
@@ -1997,22 +2010,16 @@ describe("tool orchestrate_once (schema, Code Mode, execucao real)", () => {
       assert.equal(cCreated.metadata["jev-router"], "orchestration-internal");
       assert.equal(cCreated.metadata["jev-run-id"], "tool-test-worker");
       assert.equal(cCreated.metadata["jev-round"], 1);
-      assert.ok(
-        Array.isArray(cCreated.permissions) && cCreated.permissions.length > 0,
-        "critic session.create recebe permission rules",
+      assert.deepEqual(
+        cCreated.permissions,
+        buildCriticProviderPermissions(),
+        "critic anuncia o toolset ao provider sem transferir authority local",
       );
       assert.deepEqual(
         created.permissions,
         [{ action: "subagent", resource: "*", effect: "deny" }],
         "worker NAO herda read-only do critic: boundary propria de implementer",
       );
-      const cActions = cCreated.permissions.map((r) => `${r.action}:${r.effect}`);
-      for (const a of ["edit:deny", "shell:deny", "subagent:deny", "question:deny", "external_directory:deny", "execute:deny"]) {
-        assert.ok(cActions.includes(a), `critic policy nega ${a}`);
-      }
-      for (const a of ["read:allow", "glob:allow", "grep:allow"]) {
-        assert.ok(cActions.includes(a), `critic policy permite ${a}`);
-      }
       const info = m.workerSessions.get(out.worker.sessionID);
       assert.ok(info, "sessao worker registrada no runtime");
       assert.equal(info.agent, "build");
@@ -2351,20 +2358,17 @@ describe("orchestrator role/isolation pura (ORCH2/ORCH4-text/ORCH5)", () => {
     assert.ok(!text.toLowerCase().includes("chain-of-thought"), "sem CoT");
   });
 
-  it("ORCH5: orchestrator permissions = read-only envelope (nega edit/shell/subagent/execute)", async () => {
-    const build = readonlyPolicy.buildOrchestratorPermissionRules;
-    assert.equal(typeof build, "function", "buildOrchestratorPermissionRules existe (RED: nao existe)");
+  it("ORCH5: orchestrator anuncia tools para o provider; execução read-only é local", async () => {
+    const build = readonlyPolicy.buildOrchestratorProviderPermissions;
+    assert.equal(typeof build, "function", "buildOrchestratorProviderPermissions existe");
     const rules = build();
     const has = (action, effect) => rules.some((r) => r.action === action && r.effect === effect);
-    assert.ok(has("read", "allow"), "read permitido");
-    for (const a of ["edit", "shell", "subagent", "execute", "skill", "question", "webfetch", "websearch", "external_directory"]) {
-      assert.ok(has(a, "deny"), `orchestrator nega ${a}`);
-    }
-    assert.ok(!rules.some((r) => r.effect === "ask"), "nenhum ask (sem escalada)");
+    assert.ok(has("*", "allow"), "provider vê o toolset completo compatível");
+    assert.ok(has("external_directory", "deny"), "restrição external_directory preservada no Permission API");
     assert.deepEqual(
       rules,
-      readonlyPolicy.buildCriticPermissionRules(),
-      "mesmo envelope read-only do critic (sem duplicacao de policy)",
+      readonlyPolicy.buildCriticProviderPermissions(),
+      "mesma compatibilidade provider-facing para critic e orchestrator",
     );
   });
 });
@@ -2394,6 +2398,15 @@ describe("orchestrator hooks no adapter (ORCH3/ORCH4-adapter)", () => {
     assert.equal(ev.metadata["jev-role"], "orchestrator", "papel preservado");
     assert.equal(ev.metadata["jev-agent"], undefined, "sem agente roteado");
     assert.equal(ev.metadata["jev-route"], undefined, "sem rota decidida");
+
+    let sideEffects = 0;
+    for (const tool of ["bash", "edit", "write", "task", "execute", "question", "webfetch"]) {
+      await assert.rejects((async () => {
+        await m.hooks.tool["execute.before"]({ sessionID: info.id, tool });
+        sideEffects += 1;
+      })(), /OPJEV_INTERNAL_TOOL_DENIED/, `orchestrator deve bloquear ${tool} localmente`);
+    }
+    assert.equal(sideEffects, 0, "orchestrator não invoca executores mutáveis");
   });
 
   it("ORCH4-adapter: context hook injeta instrucao do orchestrator (sem Jev normal)", async () => {
@@ -3429,7 +3442,7 @@ describe("tool orchestrate_once: agent catalog eligibility (ARC4-ARC11)", () => 
     }
   });
 
-  it("ARC11: critic permission payload nega subagent spawn (read-only preservado)", async () => {
+  it("ARC11: critic anuncia tools para o provider; boundary local impede subagent", async () => {
     const m = await bootCtx({
       models: ALL_MODELS,
       agents: catalogAgents(),
@@ -3459,10 +3472,15 @@ describe("tool orchestrate_once: agent catalog eligibility (ARC4-ARC11)", () => 
       const criticCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "critic");
       const perms = criticCreates[0].permissions ?? [];
       assert.ok(
-        perms.some((p) => p.action === "subagent" && p.effect === "deny"),
-        "critic nega subagent spawn",
+        perms.some((p) => p.action === "*" && p.effect === "allow"),
+        "toolset compatível fica visível ao provider",
       );
-      assert.ok(perms.some((p) => p.action === "read" && p.effect === "allow"), "critic continua read-only");
+      let executions = 0;
+      await assert.rejects((async () => {
+        await m.hooks.tool["execute.before"]({ sessionID: out.critic.sessionID, tool: "task" });
+        executions += 1;
+      })(), /OPJEV_INTERNAL_TOOL_DENIED/);
+      assert.equal(executions, 0, "TaskTool negada antes de criar child session");
     } finally {
       stub.restore();
     }

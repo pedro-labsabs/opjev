@@ -27,7 +27,8 @@ import { OrchestrationError, validateExecutionContract, type ExecutionContract }
 import { createFollowupTakeSeam } from "./src/orchestration/followup.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { withResumeLock } from "./src/orchestration/resume-lock.ts";
-import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
+import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./src/orchestration/readonly-policy.ts";
+import { enforceInternalToolAuthority, registerInternalToolSession, resolveInternalToolRole } from "./src/orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -534,6 +535,7 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
       if (!sessionID) {
         throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
       }
+      registerInternalToolSession(sessionID, "worker");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -563,11 +565,10 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
 }
 
 /**
- * Runtime do critic: mesma API de sessao, mas a criacao injeta as permission
- * rules read-only (buildCriticPermissionRules) no `ctx.session.create` do
- * critic. Enforcement e do runtime OpenCode; o adapter apenas declara a
- * policy. O worker (makeWorkerRuntime) NUNCA recebe permission rules —
- * cria sem o campo, entao nao herda restricao do critic.
+ * Runtime do critic: anuncia toolset compativel ao provider. A autoridade
+ * read-only e aplicada localmente por `tool.execute.before`, que verifica
+ * metadata de role criada pelo dispatcher antes de qualquer tool side effect.
+ * Worker continua com sua permission boundary propria.
  */
 function makeCriticRuntime(ctx: any): CriticRuntime {
   return {
@@ -578,12 +579,13 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
         location: input.location,
         // Critic logico: mesma sessao kind critic, papel auditavel separado.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "critic" },
-        permissions: buildCriticPermissionRules(),
+        permissions: buildCriticProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
         throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
       }
+      registerInternalToolSession(sessionID, "critic");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -617,7 +619,8 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
  * Canonical agent/model vindos do dispatcher (nunca selection hardcoded, nunca
  * escolha do planner); location atual; read-only (mesmo envelope do critic,
  * com execute=deny contra tools.jev.* e recursao); metadata com jev-role
- * orchestrator + jev-agent-role orchestrator. Nao registra agent novo.
+ * orchestrator + jev-agent-role orchestrator. Nao registra agent novo. O
+ * provider recebe o toolset compativel; enforcement read-only e local.
  */
 function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
   return {
@@ -627,12 +630,13 @@ function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
         model: input.model,
         location: input.location,
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "orchestrator" },
-        permissions: buildOrchestratorPermissionRules(),
+        permissions: buildOrchestratorProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
         throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
       }
+      registerInternalToolSession(sessionID, "orchestrator");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -961,6 +965,15 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
   if (event?.status !== "error") return;
   const sessionID = String(event?.sessionID ?? "");
   if (!sessionID) return;
+  // Critic/orchestrator are evaluators/planners, never Jev decision clients.
+  // A local read-only denial must not turn into a Jev retry/recovery loop.
+  try {
+    const info: any = await ctx.session.get({ sessionID });
+    const role = resolveInternalToolRole(info?.metadata, sessionID);
+    if (role === "critic" || role === "orchestrator" || role === "ambiguous") return;
+  } catch {
+    return;
+  }
   const tool = String(event?.tool ?? "unknown");
   const message = String(event?.error?.message ?? event?.error ?? "");
   const errorClass = errorClassOf(message);
@@ -1151,6 +1164,13 @@ export default Plugin.define({
     // Resolve por chamada (nao so no setup) para captar `export` ou
     // `/connect` feitos apos o load. resolveApiKey le a env primeiro.
     const getKey = () => resolveApiKey(ctx, opts.apiKeyEnv);
+
+    // Provider-compatible tools are still subject to local role authority.
+    // OpenCode 2.0.11 runs execute.before before item.execute; a thrown deny
+    // fails the tool call without invoking shell/write/MCP/other side effects.
+    await ctx.tool.hook("execute.before", async (event: any) => {
+      await enforceInternalToolAuthority(ctx, event);
+    });
 
     // Emissor do evento de apresentacao (presentation boundary, PR #27):
     // registro somete-eventos no mesmo seam RPC publico; `null` quando a

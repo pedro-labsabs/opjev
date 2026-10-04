@@ -1,66 +1,69 @@
-// RED — read-only permission policy para o critic session.
-//
-// Principio default-deny: o critic NUNCA recebe capacidade de mutar o
-// workspace nem de escalar autorizacao. Formato exatamente o suportado por
-// SessionCreateInput.permissions / Permission.Rule dos tipos instalados
-// (@opencode/plugin 2.0.7): { action, resource, effect } com
-// effect em allow|deny|ask. V2: shell (nao bash), subagent (nao task),
-// edit (cobre write/patch).
+// Provider visibility and local authorization are tested independently.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCriticPermissionRules,
-  CRITIC_DENIED_ACTIONS,
-  CRITIC_ALLOWED_ACTIONS,
+  buildCriticProviderPermissions,
+  buildOrchestratorProviderPermissions,
 } from "./orchestration/readonly-policy.ts";
+import { enforceInternalToolAuthority } from "./orchestration/tool-authority.ts";
 
-describe("critic read-only policy (runtime permission rules)", () => {
-  it("toda superficie mutavel negada explicitamente (hard deny, nunca ask)", () => {
-    const rules = buildCriticPermissionRules();
-    const denies = rules.filter((r) => r.effect === "deny");
-    for (const action of CRITIC_DENIED_ACTIONS) {
-      assert.ok(
-        denies.some((r) => r.action === action && r.resource === "*"),
-        `deny ${action} *`,
-      );
+const INTERNAL = "orchestration-internal";
+const criticCtx = {
+  session: {
+    get: async () => ({ metadata: {
+      "jev-router": INTERNAL,
+      "jev-role": "critic",
+      "jev-agent-role": "critic",
+    } }),
+  },
+};
+
+describe("critic/orchestrator provider visibility with local read-only authority", () => {
+  it("advertises a compatible provider toolset for both roles", () => {
+    for (const rules of [buildCriticProviderPermissions(), buildOrchestratorProviderPermissions()]) {
+      assert.ok(rules.some((r) => r.action === "*" && r.resource === "*" && r.effect === "allow"));
+      assert.ok(!rules.some((r) => r.effect === "ask"));
     }
   });
 
-  it("capacidades de leitura permitidas ('read', 'glob', 'grep')", () => {
-    const rules = buildCriticPermissionRules();
-    for (const action of CRITIC_ALLOWED_ACTIONS) {
-      assert.ok(
-        rules.some((r) => r.action === action && r.effect === "allow"),
-        `allow ${action}`,
-      );
+  it("locally hard-denies mutating and execution tools before invocation", async () => {
+    for (const tool of ["bash", "edit", "write", "task", "execute", "question", "webfetch", "websearch"]) {
+      let executorInvocations = 0;
+      await assert.rejects((async () => {
+        await enforceInternalToolAuthority(criticCtx, { sessionID: "critic", tool });
+        executorInvocations += 1;
+      })(), /OPJEV_INTERNAL_TOOL_DENIED/);
+      assert.equal(executorInvocations, 0, `${tool}: zero executor invocation`);
     }
   });
 
-  it("nenhuma regra usa ask (critic nao consegue escalar autorizacao)", () => {
-    for (const r of buildCriticPermissionRules()) {
-      assert.notEqual(r.effect, "ask", `nenhuma regra em ask: ${JSON.stringify(r)}`);
+  it("allows only read/glob/grep for critic", async () => {
+    for (const tool of ["read", "glob", "grep"]) {
+      await assert.doesNotReject(enforceInternalToolAuthority(criticCtx, { sessionID: "critic", tool }));
     }
   });
 
-  it("segredos (.env) nunca lidos mesmo com allow geral de read", () => {
-    const rules = buildCriticPermissionRules();
-    for (const pat of ["*.env", "*.env.*"]) {
-      assert.ok(
-        rules.some((r) => r.action === "read" && r.resource === pat && r.effect === "deny"),
-        `deny read ${pat}`,
-      );
+  it("keeps secret and external-directory restrictions in the local permission rules", () => {
+    const rules = buildCriticProviderPermissions();
+    for (const [action, resource] of [
+      ["read", "*.env"],
+      ["read", "*.env.*"],
+      ["external_directory", "*"],
+    ]) {
+      assert.ok(rules.some((r) => r.action === action && r.resource === resource && r.effect === "deny"));
     }
   });
 
-  it("policy estavel entre chamadas (ordenacao preserva last-match-wins)", () => {
-    assert.deepEqual(buildCriticPermissionRules(), buildCriticPermissionRules());
+  it("returns stable, identical compatibility rules for critic and orchestrator", () => {
+    assert.deepEqual(buildCriticProviderPermissions(), buildCriticProviderPermissions());
+    assert.deepEqual(buildOrchestratorProviderPermissions(), buildOrchestratorProviderPermissions());
+    assert.deepEqual(buildCriticProviderPermissions(), buildOrchestratorProviderPermissions());
   });
 
-  it("regras no formato exato {action, resource, effect} com effect valido", () => {
-    for (const r of buildCriticPermissionRules()) {
-      assert.equal(typeof r.action, "string");
-      assert.equal(typeof r.resource, "string");
-      assert.ok(["allow", "deny", "ask"].includes(r.effect), `effect valido: ${JSON.stringify(r)}`);
+  it("preserves the runtime rule shape and valid effects", () => {
+    for (const rule of buildCriticProviderPermissions()) {
+      assert.deepEqual(Object.keys(rule).sort(), ["action", "effect", "resource"]);
+      assert.ok(["allow", "deny"].includes(rule.effect));
     }
   });
 });
