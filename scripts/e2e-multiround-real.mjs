@@ -156,6 +156,44 @@ function readRunFromDb(homeDir, runID) {
   }
 }
 
+function injectStaleEvidenceRound(homeDir, runID, expectedRound, staleRound) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  const target = `:orchestration/run/${runID}`;
+  const db = new DatabaseSync(dbPath);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("SELECT key, value FROM kv WHERE key = ? OR substr(key, -length(?)) = ?").get(runID, target, target);
+    if (!row?.value) throw new Error(`run persistido ausente para fault injection: ${runID}`);
+    const persisted = typeof row.value === "string" ? JSON.parse(row.value) : row.value;
+    if (persisted.state?.phase !== "awaiting-human") throw new Error("fault injection exige run real awaiting-human");
+    if (persisted.state.round !== expectedRound || persisted.state.evidence?.round !== expectedRound) {
+      throw new Error("fault injection exige evidence.round igual ao round real antes da corrupção");
+    }
+    if (staleRound === expectedRound) throw new Error("fault injection exige round stale divergente");
+
+    const before = JSON.stringify(persisted);
+    persisted.state.evidence.round = staleRound;
+    const injected = JSON.stringify(persisted);
+    const result = db.prepare("UPDATE kv SET value = ? WHERE key = ?").run(injected, row.key);
+    if (result.changes !== 1) throw new Error(`fault injection alterou ${result.changes} rows; esperado 1`);
+    db.exec("COMMIT");
+
+    const verifiedRow = db.prepare("SELECT value FROM kv WHERE key = ?").get(row.key);
+    const verified = JSON.parse(verifiedRow.value);
+    const expectedOnlyMutation = JSON.parse(before);
+    expectedOnlyMutation.state.evidence.round = staleRound;
+    if (JSON.stringify(verified) !== JSON.stringify(expectedOnlyMutation)) {
+      throw new Error("fault injection alterou campos alem de state.evidence.round");
+    }
+    return { key: row.key, persisted: verified, originalEvidenceRound: expectedRound, injectedEvidenceRound: staleRound };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
 function getSessionsForRun(homeDir, runID) {
   try {
     const db = getSqliteDb(homeDir);
@@ -1665,14 +1703,150 @@ async function main() {
     log(`  -> Cenário 16: ${pass ? "PASS" : "FAIL"} (16a=${c16a}, 16b=${c16b}, 16c=${c16c}, 16d=${c16d})`);
   }
 
-  // --- Cenário 17: stale evidence ---
+  // --- Cenário 17: stale evidence via storage fault injection + real host resume ---
   {
     const id = 17;
-    log(`[${id}/17] Cenário 17: BLOCKER — dispatcher não expõe boundary runtime de EvidencePacket`);
-    const pass = false;
-    const runID = "none";
-    results.push({ id, name: SCENARIO_DEFS[16].name, pass, phase: "BLOCKED", round: 0, runID, blocker: "EvidencePacket is constructed inside dispatcher; no runtime injection seam" });
-    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[16].name, tier: "BLOCKER — NOT REAL OPENCODE", runID, round: 0, workerSessionID: "none", criticSessionID: "none", executor: { agent: "none", model: "none" }, verdict: "BLOCKER: no legitimate runtime EvidencePacket injection boundary; prior direct kernel injection removed", command: "none", finalPhase: "BLOCKED" });
+    log(`[${id}/17] Cenário 17: evidence.round stale injetado no SQLite real; rejeição via tool host real...`);
+    let c17JevRequests = 0;
+    activeProxyBehavior = { mode: "custom" };
+    customJevHandler = async (reqBody) => {
+      c17JevRequests += 1;
+      if (reqBody?.questions?.done) {
+        return { model: "jev-1.13-free", answers: stdAnswers({
+          done: { type: "noul", noul: 0 },
+          failure_class: { type: "choice", choice: "bad-contract" },
+          same_executor_can_repair: { type: "noul", noul: 0 },
+          next_action: { type: "choice", choice: "human", confidence: 0.95 },
+        }) };
+      }
+      return { model: "jev-1.13-free", answers: stdAnswers() };
+    };
+
+    const sourceSessionID = await createRealSession();
+    const messageID = `msg_e2e_c17_${Date.now()}`;
+    const admission = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", {
+      input: { sessionID: sourceSessionID, messageID, objective: "Pause with a valid current-round evidence packet", maxRounds: 1 },
+    });
+    const runID = getRunId(admission);
+    const awaitingHuman = await waitFor(() => {
+      const current = readRunFromDb(homeDir, runID);
+      return current?.state?.phase === "awaiting-human" ? current : null;
+    }, 60000, "Cenário 17 run real awaiting-human com evidence válido");
+    const roundBefore = awaitingHuman.state.round;
+    const evidenceRoundBefore = awaitingHuman.state.evidence?.round;
+    const decision = { requestID: awaitingHuman.state.pendingHuman?.requestID, action: "resume", newMaxRounds: 2 };
+    const sessionsBefore = getSessionsForRun(homeDir, runID);
+    const workersBefore = sessionsBefore.filter((session) => session.role === "worker").map((session) => session.id).sort();
+    const criticsBefore = sessionsBefore.filter((session) => session.role === "critic").map((session) => session.id).sort();
+    const humanDecisionsBefore = awaitingHuman.state.history.filter((entry) => Boolean(entry.humanDecision)).length;
+    const jevRequestsBefore = c17JevRequests;
+
+    // Adversarial input only: mutate state.evidence.round; preserve phase, round, checkpoint, history, and all other fields.
+    const injected = injectStaleEvidenceRound(homeDir, runID, roundBefore, roundBefore + 1);
+    const injectedRun = injected.persisted;
+    const callerID = await createRealSession();
+    const callerIdleBaseline = (() => {
+      const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+      const count = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(callerID).n;
+      db.close();
+      return count;
+    })();
+    const callerToken = `C17_STALE_RESUME_${callerID}`;
+    let releaseBarrier;
+    const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+    activeResumeToolRequests = {
+      expected: 1,
+      arrived: 0,
+      pending: new Map([[callerToken, { runID, decision }]]),
+      observedInputs: [],
+      barrier,
+      releaseBarrier,
+      toolNames: [],
+      unsupported: false,
+    };
+    const promptResult = await api("POST", `/api/session/${callerID}/prompt`, {
+      text: `${callerToken} Use Code Mode execute to call tools.jev.orchestrate_resume with exactly ${JSON.stringify({ runID, decision })}. Do not call another tool.`,
+    });
+    let callerProcessed = false;
+    try {
+      await waitFor(() => {
+        const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+        const count = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(callerID).n;
+        db.close();
+        return count > callerIdleBaseline;
+      }, 45000, "Cenário 17 tool-call real de resume concluído");
+      callerProcessed = true;
+    } catch {}
+    const callerMessages = (() => {
+      const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+      const rows = db.prepare("SELECT data FROM session_message WHERE session_id = ?").all(callerID);
+      db.close();
+      return rows.map((row) => String(row.data));
+    })();
+    const invalidResumableRunObserved = callerMessages.some((data) => data.includes("invalid-resumable-run"));
+    const staleEvidenceDiagnosticObserved = callerMessages.some((data) => data.includes("evidence.round difere do state.round"));
+    const toolInputObserved = activeResumeToolRequests.arrived === 1 &&
+      activeResumeToolRequests.observedInputs.length === 1 &&
+      activeResumeToolRequests.observedInputs[0]?.runID === runID &&
+      activeResumeToolRequests.observedInputs[0]?.decision?.requestID === decision.requestID;
+    const finalRun = readRunFromDb(homeDir, runID);
+    const sessionsAfter = getSessionsForRun(homeDir, runID);
+    const workersAfter = sessionsAfter.filter((session) => session.role === "worker").map((session) => session.id).sort();
+    const criticsAfter = sessionsAfter.filter((session) => session.role === "critic").map((session) => session.id).sort();
+    const humanDecisionsAfter = finalRun?.state?.history?.filter((entry) => Boolean(entry.humanDecision)).length ?? -1;
+    const jevRequestsAfter = c17JevRequests;
+    const persistedStateUnchangedAfterInjection = JSON.stringify(finalRun) === JSON.stringify(injectedRun);
+    const noNewWorkers = JSON.stringify(workersAfter) === JSON.stringify(workersBefore);
+    const noNewCritics = JSON.stringify(criticsAfter) === JSON.stringify(criticsBefore);
+    const lockTelemetry = up.lines.filter((line) => line.includes("[opjev-e2e] resume-lock-release=")).at(-1);
+    const lockCountZero = lockTelemetry?.endsWith("=0") ?? false;
+    const staleInputConfirmed = evidenceRoundBefore === roundBefore && injected.injectedEvidenceRound === roundBefore + 1 && injectedRun.state.evidence.round === roundBefore + 1;
+    const pass = awaitingHuman.state.phase === "awaiting-human" && typeof decision.requestID === "string" &&
+      promptResult.status === 200 && callerProcessed && toolInputObserved && invalidResumableRunObserved &&
+      staleEvidenceDiagnosticObserved && staleInputConfirmed && persistedStateUnchangedAfterInjection &&
+      finalRun?.state?.phase === "awaiting-human" && finalRun.state.round === roundBefore &&
+      finalRun.state.evidence.round === roundBefore + 1 && noNewWorkers && noNewCritics &&
+      humanDecisionsAfter === humanDecisionsBefore && jevRequestsAfter === jevRequestsBefore && lockCountZero;
+
+    results.push({ id, name: SCENARIO_DEFS[16].name, pass, phase: finalRun?.state?.phase ?? "missing", round: finalRun?.state?.round ?? -1, runID });
+    evidenceRecords.push({
+      scenarioId: id,
+      scenarioName: SCENARIO_DEFS[16].name,
+      tier: "REAL OPENCODE + CONTROLLED HUMAN GATE + SQLITE EVIDENCE FAULT INJECTION",
+      runID,
+      requestID: decision.requestID,
+      initialPhase: awaitingHuman.state.phase,
+      round: roundBefore,
+      evidenceRoundBefore,
+      evidenceRoundInjected: injected.injectedEvidenceRound,
+      workerSessionIDsBefore: workersBefore,
+      workerSessionIDsAfter: workersAfter,
+      criticSessionIDsBefore: criticsBefore,
+      criticSessionIDsAfter: criticsAfter,
+      callerSessionID: callerID,
+      callerPromptStatus: promptResult.status,
+      callerProcessed,
+      executor: awaitingHuman.state.executor,
+      invalidResumableRunObserved,
+      staleEvidenceDiagnosticObserved,
+      diagnostic: "evidence.round difere do state.round",
+      toolInputObserved,
+      observedResumeInput: activeResumeToolRequests.observedInputs.map((request) => ({ runID: request.runID, requestID: request.decision.requestID })),
+      noNewWorkers,
+      noNewCritics,
+      humanDecisionsBefore: humanDecisionsBefore,
+      humanDecisionsAfter,
+      jevRequestsBefore,
+      jevRequestsAfter,
+      persistedStateUnchangedAfterInjection,
+      lockCountZero,
+      lockTelemetry: lockTelemetry ?? "missing",
+      verdict: pass ? "invalid-resumable-run: stale evidence.round rejected before decision or dispatch" : "BLOCKED/FAIL: stale EvidencePacket rejection or bounded no-side-effect assertions missing",
+      command: "real OpenCode admission -> stale evidence.round storage fault injection -> session prompt -> Code Mode execute -> tools.jev.orchestrate_resume",
+      finalPhase: finalRun?.state?.phase ?? "missing",
+    });
+    log(`  -> Cenário 17: ${pass ? "PASS" : "FAIL"} (invalid=${invalidResumableRunObserved}, evidenceDiag=${staleEvidenceDiagnosticObserved}, noWorkers=${noNewWorkers}, noCritics=${noNewCritics}, jevStable=${jevRequestsAfter === jevRequestsBefore}, persistedStable=${persistedStateUnchangedAfterInjection})`);
+    activeResumeToolRequests = null;
   }
 
   // ---------------------------------------------------------------- Persistir Evidência
