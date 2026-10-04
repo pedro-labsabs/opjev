@@ -43,7 +43,8 @@ test("pressure dimensions keep provenance/confidence separate; quota is unknown 
   assert.equal(empty.quota.level, "unknown");
   assert.equal(empty.quota.confidence, "none");
   assert.equal("quotaRemainingPercent" in empty, false);
-  assert.equal(empty.profile, "normal");
+  assert.equal(empty.profile, "unknown");
+  assert.equal([empty.quota, empty.rate, empty.context, empty.execution, empty.availability].every(x => x.level === "unknown" && x.confidence === "none"), true);
 });
 
 test("429, 529, and rate-limit evidence raise rate pressure without suggesting a model switch", () => {
@@ -73,7 +74,7 @@ test("retry storm is inferred deterministically, recovery follows window expiry"
   assert.equal(pressured.execution.confidence, "medium");
   const recovered = estimateResourcePressure(aggregateUsage(storm, { from: 200, to: 300 }));
   assert.equal(recovered.execution.level, "unknown");
-  assert.equal(recovered.profile, "normal");
+  assert.equal(recovered.profile, "unknown");
 });
 
 test("provider failures do not become capability findings", () => {
@@ -89,8 +90,10 @@ test("context and operations profiles are deterministic observations only", () =
   assert.equal(estimateResourcePressure(context).context.level, "high");
   for (const [facts, profile] of [
     [[{ at: 1, kind: "throttle" }], "conservative"],
+    [[{ at: 1, kind: "throttle" }, { at: 2, kind: "throttle" }, { at: 3, kind: "throttle" }], "scarce"],
     [[{ at: 1, kind: "quota-limit" }], "survival"],
   ]) assert.equal(estimateResourcePressure(aggregateUsage(facts, { from: 0, to: 10 })).profile, profile);
+  assert.equal(estimateResourcePressure(aggregateUsage([{ at: 1, kind: "request" }], { from: 0, to: 10 })).profile, "unknown");
 });
 
 test("pressure outputs cannot silently create routing or budget authority", () => {
@@ -100,6 +103,7 @@ test("pressure outputs cannot silently create routing or budget authority", () =
   assert.equal("agent" in pressure, false);
   assert.equal("maxRounds" in pressure, false);
   assert.equal("nextAction" in pressure, false);
+  assert.equal("routing" in pressure, false);
 });
 
 test("storage sink serializes concurrent writes and persists a bounded sanitized ring", async () => {

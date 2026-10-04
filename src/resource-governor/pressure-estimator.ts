@@ -8,7 +8,7 @@ export interface PressureSignal {
   provenance: string[];
   observedCount?: number;
 }
-export type ResourceProfile = "normal" | "conservative" | "scarce" | "survival";
+export type ResourceProfile = "unknown" | "normal" | "conservative" | "scarce" | "survival";
 export interface ResourcePressure {
   estimatedAt: number;
   window: { from: number; to: number };
@@ -48,7 +48,10 @@ export function estimateResourcePressure(usage: UsageWindow, estimatedAt = usage
   const max = (rank: Record<PressureLevel, number>) => Math.max(...levels.map(x => rank[x]));
   const rank: Record<PressureLevel, number> = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
   const peak = max(rank);
-  const profile: ResourceProfile = peak >= 4 ? "survival" : peak >= 3 ? "scarce" : peak >= 2 ? "conservative" : "normal";
+  // Missing evidence is not evidence of normal operation. A normal profile
+  // requires a future, explicit low-pressure coverage contract; this slice
+  // does not have an authoritative quota/capacity baseline to support it.
+  const profile: ResourceProfile = peak === 0 ? "unknown" : peak >= 4 ? "survival" : peak >= 3 ? "scarce" : peak >= 2 ? "conservative" : "unknown";
   return {
     estimatedAt, window: { from: usage.from, to: usage.to }, quota, rate, context, execution, availability,
     profile, profileBasis: "deterministic-maximum-dimension", mode: "observation",

@@ -28,6 +28,8 @@ import {
 import { buildCriticPermissionRules } from "./orchestration/readonly-policy.ts";
 import * as workerHooks from "./worker-hooks.ts";
 import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
+import { aggregateUsage } from "./resource-governor/usage-ledger.ts";
+import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
 import * as replanMod from "./orchestration/replan.ts";
 import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { isFreeModel, FREE_POOL } from "./config.ts";
@@ -1116,10 +1118,12 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
   });
 
   it("O0d: observed 429/529 and quota errors remain observations, never implicit reroutes", async () => {
-    for (const error of [
-      Object.assign(new Error("429 rate limit"), { status: 429 }),
-      Object.assign(new Error("529 overloaded"), { statusCode: 529 }),
-      Object.assign(new Error("free usage exhausted"), { name: "FreeUsageLimitError" }),
+    for (const [error, expectedKind] of [
+      [Object.assign(new Error("429 rate limit"), { status: 429 }), "throttle"],
+      [Object.assign(new Error("529 overloaded"), { statusCode: 529 }), "throttle"],
+      [Object.assign(new Error("rate limit"), { name: "RateLimitError" }), "throttle"],
+      [Object.assign(new Error("free usage exhausted"), { name: "FreeUsageLimitError" }), "quota-limit"],
+      [Object.assign(new Error("recognized provider outage"), { status: 503, type: "http_error" }), "provider-error"],
     ]) {
       const t = fakeDeps({ runtime: { prompt: async () => { throw error; } } });
       const observations = [];
@@ -1131,9 +1135,37 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
       assert.equal(result.round, 1);
       assert.equal(t.effects.includes("select-model"), false);
       assert.equal(t.effects.includes("select-agent"), false);
-      assert.equal(observations.some(x => x.kind === (error.name === "FreeUsageLimitError" ? "quota-limit" : "throttle")), true);
+      assert.equal(observations.some(x => x.kind === expectedKind && x.failureDomain === (expectedKind === "quota-limit" ? "quota" : "provider")), true);
       assert.equal(JSON.stringify(observations).includes(error.message), false);
     }
+  });
+
+  it("O0e: local follow-up confirmation failure after prompt is operational, not provider availability", async () => {
+    const t = fakeDeps();
+    const observations = [];
+    const followups = Object.assign(async () => [], {
+      reserve: async () => [{ id: "followup-1", message: "bounded follow up", messageID: "followup-1" }],
+      confirm: async () => { throw new Error("local persistence confirmation failed"); },
+    });
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, followups,
+      observeResource: event => observations.push(event),
+    });
+    assert.equal(t.effects.includes("prompt"), true, "prompt was delivered before local failure");
+    assert.equal(result.phase, "failed");
+    assert.equal(observations.some(x => x.kind === "provider-error"), false);
+    assert.equal(observations.some(x => x.kind === "operational-failure" && x.failureDomain === "operational"), true);
+    const pressure = estimateResourcePressure(aggregateUsage(observations, { from: 0, to: Number.MAX_SAFE_INTEGER }));
+    assert.equal(pressure.availability.level, "unknown");
+  });
+
+  it("O0f: ambiguous local runtime errors do not imply provider failure", async () => {
+    const t = fakeDeps({ runtime: { prompt: async () => { throw new Error("unexpected local error"); } } });
+    const observations = [];
+    await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions, observeResource: event => observations.push(event) });
+    assert.equal(observations.some(x => x.kind === "operational-failure"), true);
+    assert.equal(observations.some(x => x.kind === "provider-error"), false);
+    assert.equal(JSON.stringify(observations).includes("unexpected local error"), false);
   });
 
   it("O1: happy path -> completed, round 1, worker criado UMA vez, judge UMA vez", async () => {

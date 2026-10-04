@@ -244,17 +244,23 @@ async function observeResource(deps: DispatcherDeps, observation: Record<string,
 
 function resourceErrorObservation(error: unknown, at: number, identity: Record<string, unknown>): Record<string, unknown> {
   const e = error && typeof error === "object" ? error as Record<string, unknown> : {};
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  const rawCode = String(e.code ?? e.name ?? "");
+  const rawCode = typeof e.code === "string" ? e.code : typeof e.name === "string" ? e.name : "";
   const code = /freeusagelimit/i.test(rawCode) ? "FreeUsageLimitError" : "";
   const response = e.response && typeof e.response === "object" ? e.response as Record<string, unknown> : {};
   const status = Number(e.status ?? e.statusCode ?? response.status);
-  if (/freeusagelimit|quota.?limit|usage.?limit/i.test(`${rawCode} ${message}`)) return { ...identity, at, kind: "quota-limit", errorCode: code || "quota-limit", failureDomain: "quota" };
-  if ([429, 529].includes(status) || /429|529|rate.?limit|too many requests|throttl|overload/i.test(`${code} ${message}`)) {
+  const structuredCode = `${rawCode} ${typeof e.type === "string" ? e.type : ""}`;
+  if (/freeusagelimit|quota.?limit|usage.?limit/i.test(structuredCode)) return { ...identity, at, kind: "quota-limit", errorCode: code || "quota-limit", failureDomain: "quota" };
+  if ([429, 529].includes(status) || /rate.?limit|too many requests|throttl|overload/i.test(structuredCode)) {
     return { ...identity, at, kind: "throttle", ...(Number.isFinite(status) ? { statusCode: status } : {}), signal: "throttle", failureDomain: "provider" };
   }
-  if (/context.?overflow|context.?length|max.?tokens/i.test(`${code} ${message}`)) return { ...identity, at, kind: "context-overflow", errorCode: code || "context-overflow", failureDomain: "context" };
-  return { ...identity, at, kind: "provider-error", errorCode: code || "provider-error", failureDomain: "provider" };
+  if (/context.?overflow|context.?length|max.?tokens/i.test(structuredCode)) return { ...identity, at, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" };
+  // Attribute provider failure only when the thrown value carries structured
+  // HTTP/provider provenance. A plain Error may come from local orchestration,
+  // persistence, follow-up bookkeeping, or an ambiguous integration seam.
+  const explicitHttp = Number.isInteger(status) && status >= 400 && status <= 599 &&
+    (typeof e.type === "string" && /http.?error|provider.?error/i.test(e.type) || response.status !== undefined);
+  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: "provider-error", failureDomain: "provider" };
+  return { ...identity, at, kind: "operational-failure", errorCode: "operational-failure", failureDomain: "operational" };
 }
 
 function observedTokenCounts(usage: unknown): Record<string, number> | undefined {

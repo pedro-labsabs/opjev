@@ -29,10 +29,15 @@ compactions or usage data that OpenCode does not expose at those boundaries.
 context, execution and availability. Each contains a level, confidence,
 provenance and (where applicable) the observed count. Quota is `unknown` until
 an explicit quota-limit error is observed; this is not a remaining-quota
-estimate. Provider failures contribute to availability and are not classified
-as model capability failures. A deterministic maximum dimension maps to the
-observational profile `normal`, `conservative`, `scarce` or `survival`. Profiles
-carry no routing, retry, model, agent or `maxRounds` instruction.
+estimate. Provider failures contribute to availability only when the thrown
+value carries structured HTTP/provider provenance; ambiguous errors are
+operational failures and are not classified as model capability failures. A
+deterministic maximum dimension maps observed pressure to `conservative`,
+`scarce` or `survival`. `unknown` is used when dimensions lack evidence or the
+observations do not establish an authoritative low-pressure baseline. This
+slice does not emit `normal`: absence of quota/capacity evidence cannot certify
+normal operation. Profiles carry no routing, retry, model, agent or
+`maxRounds` instruction.
 
 Initial thresholds are local signal heuristics: an observed quota-limit maps to
 critical quota pressure; one or two throttles map to moderate rate pressure and
