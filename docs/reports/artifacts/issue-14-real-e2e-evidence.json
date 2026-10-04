@@ -1,274 +1,629 @@
-[
-  {
-    "scenarioId": 1,
-    "scenarioName": "happy path → accept",
-    "tier": "REAL OPENCODE + LIVE JEV SYSTEMONE",
-    "runID": "auto-ses_efbe11543ffeZvn61l64JUKNtN-msg_e2e_c1_1791070497484-06d1525af640",
-    "round": 1,
-    "workerSessionID": "ses_efbe111adffeJJSGUk6Biz0Uh3",
-    "criticSessionID": "ses_efbe1113fffeJPUJSV2umTzpEc",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
-    },
-    "verdict": "accept",
-    "command": "none",
-    "finalPhase": "completed"
+{
+  "schemaVersion": 1,
+  "provenance": {
+    "headSha": "598977a73e8e8275e47d774c883333192ed1aa38",
+    "openCodeRuntimeVersion": "2.0.11",
+    "executedAt": "2026-10-04T01:27:48.096Z",
+    "runner": "scripts/e2e-multiround-real.mjs"
   },
-  {
-    "scenarioId": 2,
-    "scenarioName": "critic encontra problema → Jev não aceita",
-    "tier": "REAL OPENCODE + CONTROLLED JEV BOUNDARY",
-    "runID": "auto-ses_efbe10d43ffeSnkG4daOkYj7rJ-msg_e2e_c2_1791070499522-13e0b217551a",
-    "round": 1,
-    "workerSessionID": "ses_efbe10d11ffejxvnKNOcF7QOKg",
-    "criticSessionID": "ses_efbe10cc2ffeZMdDVqK6UagDxq",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+  "scenarios": [
+    {
+      "scenarioId": 1,
+      "scenarioName": "happy path → accept",
+      "tier": "REAL OPENCODE + LIVE JEV SYSTEMONE",
+      "runID": "auto-ses_efb7b93f6ffe7nvycasngnoNio-msg_e2e_c1_1791077149716-fdd501d27901",
+      "round": 1,
+      "workerSessionID": "ses_efb7b8f62ffeXEwqLSMrA2dxG7",
+      "criticSessionID": "ses_efb7b8f19ffeEdMLe85gXQWpoA",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b8f62ffeXEwqLSMrA2dxG7",
+        "ses_efb7b8f19ffeEdMLe85gXQWpoA"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "accept"
     },
-    "verdict": "repair-same",
-    "command": "none",
-    "finalPhase": "awaiting-human"
-  },
-  {
-    "scenarioId": 3,
-    "scenarioName": "repair-same",
-    "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
-    "runID": "auto-ses_efbe10c2cffetTvs8k7RF03LBs-msg_e2e_c3_1791070499800-071e5c925e7f",
-    "round": 2,
-    "workerSessionID": "ses_efbe10c0bffe2u71JNtyJW1ftP",
-    "criticSessionID": "ses_efbe10b23ffeFqkVzdUYYn7v3I",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 2,
+      "scenarioName": "critic encontra problema → Jev não aceita",
+      "tier": "REAL OPENCODE + CONTROLLED JEV BOUNDARY",
+      "runID": "auto-ses_efb7b8b02ffeTaSIvupB5OzCzg-msg_e2e_c2_1791077152001-77811bbd94cd",
+      "round": 1,
+      "workerSessionID": "ses_efb7b8aeaffeJ8TVpSRJFHYgqt",
+      "criticSessionID": "ses_efb7b8abcffeGsN9m555dIRF33",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "critic-flags-defect-no-accept",
+      "command": "none",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb7b8aeaffeJ8TVpSRJFHYgqt",
+        "ses_efb7b8abcffeGsN9m555dIRF33"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "critic-flags-defect-no-accept"
     },
-    "verdict": "repair-same -> accept",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 4,
-    "scenarioName": "fresh-same",
-    "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
-    "runID": "auto-ses_efbe10a14ffe5WDDEBzWH7MNdO-msg_e2e_c4_1791070500336-bde6f580b47d",
-    "round": 2,
-    "workerSessionID": "ses_efbe1096bffeOgHtHggeURh8pP",
-    "criticSessionID": "ses_efbe10941ffezvmAniatJp3efM",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 3,
+      "scenarioName": "repair-same",
+      "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
+      "runID": "auto-ses_efb7b89f7ffeoY8tXEzUSCRVnE-msg_e2e_c3_1791077152268-0ec251a01d03",
+      "round": 2,
+      "workerSessionID": "ses_efb7b89e1ffeqvGBpeNweXq7mX",
+      "criticSessionID": "ses_efb7b897bffehM996TbqRYbOZ7",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "verdict": "repair-same -> accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b89e1ffeqvGBpeNweXq7mX",
+        "ses_efb7b897bffehM996TbqRYbOZ7"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "observedDecision": "repair-same -> accept"
     },
-    "verdict": "fresh-same -> accept",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 5,
-    "scenarioName": "switch-model",
-    "tier": "REAL OPENCODE + FREE_POOL GUARD",
-    "runID": "auto-ses_efbe10900ffeOOceFAECzaTVHj-msg_e2e_c5_1791070500611-df5e78959701",
-    "round": 2,
-    "workerSessionID": "ses_efbe10861ffe18nBXJ3EeyTz3C",
-    "criticSessionID": "ses_efbe1080cffeLVREOyHqEoG69W",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/mimo-v2.5-free"
+    {
+      "scenarioId": 4,
+      "scenarioName": "fresh-same",
+      "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
+      "runID": "auto-ses_efb7b88e3ffe8RT74GnBArPc2n-msg_e2e_c4_1791077152545-ed2238a4e09e",
+      "round": 2,
+      "workerSessionID": "ses_efb7b8887ffeQxR6N5xRPlzrWG",
+      "criticSessionID": "ses_efb7b8869ffefo7Ycq9YXEdyLo",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "verdict": "fresh-same -> accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b8887ffeQxR6N5xRPlzrWG",
+        "ses_efb7b8869ffefo7Ycq9YXEdyLo"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "observedDecision": "fresh-same -> accept"
     },
-    "verdict": "switch-model -> accept",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 6,
-    "scenarioName": "switch-agent",
-    "tier": "REAL OPENCODE + CATALOG GUARD",
-    "runID": "auto-ses_efbe106f0ffeno1ATfRAmTWO3A-msg_e2e_c6_1791070501139-e84891d631a1",
-    "round": 2,
-    "workerSessionID": "ses_efbe10654ffeeu8GEUq4zhw7zU",
-    "criticSessionID": "ses_efbe1060cffeJx3figSTrPqpMC",
-    "executor": {
-      "agent": "plan",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 5,
+      "scenarioName": "switch-model",
+      "tier": "REAL OPENCODE + FREE_POOL GUARD",
+      "runID": "auto-ses_efb7b87cfffet31lcneaY5a2hf-msg_e2e_c5_1791077152819-2a789365d38c",
+      "round": 2,
+      "workerSessionID": "ses_efb7b8757ffeMYWAQGb2nqm0A6",
+      "criticSessionID": "ses_efb7b8732ffeEiMylfNEhFH3Tk",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/ling-3.0-flash-fin-free"
+      },
+      "verdict": "switch-model -> accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b8757ffeMYWAQGb2nqm0A6",
+        "ses_efb7b8732ffeEiMylfNEhFH3Tk"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/ling-3.0-flash-fin-free"
+      },
+      "observedDecision": "switch-model -> accept"
     },
-    "verdict": "switch-agent -> accept",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 7,
-    "scenarioName": "replan",
-    "tier": "REAL OPENCODE + ORCHESTRATOR ISOLATION",
-    "runID": "auto-ses_efbe104e0ffeU2sTEBsvijGC5m-msg_e2e_c7_1791070501667-f17d16733cb7",
-    "round": 2,
-    "workerSessionID": "ses_efbe103e3fferARrvZoAV5ou26",
-    "criticSessionID": "ses_efbe10394ffe9HLDfMOzGxS8qK",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 6,
+      "scenarioName": "switch-agent",
+      "tier": "REAL OPENCODE + CATALOG GUARD",
+      "runID": "auto-ses_efb7b86beffewKpOewCfsOOAr1-msg_e2e_c6_1791077153093-af07060e0eef",
+      "round": 2,
+      "workerSessionID": "ses_efb7b8655ffey8GGe84uC2hAS2",
+      "criticSessionID": "ses_efb7b8633ffe8BLUOzGQHyovQG",
+      "executor": {
+        "agent": "plan",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "verdict": "switch-agent -> accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b8655ffey8GGe84uC2hAS2",
+        "ses_efb7b8633ffe8BLUOzGQHyovQG"
+      ],
+      "observedExecutor": {
+        "agent": "plan",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "observedDecision": "switch-agent -> accept"
     },
-    "verdict": "replan -> accept",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 8,
-    "scenarioName": "human + resume",
-    "tier": "REAL OPENCODE + CONCURRENCY LOCK",
-    "runID": "auto-ses_efbe102d3ffedNeed7nh3Zfvqn-msg_e2e_c8_1791070502194-5376c05f9d14",
-    "round": 2,
-    "workerSessionID": "ses_efbe102a2ffeA0KQFvrtG50m4N",
-    "criticSessionID": "ses_efbe1024bffeCpnRM0WTIk7zqN",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 7,
+      "scenarioName": "replan",
+      "tier": "REAL OPENCODE + ORCHESTRATOR ISOLATION",
+      "runID": "auto-ses_efb7b85abffeYMXdSfELY0TViy-msg_e2e_c7_1791077153367-ede86bbc4a5e",
+      "round": 2,
+      "workerSessionID": "ses_efb7b84e5ffe2ULgy6zaStubQX",
+      "criticSessionID": "ses_efb7b84a3ffe0pDW7rTgRSRsYM",
+      "orchestratorSessionID": "ses_efb7b852affehJVRR9VcbtKMlf",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "verdict": "replan -> accept",
+      "command": "none",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b84e5ffe2ULgy6zaStubQX",
+        "ses_efb7b84a3ffe0pDW7rTgRSRsYM",
+        "ses_efb7b852affehJVRR9VcbtKMlf"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "observedDecision": "replan -> accept"
     },
-    "verdict": "human -> resume (concurrency serialized)",
-    "command": "none",
-    "finalPhase": "completed"
-  },
-  {
-    "scenarioId": 9,
-    "scenarioName": "stop",
-    "tier": "REAL OPENCODE + IMMEDIATE TERMINATION",
-    "runID": "auto-ses_efbe101aaffe2DPdUa8ZZQSBpr-msg_e2e_c9_1791070502491-5eaa66b17441",
-    "round": 1,
-    "workerSessionID": "ses_efbe1017cffe6I8khqG1gi0gVT",
-    "criticSessionID": "ses_efbe1013affemH4u1X1XzYHuvk",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 8,
+      "scenarioName": "human + resume",
+      "tier": "REAL OPENCODE + CONCURRENCY LOCK",
+      "runID": "auto-ses_efb7b83a3ffeDcaWX1L00y5QoT-msg_e2e_c8_1791077153887-805406f4e5f0",
+      "requestID": "human:1:1:jev-human",
+      "initialPhase": "awaiting-human",
+      "initialRound": 1,
+      "round": 2,
+      "workerSessionID": "ses_efb7b822bffeH7wssyg4bQGn8c",
+      "criticSessionID": "ses_efb7b8209ffe1IMiR2eyskDUf7",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "sessionID": "ses_efb7b822bffeH7wssyg4bQGn8c"
+      },
+      "sameRunAndRequestID": true,
+      "observedResumeInputs": [
+        {
+          "runID": "auto-ses_efb7b83a3ffeDcaWX1L00y5QoT-msg_e2e_c8_1791077153887-805406f4e5f0",
+          "requestID": "human:1:1:jev-human"
+        },
+        {
+          "runID": "auto-ses_efb7b83a3ffeDcaWX1L00y5QoT-msg_e2e_c8_1791077153887-805406f4e5f0",
+          "requestID": "human:1:1:jev-human"
+        }
+      ],
+      "callerSessionIDs": [
+        "ses_efb7b8299ffeUos7PGuTW6rE6T",
+        "ses_efb7b8299ffdov0aoMlqcH0qKg"
+      ],
+      "callerPromptsProcessed": [
+        true,
+        true
+      ],
+      "toolNamesObserved": [
+        "edit",
+        "glob",
+        "grep",
+        "question",
+        "read",
+        "shell",
+        "skill",
+        "subagent",
+        "webfetch",
+        "websearch",
+        "write",
+        "execute",
+        "edit",
+        "glob",
+        "grep",
+        "question",
+        "read",
+        "shell",
+        "skill",
+        "subagent",
+        "webfetch",
+        "websearch",
+        "write",
+        "execute"
+      ],
+      "toolCallCount": 2,
+      "loserCount": 1,
+      "humanDecisionCount": 1,
+      "workerCount": 2,
+      "criticCount": 2,
+      "lockCountZero": true,
+      "lockTelemetry": "[opjev-e2e] resume-lock-release=0",
+      "verdict": "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser",
+      "command": "real OpenCode session prompt -> Code Mode execute -> tools.jev.orchestrate_resume",
+      "finalPhase": "completed",
+      "sessionIDs": [
+        "ses_efb7b822bffeH7wssyg4bQGn8c",
+        "ses_efb7b8209ffe1IMiR2eyskDUf7"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "sessionID": "ses_efb7b822bffeH7wssyg4bQGn8c"
+      },
+      "observedDecision": "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser"
     },
-    "verdict": "stop",
-    "command": "none",
-    "finalPhase": "stopped"
-  },
-  {
-    "scenarioId": 10,
-    "scenarioName": "worker timeout / interrupted",
-    "tier": "REAL OPENCODE + WORKER BOUNDARY",
-    "runID": "auto-ses_efbe1008cffeOBHu0uiBuKS04M-msg_e2e_c10_1791070502775-e994af13afe0",
-    "round": 1,
-    "workerSessionID": "ses_efbe10069ffe3X9dTIBnOa6AG0",
-    "criticSessionID": "none",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 9,
+      "scenarioName": "stop",
+      "tier": "REAL OPENCODE + IMMEDIATE TERMINATION",
+      "runID": "auto-ses_efb7b8167ffefnDcK70tII4nKQ-msg_e2e_c9_1791077154459-dc62369b7747",
+      "round": 1,
+      "workerSessionID": "ses_efb7b8152fferBkdKm9bmELRVu",
+      "criticSessionID": "ses_efb7b8133ffezwKRHxhY0kBvpd",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "stop",
+      "command": "none",
+      "finalPhase": "stopped",
+      "sessionIDs": [
+        "ses_efb7b8152fferBkdKm9bmELRVu",
+        "ses_efb7b8133ffezwKRHxhY0kBvpd"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "stop"
     },
-    "verdict": "deterministic-check-failed",
-    "command": "interrupt",
-    "finalPhase": "failed"
-  },
-  {
-    "scenarioId": 11,
-    "scenarioName": "critic timeout / failure",
-    "tier": "REAL OPENCODE + CRITIC GUARD",
-    "runID": "auto-ses_efbe0d93fffe3l35rZoebJn737-msg_e2e_c11_1791070512837-63817b0b1b22",
-    "round": 1,
-    "workerSessionID": "ses_efbe0d921ffeUegrmipDM7Jtdn",
-    "criticSessionID": "ses_efbe0d8fcffe4Wo5a2aOg71Zuw",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 10,
+      "scenarioName": "worker timeout / interrupted",
+      "tier": "REAL OPENCODE + WORKER BOUNDARY",
+      "runID": "auto-ses_efb7b805cffeO3UNhksTOomj1T-msg_e2e_c10_1791077154727-c8185e2c7b6f",
+      "round": 1,
+      "workerSessionID": "ses_efb7b8045ffegTtkkyh8997OjP",
+      "criticSessionID": "none",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "worker-timeout-interrupted",
+      "timeoutMs": 60000,
+      "providerBehavior": "deliberately non-responsive",
+      "timeoutDiagnostic": "execucao do worker excedeu 60000ms; worker interrompido best-effort",
+      "timeoutDiagnosticMatched": true,
+      "interruptObserved": true,
+      "interruptDiagnostic": "execucao do worker excedeu 60000ms; worker interrompido best-effort",
+      "workerOutcome": "interrupted",
+      "workerCount": 1,
+      "noExtraRounds": true,
+      "noExtraWorker": true,
+      "command": "interrupt",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb7b8045ffegTtkkyh8997OjP"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "worker-timeout-interrupted"
     },
-    "verdict": "critic-failure-blocks-accept",
-    "command": "none",
-    "finalPhase": "failed"
-  },
-  {
-    "scenarioId": 12,
-    "scenarioName": "Jev unavailable / timeout",
-    "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 500)",
-    "runID": "auto-ses_efbe0d82effeoi14RIee6wDboQ-msg_e2e_c12_1791070513110-99558e89b1cd",
-    "round": 1,
-    "workerSessionID": "ses_efbe0d807ffeCeRBp3kVES3BfV",
-    "criticSessionID": "ses_efbe0d7d6ffe9BglSb5MrjvGro",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 11,
+      "scenarioName": "critic timeout / failure",
+      "tier": "REAL OPENCODE + CRITIC GUARD",
+      "runID": "auto-ses_efb7a950affexicO8Q25fFVM3o-msg_e2e_c11_1791077214970-9ee575b12ceb",
+      "round": 1,
+      "workerSessionID": "ses_efb7a94e2ffeM6DlxcX0lC4GHb",
+      "criticSessionID": "ses_efb7a94a6ffeWLXP8L65v3wKrB",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "critic-failure-blocks-accept",
+      "command": "none",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb7a94e2ffeM6DlxcX0lC4GHb",
+        "ses_efb7a94a6ffeWLXP8L65v3wKrB"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "critic-failure-blocks-accept"
     },
-    "verdict": "jev-http-500-abort",
-    "command": "none",
-    "finalPhase": "failed"
-  },
-  {
-    "scenarioId": 13,
-    "scenarioName": "provider / global throttle",
-    "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 429)",
-    "runID": "auto-ses_efbe0d711ffedXJ1EbPrmBqvjQ-msg_e2e_c13_1791070513396-92f05c63ddf1",
-    "round": 1,
-    "workerSessionID": "ses_efbe0d6e2ffeTqoI5NYqNqKz6u",
-    "criticSessionID": "ses_efbe0d69fffeJVtQ4eXDxSB7qL",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 12,
+      "scenarioName": "Jev unavailable / timeout",
+      "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 500)",
+      "runID": "auto-ses_efb7a93f8ffeh040AvzRle0cpw-msg_e2e_c12_1791077215243-adfc51e66025",
+      "round": 1,
+      "workerSessionID": "ses_efb7a93deffeykqMaujQewGuzn",
+      "criticSessionID": "ses_efb7a93c1ffeiilVbAaOPTLzBs",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "jev-http-500-abort",
+      "command": "none",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb7a93deffeykqMaujQewGuzn",
+        "ses_efb7a93c1ffeiilVbAaOPTLzBs"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "jev-http-500-abort"
     },
-    "verdict": "throttle-429-abort",
-    "command": "none",
-    "finalPhase": "failed"
-  },
-  {
-    "scenarioId": 14,
-    "scenarioName": "maxRounds exhaustion",
-    "tier": "REAL OPENCODE + BUDGET ENFORCEMENT",
-    "runID": "auto-ses_efbe0d5fbffeHjMO1HvLjNKfwc-msg_e2e_c14_1791070513673-8cabe65780bd",
-    "round": 2,
-    "workerSessionID": "ses_efbe0d5d8ffevVouznF8etPRBe",
-    "criticSessionID": "ses_efbe0d530ffeg0h4ReyXf05hbj",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 13,
+      "scenarioName": "provider / global throttle",
+      "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 429)",
+      "runID": "auto-ses_efb7a92ebffeKnJsnrTBlahblk-msg_e2e_c13_1791077215511-250c4bd8aa46",
+      "round": 1,
+      "workerSessionID": "ses_efb7a92c0ffegKdIn1sakI1705",
+      "criticSessionID": "none",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "verdict": "throttle-429-abort",
+      "command": "none",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb7a92c0ffegKdIn1sakI1705"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free"
+      },
+      "observedDecision": "throttle-429-abort"
     },
-    "verdict": "max-rounds-exhaustion -> awaiting-human",
-    "command": "none",
-    "finalPhase": "awaiting-human"
-  },
-  {
-    "scenarioId": 15,
-    "scenarioName": "tentativa de recursão por sessão interna",
-    "tier": "REAL OPENCODE + MULTI-LAYER RECURSION GUARD",
-    "runID": "auto-ses_efbe0d4e8ffeBjSQw11ZDqfxmw-msg_internal_recurse",
-    "round": 0,
-    "workerSessionID": "ses_efbe0d4e8ffeBjSQw11ZDqfxmw",
-    "criticSessionID": "none",
-    "executor": {
-      "agent": "none",
-      "model": "none"
+    {
+      "scenarioId": 14,
+      "scenarioName": "maxRounds exhaustion",
+      "tier": "REAL OPENCODE + BUDGET ENFORCEMENT",
+      "runID": "auto-ses_efb79cdc3ffe7bbxsOljDHJIvI-msg_e2e_c14_1791077265983-a60b1d0ca650",
+      "round": 2,
+      "workerSessionID": "ses_efb79cdb1ffeODMlvzOppbJKwP",
+      "criticSessionID": "ses_efb79cd60ffeV5o0FFk6PrQPB8",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "max-rounds-exhaustion -> awaiting-human",
+      "command": "none",
+      "finalPhase": "awaiting-human",
+      "sessionIDs": [
+        "ses_efb79cdb1ffeODMlvzOppbJKwP",
+        "ses_efb79cd60ffeV5o0FFk6PrQPB8"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "max-rounds-exhaustion -> awaiting-human"
     },
-    "verdict": "internal-bypass",
-    "command": "none",
-    "finalPhase": "internal-bypass"
-  },
-  {
-    "scenarioId": 16,
-    "scenarioName": "agent / model candidate inválido",
-    "tier": "REAL OPENCODE + CANDIDATE INTEGRITY",
-    "runID": "run_real_1791070513962_2gf0",
-    "round": 1,
-    "workerSessionID": "ses_worker_c16",
-    "criticSessionID": "none",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 15,
+      "scenarioName": "tentativa de recursão por sessão interna",
+      "tier": "REAL OPENCODE + MULTI-LAYER RECURSION GUARD",
+      "runID": "auto-ses_efb79cdb1ffeODMlvzOppbJKwP-msg_internal_recurse",
+      "round": 0,
+      "workerSessionID": "ses_efb79cdb1ffeODMlvzOppbJKwP",
+      "criticSessionID": "none",
+      "executor": {
+        "agent": "none",
+        "model": "none"
+      },
+      "promptProofs": [
+        {
+          "role": "worker",
+          "sessionID": "ses_efb79cdb1ffeODMlvzOppbJKwP",
+          "sourceRunID": "auto-ses_efb79cdc3ffe7bbxsOljDHJIvI-msg_e2e_c14_1791077265983-a60b1d0ca650",
+          "status": 200,
+          "processed": true,
+          "markerSent": true,
+          "callerGuardToolCallObserved": true,
+          "toolNamesObserved": [
+            "edit",
+            "glob",
+            "grep",
+            "question",
+            "read",
+            "shell",
+            "skill",
+            "webfetch",
+            "websearch",
+            "write",
+            "execute"
+          ],
+          "baselineAssistantMessages": 2,
+          "baselineIdleEvents": 2
+        },
+        {
+          "role": "critic",
+          "sessionID": "ses_efb79cd60ffeV5o0FFk6PrQPB8",
+          "sourceRunID": "auto-ses_efb79cdc3ffe7bbxsOljDHJIvI-msg_e2e_c14_1791077265983-a60b1d0ca650",
+          "status": 200,
+          "processed": true,
+          "markerSent": true,
+          "baselineAssistantMessages": 1,
+          "baselineIdleEvents": 1
+        },
+        {
+          "role": "orchestrator",
+          "sessionID": "ses_efb7b852affehJVRR9VcbtKMlf",
+          "sourceRunID": "auto-ses_efb7b85abffeYMXdSfELY0TViy-msg_e2e_c7_1791077153367-ede86bbc4a5e",
+          "status": 200,
+          "processed": true,
+          "markerSent": true,
+          "baselineAssistantMessages": 1,
+          "baselineIdleEvents": 1
+        }
+      ],
+      "admissionPass": true,
+      "baselineRunCount": 14,
+      "finalRunCount": 14,
+      "noNewRuns": true,
+      "baselineDispatchCount": 40,
+      "finalDispatchCount": 40,
+      "noNewDispatches": true,
+      "verdict": "PASS: real worker/critic/orchestrator prompts, admission bypass, and resume caller guard produced no new runs or dispatches",
+      "command": "OpenCode prompt API; worker Code Mode execute -> orchestrate_resume",
+      "finalPhase": "internal-bypass",
+      "sessionIDs": [
+        "ses_efb79cdb1ffeODMlvzOppbJKwP"
+      ],
+      "observedExecutor": {
+        "agent": "none",
+        "model": "none"
+      },
+      "observedDecision": "PASS: real worker/critic/orchestrator prompts, admission bypass, and resume caller guard produced no new runs or dispatches"
     },
-    "verdict": "invalid-candidate-rejected-fast",
-    "command": "none",
-    "finalPhase": "failed"
-  },
-  {
-    "scenarioId": 17,
-    "scenarioName": "stale evidence / rodada errada",
-    "tier": "REAL OPENCODE + CAUSAL ROUND INTEGRITY",
-    "runID": "run_real_1791070513984_r1nm",
-    "round": 1,
-    "workerSessionID": "ses_w",
-    "criticSessionID": "ses_c",
-    "executor": {
-      "agent": "build",
-      "model": "opencode/big-pickle"
+    {
+      "scenarioId": 16,
+      "scenarioName": "agent / model candidate inválido",
+      "tier": "REAL OPENCODE + CANDIDATE INTEGRITY",
+      "runID": "auto-ses_efb79c9aeffePn14aBHKB94Hkj-msg_e2e_c16_1791077267028_yqw2-36c29e2e4023",
+      "round": 1,
+      "workerSessionID": "ses_efb79c98fffe2CNaGXPjZsWs1P",
+      "criticSessionID": "none",
+      "executor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "verdict": "invalid-candidate-rejected-fast",
+      "subcases": [
+        {
+          "label": "paid model",
+          "runID": "auto-ses_efb79c9aeffePn14aBHKB94Hkj-msg_e2e_c16_1791077267028_yqw2-36c29e2e4023",
+          "candidate": "openai/gpt-4o",
+          "diagnostic": "switch-model fora dos candidatos validos: openai/gpt-4o (candidates=3)",
+          "round": 2,
+          "executorSessions": [
+            {
+              "id": "ses_efb79c98fffe2CNaGXPjZsWs1P",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            },
+            {
+              "id": "ses_efb79c95dffeyefswV3Ds5xGQz",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            }
+          ]
+        },
+        {
+          "label": "nonexistent model",
+          "runID": "auto-ses_efb79c8a3ffeD45EVwbmxJeguR-msg_e2e_c16_1791077267296_r94s-4a12654b559a",
+          "candidate": "fake/nonexistent-model",
+          "diagnostic": "switch-model fora dos candidatos validos: fake/nonexistent-model (candidates=3)",
+          "round": 2,
+          "executorSessions": [
+            {
+              "id": "ses_efb79c888ffeolY6Bv3kGHz4yb",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            },
+            {
+              "id": "ses_efb79c86affe2LvRX1UawcqWaK",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            }
+          ]
+        },
+        {
+          "label": "unknown agent",
+          "runID": "auto-ses_efb79c799ffeMP4HaSWSl4k4bY-msg_e2e_c16_1791077267562_8hz4-7495eaca409b",
+          "candidate": "unknown-rogue-agent",
+          "diagnostic": "agente selecionado nao existe no catalogo runtime: unknown-rogue-agent",
+          "round": 2,
+          "executorSessions": [
+            {
+              "id": "ses_efb79c783ffeu2JOy3AVaRxkKp",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            },
+            {
+              "id": "ses_efb79c768ffe3LZnz6KoISUph2",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            }
+          ]
+        },
+        {
+          "label": "known non-primary agent",
+          "runID": "auto-ses_efb79c68effet6oivbILFdonpn-msg_e2e_c16_1791077267828_vp4m-fd03232edfbc",
+          "candidate": "explore",
+          "diagnostic": "agente selecionado nao elegivel como primary no catalogo runtime: explore (mode=subagent, hidden=false)",
+          "round": 2,
+          "executorSessions": [
+            {
+              "id": "ses_efb79c679ffedC4sCKy64uLFbs",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            },
+            {
+              "id": "ses_efb79c65effevBCWNALVTdjpbi",
+              "agent": "build",
+              "model": "opencode/nemotron-3.5-lightning-free"
+            }
+          ]
+        }
+      ],
+      "command": "none",
+      "finalPhase": "failed",
+      "sessionIDs": [
+        "ses_efb79c98fffe2CNaGXPjZsWs1P"
+      ],
+      "observedExecutor": {
+        "agent": "build",
+        "model": "opencode/big-pickle"
+      },
+      "observedDecision": "invalid-candidate-rejected-fast"
     },
-    "verdict": "stale-evidence-rejected",
-    "command": "none",
-    "finalPhase": "evaluating"
-  }
-]
+    {
+      "scenarioId": 17,
+      "scenarioName": "stale evidence / rodada errada",
+      "tier": "BLOCKER — NOT REAL OPENCODE",
+      "runID": "none",
+      "round": 0,
+      "workerSessionID": "none",
+      "criticSessionID": "none",
+      "executor": {
+        "agent": "none",
+        "model": "none"
+      },
+      "verdict": "BLOCKER: no legitimate runtime EvidencePacket injection boundary; prior direct kernel injection removed",
+      "command": "none",
+      "finalPhase": "BLOCKED",
+      "sessionIDs": [],
+      "observedExecutor": {
+        "agent": "none",
+        "model": "none"
+      },
+      "observedDecision": "BLOCKER: no legitimate runtime EvidencePacket injection boundary; prior direct kernel injection removed"
+    }
+  ]
+}
