@@ -321,7 +321,8 @@ describe("retry hook", () => {
   });
 
   it("6. throttle global nao causa troca inutil de modelo (sem Jev)", async () => {
-    const storage = makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] } });
+    const now = Date.now();
+    const storage = makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] }, "resource/throttle-retry/v1": { windowStart: now, retries: 2 } });
     const m = await bootCtx({
       models: ALL_MODELS,
       session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
@@ -339,17 +340,49 @@ describe("retry hook", () => {
         decision: {},
       };
       await m.hooks.session.retry(ev);
-      assert.deepEqual(ev.decision, { retry: true, delay: 5000 });
+      assert.deepEqual(ev.decision, { retry: false }, "attempt 2 encerra a sequência bounded");
       assert.equal(m.calls.switchModel.length, 0, "throttle nao deve trocar modelo");
       assert.equal(stub.calls.length, 0, "throttle nao deve consultar o Jev");
       for (let i = 0; i < 10 && !storage._map.get("resource/usage-ledger/v1"); i++) await new Promise(resolve => setTimeout(resolve, 0));
       const observations = storage._map.get("resource/usage-ledger/v1")?.observations ?? [];
       assert.equal(observations.some(x => x.kind === "throttle" && x.statusCode === 429), true, "429 real entra no ledger");
-      assert.equal(observations.some(x => x.kind === "retry" && x.retry === 2), true, "retry autorizado pelo runtime e observado");
+      assert.equal(observations.some(x => x.kind === "retry" && x.retry === 2), false, "retry negado não é contado como gasto");
       assert.equal(JSON.stringify(observations).includes("rate limit exceeded for Zen free tier"), false, "erro bruto nao persiste");
     } finally {
       stub.restore();
     }
+  });
+
+  it("quota-limit encerra imediatamente sem Jev, switch ou retry", async () => {
+    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage: makeStorage(), options: PLUGIN_OPTS });
+    const stub = stubFetch(() => { throw new Error("quota must not call Jev"); });
+    try {
+      const ev = { sessionID: "s1", model: { providerID: "opencode", id: "big-pickle" }, error: { name: "FreeUsageLimitError", message: "free usage exhausted" }, attempt: 0, decision: {} };
+      await m.hooks.session.retry(ev);
+      assert.deepEqual(ev.decision, { retry: false });
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("global throttle permite no máximo duas tentativas por janela e recupera após expiração", async () => {
+    const storage = makeStorage();
+    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage, options: PLUGIN_OPTS });
+    const stub = stubFetch(() => { throw new Error("throttle never consults Jev"); });
+    try {
+      const makeEvent = () => ({ sessionID: "s-throttle-budget", model: { providerID: "opencode", id: "big-pickle" }, error: { type: "http_error", message: "rate limit", status: 429 }, decision: {} });
+      const first = makeEvent(); await m.hooks.session.retry(first);
+      const second = makeEvent(); await m.hooks.session.retry(second);
+      const third = makeEvent(); await m.hooks.session.retry(third);
+      assert.equal(first.decision.retry, true);
+      assert.equal(second.decision.retry, true);
+      assert.deepEqual(third.decision, { retry: false });
+      storage._map.set("resource/throttle-retry/v1", { windowStart: Date.now() - 16 * 60 * 1000, retries: 2 });
+      const recovered = makeEvent(); await m.hooks.session.retry(recovered);
+      assert.equal(recovered.decision.retry, true);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
   });
 
   it("context overflow deixa compaction resolver (sem troca, sem Jev)", async () => {

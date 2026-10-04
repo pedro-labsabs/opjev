@@ -30,6 +30,7 @@ import * as workerHooks from "./worker-hooks.ts";
 import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
 import { aggregateUsage } from "./resource-governor/usage-ledger.ts";
 import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
+import { decideResourceBudget } from "./resource-governor/budget-policy.ts";
 import * as replanMod from "./orchestration/replan.ts";
 import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { isFreeModel, FREE_POOL } from "./config.ts";
@@ -1096,6 +1097,41 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.equal(isFreeModel(result.worker.model), true);
     assert.equal(t.selectModelCalls.length, 0);
     assert.equal(t.selectAgentCalls.length, 0);
+  });
+
+  it("O0e: hard resource budget blocks Jev and worker effects at the kernel boundary", async () => {
+    const t = fakeDeps();
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      resourceBudget: () => ({ allowed: false, stage: "jev-decision", effectiveMaxRounds: 1, reason: "resource-budget:quota-critical", basis: ["quota-critical"] }),
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(t.effects.includes("create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
+  it("O0f: governor read failure fails closed without an alternate authority path", async () => {
+    const t = fakeDeps();
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      resourceBudget: () => { throw new Error("ledger unavailable"); },
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(t.effects.includes("select"), false);
+    assert.equal(t.effects.includes("create"), false);
+  });
+
+  it("O0g: Jev verdict cannot open a round beyond the adaptive kernel cap", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), repairAnswers()] });
+    const pressure = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "throttle" }], { from: 0, to: 2 }));
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      resourceBudget: input => decideResourceBudget({ pressure, ...input }),
+    });
+    assert.equal(result.phase, "failed");
+    assert.equal(result.round, 2);
+    assert.equal(result.rounds.length, 1, "round 3 nao foi aberta no estado do kernel");
+    assert.equal(t.effects.filter(x => x === "judge").length, 2);
   });
 
   it("O0c: dispatcher facts reach the bounded runtime storage ledger", async () => {
@@ -4095,7 +4131,7 @@ describe("switch candidates via adapter (SW2/SA2/SA3b)", () => {
         },
       });
       const out = JSON.parse(res.content);
-      assert.ok(switchBody, "Jev foi consultado para switch-model");
+      assert.ok(switchBody, `Jev foi consultado para switch-model: ${res.content}`);
       const criteria = Object.keys(switchBody.questions.selected_model.criteria);
       assert.ok(!criteria.includes("opencode/big-pickle"), "M1 atual excluido");
       assert.ok(criteria.every((c) => isFreeModel(c)), "so modelos FREE apresentados");

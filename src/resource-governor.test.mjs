@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { UsageLedger, aggregateUsage, sanitizeObservation } from "./resource-governor/usage-ledger.ts";
 import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
 import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY, RESOURCE_LEDGER_CAPACITY, RESOURCE_LEDGER_PENDING_LIMIT } from "./resource-governor/storage-sink.ts";
+import { decideResourceBudget, RESOURCE_POLICY_WINDOW_MS } from "./resource-governor/budget-policy.ts";
 
 test("ledger has fixed retention, sanitizes payloads, and does not grow without bound", () => {
   const ledger = new UsageLedger({ capacity: 3 });
@@ -137,4 +138,37 @@ test("storage sink bounds pending writes during storage stalls", async () => {
   release();
   await Promise.all(pending);
   assert.equal(data.get(RESOURCE_LEDGER_KEY).observations.length, RESOURCE_LEDGER_PENDING_LIMIT);
+});
+
+test("budget policy is deterministic, preserves unknown, and never expands maxRounds", () => {
+  const unknown = estimateResourcePressure(aggregateUsage([], { from: 0, to: 1 }));
+  const a = decideResourceBudget({ pressure: unknown, maxRounds: 3, round: 1, stage: "new-round" });
+  assert.deepEqual(a, decideResourceBudget({ pressure: unknown, maxRounds: 3, round: 1, stage: "new-round" }));
+  assert.equal(a.allowed, true);
+  assert.equal(a.effectiveMaxRounds, 3);
+  assert.equal(a.reason.includes("normal"), false);
+  const storm = estimateResourcePressure(aggregateUsage(Array.from({ length: 5 }, (_, i) => ({ at: i, kind: "retry" })), { from: 0, to: 10 }));
+  const limited = decideResourceBudget({ pressure: storm, maxRounds: 2, round: 1, stage: "new-round" });
+  assert.equal(limited.allowed, false);
+  assert.ok(limited.effectiveMaxRounds <= 2);
+  assert.equal(RESOURCE_POLICY_WINDOW_MS, 900000);
+});
+
+test("quota and throttle policy deny additional spending without route authority", () => {
+  const quota = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "quota-limit" }], { from: 0, to: 2 }));
+  const denied = decideResourceBudget({ pressure: quota, maxRounds: 4, round: 1, stage: "jev-decision" });
+  assert.equal(denied.allowed, false);
+  assert.equal("model" in denied, false);
+  const throttle = estimateResourcePressure(aggregateUsage(Array.from({ length: 3 }, (_, i) => ({ at: i, kind: "throttle" })), { from: 0, to: 4 }));
+  assert.equal(decideResourceBudget({ pressure: throttle, maxRounds: 4, round: 1, stage: "switch" }).allowed, false);
+  assert.equal(decideResourceBudget({ pressure: estimateResourcePressure(aggregateUsage([], { from: 0, to: 1 })), maxRounds: 4, round: 1, stage: "provider-retry" }).allowed, true);
+});
+
+test("moderate independent pressure lowers the effective round cap without choosing a switch", () => {
+  const rate = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "throttle" }], { from: 0, to: 2 }));
+  const switchAllowed = decideResourceBudget({ pressure: rate, maxRounds: 5, round: 1, stage: "switch" });
+  assert.equal(switchAllowed.allowed, true);
+  assert.equal(switchAllowed.effectiveMaxRounds, 2);
+  assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 2, stage: "switch" }).allowed, false);
+  assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 3, stage: "new-round" }).allowed, false);
 });

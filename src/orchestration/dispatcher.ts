@@ -45,6 +45,7 @@ import {
 } from "./followup.ts";
 import { withKeyedLock } from "../lock.ts";
 import { sessionBindingKey } from "./admission.ts";
+import type { ResourceBudgetDecision, BudgetStage } from "../resource-governor/budget-policy.ts";
 
 export const WORKER_TIMEOUT_MS = Number(process?.env?.OPJEV_WORKER_TIMEOUT_MS) > 0 ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS) : 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -216,6 +217,8 @@ export interface DispatcherDeps {
   now?(): number;
   /** Optional factual telemetry seam. Errors are isolated from kernel execution. */
   observeResource?(observation: Record<string, unknown>): Promise<void> | void;
+  /** Kernel boundary supplied by the adapter; failures deny the requested spend. */
+  resourceBudget?(input: { stage: BudgetStage; maxRounds: number; round: number }): Promise<ResourceBudgetDecision> | ResourceBudgetDecision;
   /**
    * Consumo de follow-ups (#13): seam opcional injetado pelo adapter. Chamado
    * pelo scheduler no boundary de montagem do prompt de CADA rodada; suporta
@@ -588,6 +591,13 @@ export async function runOrchestrationOnce(contract: ExecutionContract, deps: Di
     return { runID: contract.runID, phase: "failed", round: 1, pendingCommands: [], error: bounded(err), rounds: [] };
   }
 
+  try {
+    const budget = await deps.resourceBudget?.({ stage: "jev-decision", maxRounds: contract.maxRounds, round: state.round });
+    if (budget && !budget.allowed) throw new OrchestrationError("resource-budget", budget.reason);
+  } catch (err) {
+    return await failRun(state, contract.runID, err, { phase: "failed", rounds: [] });
+  }
+
   // 2. Jev seleciona executor — APENAS na rodada inicial (repair/fresh nunca reselecionam)
   let selection: ExecutorSelection;
   try {
@@ -670,6 +680,15 @@ async function executeSchedule(
         transition: { commands: ReturnType<typeof transitionRun>["commands"] };
       }
   > {
+    try {
+      // This boundary decides whether this concrete round may execute. The
+      // switch/replan selection boundaries are checked separately before calls.
+      const stage: BudgetStage = "new-round";
+      const budget = await deps.resourceBudget?.({ stage, maxRounds: state.contract.maxRounds, round: state.round });
+      if (budget && !budget.allowed) throw new OrchestrationError("resource-budget", budget.reason);
+    } catch (err) {
+      return { abort: true, result: await failRun(state, contract.runID, err, undefined, { deps, kind: "run-failed" }) };
+    }
     // 2b. executor canonico de recovery — validado UMA vez por rodada.
     // initial usa selection (validada em validateSelection); repair/fresh usam
     // EXCLUSIVAMENTE state.executor via requireRecoveryExecutor. Ausente,
@@ -1155,6 +1174,12 @@ async function executeSchedule(
     }
 
     for (;;) {
+      try {
+        const budget = await deps.resourceBudget?.({ stage: "jev-decision", maxRounds: state.contract.maxRounds, round: state.round });
+        if (budget && !budget.allowed) throw new OrchestrationError("resource-budget", budget.reason);
+      } catch (err) {
+        return { abort: true, result: await failRun(state, contract.runID, err, { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, critic: criticProj, rounds }, { deps, kind: "run-failed", workerSessionID, criticSessionID }) };
+      }
       judgeAttempts += 1;
       const snapshotRevision = frontier.revision;
       try {
@@ -1333,6 +1358,30 @@ async function executeSchedule(
           };
         }
         frontier = currentFrontier;
+        if (!["accept", "stop", "human"].includes(verdict.nextAction)) {
+          const stage: BudgetStage = verdict.nextAction === "switch-model" || verdict.nextAction === "switch-agent"
+            ? "switch"
+            : verdict.nextAction === "replan" ? "replan" : "new-round";
+          try {
+            const budget = await deps.resourceBudget?.({
+              stage,
+              maxRounds: state.contract.maxRounds,
+              round: stage === "new-round" ? state.round + 1 : state.round,
+            });
+            if (budget && !budget.allowed) throw new OrchestrationError("resource-budget", budget.reason);
+          } catch (err) {
+            return {
+              abort: true,
+              result: await failRun(state, contract.runID, err, {
+                evidence,
+                worker: { sessionID: workerSessionID, agent, model, outcome, finalText },
+                critic: criticProj,
+                verdict,
+                rounds,
+              }, { deps, kind: "run-failed", workerSessionID, criticSessionID }),
+            };
+          }
+        }
         try {
           transitionResult = transitionRun(state, { type: "VERDICT_RECEIVED", verdict, frontier });
           state = transitionResult.state;

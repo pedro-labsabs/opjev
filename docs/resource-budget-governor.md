@@ -1,4 +1,44 @@
-# Resource/Budget Governor (Issue #3, first observational slice)
+# Resource/Budget Governor (Issue #3)
+
+## Adaptive enforcement (policy v1)
+
+`src/resource-governor/budget-policy.ts` converts the independent estimator
+signals into deterministic spend restrictions. Its evaluation window is the
+15 minutes immediately before evaluation (`[now - 15m, now]`), a local runtime
+heuristic and not a claim about any provider's quota or reset window. Facts
+outside that interval expire naturally, so policy recovers when old pressure
+observations leave the window. `unknown` remains unknown and preserves existing
+contract and provider hard limits.
+
+The policy returns only `allowed`, the bounded stage, an effective round cap,
+reason, and evidence basis. It never emits an executor, route, model, agent,
+or `nextAction`. The cap is always at most the current `ExecutionContract.maxRounds`;
+the contract remains the absolute ceiling. Moderate rate, execution, or
+availability pressure caps a run at two rounds; a switch/replan can still be
+considered before the cap. High rate/execution pressure and critical quota
+deny additional spending. The kernel checks before executor
+selection, each worker round (including resume), and each Jev judgement. A denied
+spend follows the existing bounded kernel failure/persistence path. A human
+resume passes the same checks and cannot override an active signal.
+
+Quota-limit evidence is critical. The provider retry hook records it and sets
+`retry:false` immediately: there is no Jev escalation, model switch, or retry.
+Global 429/529/throttle errors never call Jev or switch models. The hook permits
+at most two retries across the runtime in the same 15 minute local window,
+using one fixed-key counter with a timestamp and integer count, with bounded
+backoff. A failed/malformed enforcement-state read denies the retry. High rate or
+execution pressure blocks another Jev decision, round, switch, or replan, so a
+Jev verdict cannot authorize `repair-same`, `fresh-same`, `switch-model`,
+`switch-agent`, or `replan` past the hard budget.
+
+Context overflow remains a separate context signal and leaves native provider
+compaction in control; this policy does not invent a fallback. Availability
+failures remain separate from capability. Provider 500 behavior can continue
+through the existing escalation path while other policy dimensions allow it.
+The policy cannot infer official remaining quota, provider reset times, or
+fan-out the runtime does not report. Telemetry storage stays bounded and
+sanitized. A policy evaluation failure fails closed at the kernel boundary;
+observational sink failures remain isolated from authority decisions.
 
 The runtime writes factual observations through the dispatcher's optional
 `observeResource` seam to the shared `resource/usage-ledger/v1` storage record.
