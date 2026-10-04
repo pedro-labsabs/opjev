@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "scope": "Issue #3 adaptive/hard-budget policy slice",
   "baseSha": "c5e4bed9b30b54ca1b378624bf339c229be87e38",
-  "validatedHeadSha": "128add55822c4d7a01ada454dd515b39c1c50a51",
+  "validatedHeadSha": "0e708d091753e3afbaf8d408186dfaa5c18dc6cd",
   "branch": "feat/issue-3-adaptive-budget-policy",
   "executedAt": "2026-10-04",
   "runtime": {
@@ -11,22 +11,30 @@
   },
   "gates": {
     "typecheck": { "status": "PASS", "command": "npm run typecheck" },
-    "unit": { "status": "PASS", "command": "npm test", "tests": 628, "passed": 628, "failed": 0 },
+    "unit": { "status": "PASS", "command": "npm test", "tests": 632, "passed": 632, "failed": 0 },
     "matrix": { "status": "PASS", "command": "npm run e2e:matrix", "scenarios": 17, "passed": 17 },
     "gateway": {
-      "status": "FAIL_UNDER_RESOURCE_PRESSURE",
+      "status": "FAIL",
       "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:gateway",
       "assertions": 55,
-      "passed": 52,
-      "failed": 3,
-      "failedArea": "follow-up consumption assertions",
-      "observedBoundary": "resource-budget:rate-high stopped the run before a follow-up round could consume the input"
+      "passed": 51,
+      "failed": 4,
+      "failedAssertions": [
+        "orchestrate completed without resource-budget denial",
+        "follow-up record consumed with boundary",
+        "follow-up storage isolation and consumption",
+        "follow-up message delivered exactly once to real worker input"
+      ],
+      "observedBoundary": "resource-budget:rate-high stopped worker spending; admitted follow-ups were not consumed",
+      "tuiHarness": "PASS; pre-submit canary baseline avoids a lost-notice race"
     },
     "multiroundReal": {
       "status": "PASS",
       "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:multiround-real",
       "scenarios": 17,
       "passed": 17,
+      "failed": 0,
+      "runtimeEvidence": "OpenCode 2.0.11 with live Jev SystemOne and HTTP 429 fault injection",
       "notableEvidence": [
         "scenario 13: injected HTTP 429 stopped after one worker; no switch storm",
         "scenario 14: maxRounds=2 reached awaiting-human"
@@ -35,9 +43,10 @@
     "diffCheck": { "status": "PASS", "command": "git diff --check" }
   },
   "limitations": [
-    "The gateway E2E did not reach all follow-up consumption assertions because the hard governor stopped additional spend under observed rate pressure.",
-    "Provider reset times and remaining quota are not available; the policy uses a local 15 minute observation window."
+    "The gateway E2E gate failed; this PR is not ready. The real provider path raised rate-high and correctly blocked additional spend, preventing its follow-up-consumption assertions.",
+    "Provider reset times and remaining quota are not available; the policy uses a local 15 minute observation window.",
+    "The keyed throttle reservation lock is process-local and does not provide cross-process atomicity."
   ],
-  "testIsolation": "The real E2E harness clears only its Issue #3 telemetry and fixed throttle counter between the independent HTTP 429 and maxRounds scenarios; runtime storage and sessions remain real.",
+  "testIsolation": "The real E2E harness clears only Issue #3 telemetry and the fixed throttle counter between independent scenarios; runtime storage and sessions remain real.",
   "secretsIncluded": false
 }
