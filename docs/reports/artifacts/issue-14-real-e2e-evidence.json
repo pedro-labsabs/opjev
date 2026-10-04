@@ -1,20 +1,24 @@
 {
   "schemaVersion": 1,
   "provenance": {
-    "headSha": "8bf78fb0e2dadfa1911c302b634bd1b452626239",
+    "headSha": "e0097897c38056fe6f614d23b021f27a3e0c05c6",
     "openCodeRuntimeVersion": "2.0.11",
-    "executedAt": "2026-10-04T04:46:31.394Z",
-    "runner": "scripts/e2e-multiround-real.mjs"
+    "executedAt": "2026-10-04T15:41:56.238Z",
+    "runner": "scripts/e2e-multiround-real.mjs",
+    "runtimeSourceSha": "82914f331af1bf67942159e85a17b8ab28ff2c88",
+    "testHarnessSha": "27e8b052e60e2fb5d5b0079a4e9e268a58678ce9",
+    "worktreeHeadAtExecution": "e0097897c38056fe6f614d23b021f27a3e0c05c6",
+    "sourceNote": "At execution, runtime and harness changes were present in the working tree. runtimeSourceSha and testHarnessSha identify the content-identical commits created after the green run; the recorded headSha is the Git HEAD observed by the runner."
   },
   "scenarios": [
     {
       "scenarioId": 1,
       "scenarioName": "happy path → accept",
       "tier": "REAL OPENCODE + LIVE JEV SYSTEMONE",
-      "runID": "auto-ses_efac5a3d8ffeDKyshJ1b5TeoqX-msg_e2e_c1_1791089073201-7db89f4726ff",
+      "runID": "auto-ses_ef86d2d56ffeASIpWnZe3JHV0F-msg_e2e_c1_1791128425148-5e5b63897cb3",
       "round": 1,
-      "workerSessionID": "ses_efac5a052ffeJbM55VzvTN0MZL",
-      "criticSessionID": "ses_efac5a005ffeWQTYeMtDxRywDK",
+      "workerSessionID": "ses_ef86d294fffeLt2COVDRml85YT",
+      "criticSessionID": "ses_ef86d27ceffe1JSErfX62AwWs8",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -23,8 +27,8 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac5a052ffeJbM55VzvTN0MZL",
-        "ses_efac5a005ffeWQTYeMtDxRywDK"
+        "ses_ef86d294fffeLt2COVDRml85YT",
+        "ses_ef86d27ceffe1JSErfX62AwWs8"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -36,10 +40,10 @@
       "scenarioId": 2,
       "scenarioName": "critic encontra problema → Jev não aceita",
       "tier": "REAL OPENCODE + CONTROLLED JEV BOUNDARY",
-      "runID": "auto-ses_efac59cd6ffecFrCqjsmbZs64g-msg_e2e_c2_1791089074990-487054f776c2",
+      "runID": "auto-ses_ef86d2427ffe7xH8DIHzH0vGl5-msg_e2e_c2_1791128427494-c7a07ee504c8",
       "round": 1,
-      "workerSessionID": "ses_efac59cb4ffeiKFpncVtNOrmBq",
-      "criticSessionID": "ses_efac59c7effel0Q7UR3DwkndB7",
+      "workerSessionID": "ses_ef86d239affesljOuwBt5EST29",
+      "criticSessionID": "ses_ef86d22ebffeUSHcqHR3sx20DX",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -48,8 +52,8 @@
       "command": "none",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac59cb4ffeiKFpncVtNOrmBq",
-        "ses_efac59c7effel0Q7UR3DwkndB7"
+        "ses_ef86d239affesljOuwBt5EST29",
+        "ses_ef86d22ebffeUSHcqHR3sx20DX"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -61,10 +65,10 @@
       "scenarioId": 3,
       "scenarioName": "repair-same",
       "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
-      "runID": "auto-ses_efac59bc6ffehDdEUZExPLn569-msg_e2e_c3_1791089075260-f334ed2df9f1",
+      "runID": "auto-ses_ef86d2207ffe65VzvydJPArco2-msg_e2e_c3_1791128428044-a20e7c93b3b4",
       "round": 2,
-      "workerSessionID": "ses_efac59bb0ffe7lF2Yhn4NYt57l",
-      "criticSessionID": "ses_efac59b4fffe7of82Jr3jmJ3ln",
+      "workerSessionID": "ses_ef86d215fffe6efz7Uu3TH0Yph",
+      "criticSessionID": "ses_ef86d1febffetZE5SC3FUcFBDy",
       "executor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free"
@@ -73,8 +77,8 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac59bb0ffe7lF2Yhn4NYt57l",
-        "ses_efac59b4fffe7of82Jr3jmJ3ln"
+        "ses_ef86d215fffe6efz7Uu3TH0Yph",
+        "ses_ef86d1febffetZE5SC3FUcFBDy"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -86,10 +90,10 @@
       "scenarioId": 4,
       "scenarioName": "fresh-same",
       "tier": "REAL OPENCODE + MULTI-ROUND RUNTIME",
-      "runID": "auto-ses_efac59ab3ffedR8vf3bOmuBdIB-msg_e2e_c4_1791089075535-4c9af747e314",
+      "runID": "auto-ses_ef86d1edaffe3cPQF2CBEiDH3G-msg_e2e_c4_1791128428865-907faef4f1f7",
       "round": 2,
-      "workerSessionID": "ses_efac59a57ffe1EYw0p01yPPpZd",
-      "criticSessionID": "ses_efac59a3affeDw9p3wyOp9oB7P",
+      "workerSessionID": "ses_ef86d1d11ffeWj3C6KNo6ZuFEc",
+      "criticSessionID": "ses_ef86d1c95ffe89hTILL9yw9gjG",
       "executor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free"
@@ -98,8 +102,8 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac59a57ffe1EYw0p01yPPpZd",
-        "ses_efac59a3affeDw9p3wyOp9oB7P"
+        "ses_ef86d1d11ffeWj3C6KNo6ZuFEc",
+        "ses_ef86d1c95ffe89hTILL9yw9gjG"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -111,10 +115,10 @@
       "scenarioId": 5,
       "scenarioName": "switch-model",
       "tier": "REAL OPENCODE + FREE_POOL GUARD",
-      "runID": "auto-ses_efac599a3ffeHddgdprjIH2uK3-msg_e2e_c5_1791089075807-954f22e2d4ec",
+      "runID": "auto-ses_ef86d1bbdffeltveVNdqi30b3J-msg_e2e_c5_1791128429645-6d8a7a8963b9",
       "round": 2,
-      "workerSessionID": "ses_efac5993fffejgIS0IpdSJcMTC",
-      "criticSessionID": "ses_efac59923ffeQr6jlhK9dpPLD7",
+      "workerSessionID": "ses_ef86d1a2bffeE235o1wGZ4stv7",
+      "criticSessionID": "ses_ef86d1998ffe0SRQ7j7v1hXYfc",
       "executor": {
         "agent": "build",
         "model": "opencode/ling-3.0-flash-fin-free"
@@ -123,8 +127,8 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac5993fffejgIS0IpdSJcMTC",
-        "ses_efac59923ffeQr6jlhK9dpPLD7"
+        "ses_ef86d1a2bffeE235o1wGZ4stv7",
+        "ses_ef86d1998ffe0SRQ7j7v1hXYfc"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -136,10 +140,10 @@
       "scenarioId": 6,
       "scenarioName": "switch-agent",
       "tier": "REAL OPENCODE + CATALOG GUARD",
-      "runID": "auto-ses_efac59899ffeE8v4xGk7KYhFTb-msg_e2e_c6_1791089076074-73748f6e682d",
+      "runID": "auto-ses_ef86d18b2ffe9GG0fYUp2bAqQC-msg_e2e_c6_1791128430443-4a8752c86d3e",
       "round": 2,
-      "workerSessionID": "ses_efac59837ffeA584ZIfAETO639",
-      "criticSessionID": "ses_efac59815ffelgQFFNfkLYxiFB",
+      "workerSessionID": "ses_ef86d1782ffecBL23mMV9AcmX6",
+      "criticSessionID": "ses_ef86d1715ffe3iTUTAWkm455cJ",
       "executor": {
         "agent": "plan",
         "model": "opencode/nemotron-3.5-lightning-free"
@@ -148,8 +152,8 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac59837ffeA584ZIfAETO639",
-        "ses_efac59815ffelgQFFNfkLYxiFB"
+        "ses_ef86d1782ffecBL23mMV9AcmX6",
+        "ses_ef86d1715ffe3iTUTAWkm455cJ"
       ],
       "observedExecutor": {
         "agent": "plan",
@@ -160,12 +164,12 @@
     {
       "scenarioId": 7,
       "scenarioName": "replan",
-      "tier": "REAL OPENCODE + ORCHESTRATOR ISOLATION",
-      "runID": "auto-ses_efac5978bffe7bLpOqsSVUVn80-msg_e2e_c7_1791089076344-eea02846b8bf",
+      "tier": "REAL OPENCODE + PROVIDER TOOL VISIBILITY",
+      "runID": "auto-ses_ef86d1587ffekV9X6I5UF0eB8h-msg_e2e_c7_1791128431232-5505cb3d9ef4",
       "round": 2,
-      "workerSessionID": "ses_efac596faffejue15qCV3iS9k9",
-      "criticSessionID": "ses_efac596daffeNrurtlJQaikxhE",
-      "orchestratorSessionID": "ses_efac5971fffdZtNyvBoH6y4kbV",
+      "workerSessionID": "ses_ef86d13d9ffeV33Ssq0jV38q66",
+      "criticSessionID": "ses_ef86d1384ffeKwiXbnbXVTduGs",
+      "orchestratorSessionID": "ses_ef86d1443ffeuIYpN5dGGAY10X",
       "executor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free"
@@ -174,9 +178,9 @@
       "command": "none",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac596faffejue15qCV3iS9k9",
-        "ses_efac596daffeNrurtlJQaikxhE",
-        "ses_efac5971fffdZtNyvBoH6y4kbV"
+        "ses_ef86d13d9ffeV33Ssq0jV38q66",
+        "ses_ef86d1384ffeKwiXbnbXVTduGs",
+        "ses_ef86d1443ffeuIYpN5dGGAY10X"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -188,32 +192,32 @@
       "scenarioId": 8,
       "scenarioName": "human + resume",
       "tier": "REAL OPENCODE + CONCURRENCY LOCK",
-      "runID": "auto-ses_efac59681ffeuXDlVCAWI2Aqaw-msg_e2e_c8_1791089076609-388cec18cb56",
+      "runID": "auto-ses_ef86d126affesEOP8twftYepTI-msg_e2e_c8_1791128432054-f2ea76f3c62c",
       "requestID": "human:1:1:jev-human",
       "initialPhase": "awaiting-human",
       "initialRound": 1,
       "round": 2,
-      "workerSessionID": "ses_efac594f4ffe0k5GJXy90PjewA",
-      "criticSessionID": "ses_efac594d2ffeqUql2K5HCV5X9n",
+      "workerSessionID": "ses_ef86d0e43ffeGGtGJgOPF7Qnvn",
+      "criticSessionID": "ses_ef86d0d88ffeOD7Qg2zooSJ12C",
       "executor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free",
-        "sessionID": "ses_efac594f4ffe0k5GJXy90PjewA"
+        "sessionID": "ses_ef86d0e43ffeGGtGJgOPF7Qnvn"
       },
       "sameRunAndRequestID": true,
       "observedResumeInputs": [
         {
-          "runID": "auto-ses_efac59681ffeuXDlVCAWI2Aqaw-msg_e2e_c8_1791089076609-388cec18cb56",
+          "runID": "auto-ses_ef86d126affesEOP8twftYepTI-msg_e2e_c8_1791128432054-f2ea76f3c62c",
           "requestID": "human:1:1:jev-human"
         },
         {
-          "runID": "auto-ses_efac59681ffeuXDlVCAWI2Aqaw-msg_e2e_c8_1791089076609-388cec18cb56",
+          "runID": "auto-ses_ef86d126affesEOP8twftYepTI-msg_e2e_c8_1791128432054-f2ea76f3c62c",
           "requestID": "human:1:1:jev-human"
         }
       ],
       "callerSessionIDs": [
-        "ses_efac59571ffeba65hWrF6nYlqk",
-        "ses_efac5956fffetJ90apS69nmqom"
+        "ses_ef86d103affezWShzQxyuLMYVT",
+        "ses_ef86d1034ffe9m7kQBQTdNeI8G"
       ],
       "callerPromptsProcessed": [
         true,
@@ -256,13 +260,13 @@
       "command": "real OpenCode session prompt -> Code Mode execute -> tools.jev.orchestrate_resume",
       "finalPhase": "completed",
       "sessionIDs": [
-        "ses_efac594f4ffe0k5GJXy90PjewA",
-        "ses_efac594d2ffeqUql2K5HCV5X9n"
+        "ses_ef86d0e43ffeGGtGJgOPF7Qnvn",
+        "ses_ef86d0d88ffeOD7Qg2zooSJ12C"
       ],
       "observedExecutor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free",
-        "sessionID": "ses_efac594f4ffe0k5GJXy90PjewA"
+        "sessionID": "ses_ef86d0e43ffeGGtGJgOPF7Qnvn"
       },
       "observedDecision": "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser"
     },
@@ -270,10 +274,10 @@
       "scenarioId": 9,
       "scenarioName": "stop",
       "tier": "REAL OPENCODE + IMMEDIATE TERMINATION",
-      "runID": "auto-ses_efac59431ffeS9dorQX46SOyTl-msg_e2e_c9_1791089077201-1d318d9467d8",
+      "runID": "auto-ses_ef86d0b28ffe0BsL7ew8vcb1cI-msg_e2e_c9_1791128433893-f7b48ccc0822",
       "round": 1,
-      "workerSessionID": "ses_efac59416ffeUgaJwB6MqW0Bza",
-      "criticSessionID": "ses_efac593f1ffeCXf7GrVFihKOSR",
+      "workerSessionID": "ses_ef86d0ad7ffeCSwX95iIBEVVHo",
+      "criticSessionID": "ses_ef86d0a60ffe5LDk1LHssJ8K0K",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -282,8 +286,8 @@
       "command": "none",
       "finalPhase": "stopped",
       "sessionIDs": [
-        "ses_efac59416ffeUgaJwB6MqW0Bza",
-        "ses_efac593f1ffeCXf7GrVFihKOSR"
+        "ses_ef86d0ad7ffeCSwX95iIBEVVHo",
+        "ses_ef86d0a60ffe5LDk1LHssJ8K0K"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -295,9 +299,9 @@
       "scenarioId": 10,
       "scenarioName": "worker timeout / interrupted",
       "tier": "REAL OPENCODE + WORKER BOUNDARY",
-      "runID": "auto-ses_efac59326ffedyc60kTp2EWURL-msg_e2e_c10_1791089077469-e689b039af8f",
+      "runID": "auto-ses_ef86d08eaffesZAwjIObNZpIVG-msg_e2e_c10_1791128434462-db23922ddd42",
       "round": 1,
-      "workerSessionID": "ses_efac5930fffe9UMA8SCdP7zwDr",
+      "workerSessionID": "ses_ef86d089effeEf6Z2bbhmpYUb1",
       "criticSessionID": "none",
       "executor": {
         "agent": "build",
@@ -317,7 +321,7 @@
       "command": "interrupt",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac5930fffe9UMA8SCdP7zwDr"
+        "ses_ef86d089effeEf6Z2bbhmpYUb1"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -329,10 +333,10 @@
       "scenarioId": 11,
       "scenarioName": "critic timeout / failure",
       "tier": "REAL OPENCODE + CRITIC GUARD",
-      "runID": "auto-ses_efac4a7c8ffe84F5VQklFC9hsC-msg_e2e_c11_1791089137723-abdb6252eb3d",
+      "runID": "auto-ses_ef86c1d71ffejP6jnfWporLQ28-msg_e2e_c11_1791128494753-d9321852591d",
       "round": 1,
-      "workerSessionID": "ses_efac4a7b1ffe1Hvu26tR1uFlXn",
-      "criticSessionID": "ses_efac4a783ffext7URVpu4PHEXr",
+      "workerSessionID": "ses_ef86c1cd5ffeojl909VMQLwNTW",
+      "criticSessionID": "ses_ef86c1c1bffe0q5LqwCuZj2jec",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -341,8 +345,8 @@
       "command": "none",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac4a7b1ffe1Hvu26tR1uFlXn",
-        "ses_efac4a783ffext7URVpu4PHEXr"
+        "ses_ef86c1cd5ffeojl909VMQLwNTW",
+        "ses_ef86c1c1bffe0q5LqwCuZj2jec"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -354,10 +358,10 @@
       "scenarioId": 12,
       "scenarioName": "Jev unavailable / timeout",
       "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 500)",
-      "runID": "auto-ses_efac4a6bdffe3TSia1fq5V602b-msg_e2e_c12_1791089137990-28f018a79341",
+      "runID": "auto-ses_ef86c1b2bffeU0qwhob3B30Hvz-msg_e2e_c12_1791128495325-3c9a011f1050",
       "round": 1,
-      "workerSessionID": "ses_efac4a6a6ffeQR8LtgA4gb5tcW",
-      "criticSessionID": "ses_efac4a688ffeAdgJpgA71ijgcQ",
+      "workerSessionID": "ses_ef86c1ae2ffeVMLQ7s7XvhQse8",
+      "criticSessionID": "ses_ef86c1a2fffevr0e9ROIOKxA6o",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -366,8 +370,8 @@
       "command": "none",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac4a6a6ffeQR8LtgA4gb5tcW",
-        "ses_efac4a688ffeAdgJpgA71ijgcQ"
+        "ses_ef86c1ae2ffeVMLQ7s7XvhQse8",
+        "ses_ef86c1a2fffevr0e9ROIOKxA6o"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -379,9 +383,9 @@
       "scenarioId": 13,
       "scenarioName": "provider / global throttle",
       "tier": "REAL OPENCODE + FAULT INJECTION (HTTP 429)",
-      "runID": "auto-ses_efac4a5b0ffeuec4E5YBVdEx61-msg_e2e_c13_1791089138258-529ace177859",
+      "runID": "auto-ses_ef86c190affea3dVrkauRwjero-msg_e2e_c13_1791128495879-9c154d0e1574",
       "round": 1,
-      "workerSessionID": "ses_efac4a59effefDsMJqPB66r1j3",
+      "workerSessionID": "ses_ef86c18a6ffe0vMylK3shephHN",
       "criticSessionID": "none",
       "executor": {
         "agent": "build",
@@ -391,7 +395,7 @@
       "command": "none",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac4a59effefDsMJqPB66r1j3"
+        "ses_ef86c18a6ffe0vMylK3shephHN"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -403,10 +407,10 @@
       "scenarioId": 14,
       "scenarioName": "maxRounds exhaustion",
       "tier": "REAL OPENCODE + BUDGET ENFORCEMENT",
-      "runID": "auto-ses_efac3e093ffeJFNsriSn96YCn4-msg_e2e_c14_1791089188720-f5ffa405336f",
+      "runID": "auto-ses_ef86bdbc0ffe0OyH9l7uQV5SDK-msg_e2e_c14_1791128511563-5994409cc294",
       "round": 2,
-      "workerSessionID": "ses_efac3e07dffeMJBqNO1kKE1b1N",
-      "criticSessionID": "ses_efac3e02cffecMhD5kMN9xcC7e",
+      "workerSessionID": "ses_ef86bdb76ffeePgqE4MEokvUOM",
+      "criticSessionID": "ses_ef86bda02ffeuLBXt5ILp0vhFh",
       "executor": {
         "agent": "build",
         "model": "opencode/big-pickle"
@@ -415,8 +419,8 @@
       "command": "none",
       "finalPhase": "awaiting-human",
       "sessionIDs": [
-        "ses_efac3e07dffeMJBqNO1kKE1b1N",
-        "ses_efac3e02cffecMhD5kMN9xcC7e"
+        "ses_ef86bdb76ffeePgqE4MEokvUOM",
+        "ses_ef86bda02ffeuLBXt5ILp0vhFh"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -428,9 +432,9 @@
       "scenarioId": 15,
       "scenarioName": "tentativa de recursão por sessão interna",
       "tier": "REAL OPENCODE + MULTI-LAYER RECURSION GUARD",
-      "runID": "auto-ses_efac3e07dffeMJBqNO1kKE1b1N-msg_internal_recurse",
+      "runID": "auto-ses_ef86bdb76ffeePgqE4MEokvUOM-msg_internal_recurse",
       "round": 0,
-      "workerSessionID": "ses_efac3e07dffeMJBqNO1kKE1b1N",
+      "workerSessionID": "ses_ef86bdb76ffeePgqE4MEokvUOM",
       "criticSessionID": "none",
       "executor": {
         "agent": "none",
@@ -439,8 +443,8 @@
       "promptProofs": [
         {
           "role": "worker",
-          "sessionID": "ses_efac3e07dffeMJBqNO1kKE1b1N",
-          "sourceRunID": "auto-ses_efac3e093ffeJFNsriSn96YCn4-msg_e2e_c14_1791089188720-f5ffa405336f",
+          "sessionID": "ses_ef86bdb76ffeePgqE4MEokvUOM",
+          "sourceRunID": "auto-ses_ef86bdbc0ffe0OyH9l7uQV5SDK-msg_e2e_c14_1791128511563-5994409cc294",
           "status": 200,
           "processed": true,
           "markerSent": true,
@@ -463,8 +467,8 @@
         },
         {
           "role": "critic",
-          "sessionID": "ses_efac3e02cffecMhD5kMN9xcC7e",
-          "sourceRunID": "auto-ses_efac3e093ffeJFNsriSn96YCn4-msg_e2e_c14_1791089188720-f5ffa405336f",
+          "sessionID": "ses_ef86bda02ffeuLBXt5ILp0vhFh",
+          "sourceRunID": "auto-ses_ef86bdbc0ffe0OyH9l7uQV5SDK-msg_e2e_c14_1791128511563-5994409cc294",
           "status": 200,
           "processed": true,
           "markerSent": true,
@@ -473,8 +477,8 @@
         },
         {
           "role": "orchestrator",
-          "sessionID": "ses_efac5971fffdZtNyvBoH6y4kbV",
-          "sourceRunID": "auto-ses_efac5978bffe7bLpOqsSVUVn80-msg_e2e_c7_1791089076344-eea02846b8bf",
+          "sessionID": "ses_ef86d1443ffeuIYpN5dGGAY10X",
+          "sourceRunID": "auto-ses_ef86d1587ffekV9X6I5UF0eB8h-msg_e2e_c7_1791128431232-5505cb3d9ef4",
           "status": 200,
           "processed": true,
           "markerSent": true,
@@ -493,7 +497,7 @@
       "command": "OpenCode prompt API; worker Code Mode execute -> orchestrate_resume",
       "finalPhase": "internal-bypass",
       "sessionIDs": [
-        "ses_efac3e07dffeMJBqNO1kKE1b1N"
+        "ses_ef86bdb76ffeePgqE4MEokvUOM"
       ],
       "observedExecutor": {
         "agent": "none",
@@ -505,9 +509,9 @@
       "scenarioId": 16,
       "scenarioName": "agent / model candidate inválido",
       "tier": "REAL OPENCODE + CANDIDATE INTEGRITY",
-      "runID": "auto-ses_efac3dc75ffexRz3nQ8GdTH7Hm-msg_e2e_c16_1791089189773_cd85-75834e928c84",
+      "runID": "auto-ses_ef86bd580ffecrsk3sGsw2IvNH-msg_e2e_c16_1791128513175_0x0x-8c95f6601466",
       "round": 1,
-      "workerSessionID": "ses_efac3dc61ffeQI3vJtS9ug20j2",
+      "workerSessionID": "ses_ef86bd51dffe3WITspX2vK4kGr",
       "criticSessionID": "none",
       "executor": {
         "agent": "build",
@@ -517,18 +521,18 @@
       "subcases": [
         {
           "label": "paid model",
-          "runID": "auto-ses_efac3dc75ffexRz3nQ8GdTH7Hm-msg_e2e_c16_1791089189773_cd85-75834e928c84",
+          "runID": "auto-ses_ef86bd580ffecrsk3sGsw2IvNH-msg_e2e_c16_1791128513175_0x0x-8c95f6601466",
           "candidate": "openai/gpt-4o",
           "diagnostic": "switch-model fora dos candidatos validos: openai/gpt-4o (candidates=3)",
           "round": 2,
           "executorSessions": [
             {
-              "id": "ses_efac3dc61ffeQI3vJtS9ug20j2",
+              "id": "ses_ef86bd51dffe3WITspX2vK4kGr",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             },
             {
-              "id": "ses_efac3dc45ffe6oPVGpv49EOu1R",
+              "id": "ses_ef86bd49cffe1r7mJ384nlyUsM",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             }
@@ -536,18 +540,18 @@
         },
         {
           "label": "nonexistent model",
-          "runID": "auto-ses_efac3db6bffeHk0Vpr5907w504-msg_e2e_c16_1791089190039_zxpe-0ce91126e235",
+          "runID": "auto-ses_ef86bd359ffeqkbyCq1eFthIiF-msg_e2e_c16_1791128513714_wmgt-3f2d2809baf4",
           "candidate": "fake/nonexistent-model",
           "diagnostic": "switch-model fora dos candidatos validos: fake/nonexistent-model (candidates=3)",
           "round": 2,
           "executorSessions": [
             {
-              "id": "ses_efac3db57ffeSlDG24JB1eXrS7",
+              "id": "ses_ef86bd30cffeZIT0yNIAj0PhWK",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             },
             {
-              "id": "ses_efac3db3cffeYcAXrwZ4HR2v5m",
+              "id": "ses_ef86bd2b0ffencEqroIyPpaV5l",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             }
@@ -555,18 +559,18 @@
         },
         {
           "label": "unknown agent",
-          "runID": "auto-ses_efac3da62ffeUKJasg5fJvLObg-msg_e2e_c16_1791089190304_2rrz-d67c652455fd",
+          "runID": "auto-ses_ef86bd143ffecQ3kpkm2z3tzk4-msg_e2e_c16_1791128514254_khg0-3e25f83add03",
           "candidate": "unknown-rogue-agent",
           "diagnostic": "agente selecionado nao existe no catalogo runtime: unknown-rogue-agent",
           "round": 2,
           "executorSessions": [
             {
-              "id": "ses_efac3da51ffeH523bznYIf6FY4",
+              "id": "ses_ef86bd0eeffeqY6w2aeqZL2pcl",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             },
             {
-              "id": "ses_efac3da37ffeVRFOg0XrF4sB3B",
+              "id": "ses_ef86bd057ffejzi1hH6YY99ZI4",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             }
@@ -574,18 +578,18 @@
         },
         {
           "label": "known non-primary agent",
-          "runID": "auto-ses_efac3d95affe2FDaPKQkaaA0jr-msg_e2e_c16_1791089190568_q9ox-d0c5d866fb92",
+          "runID": "auto-ses_ef86bcf28ffevrkew4m192J80G-msg_e2e_c16_1791128514782_2h5x-55c6ba8bede6",
           "candidate": "explore",
           "diagnostic": "agente selecionado nao elegivel como primary no catalogo runtime: explore (mode=subagent, hidden=false)",
           "round": 2,
           "executorSessions": [
             {
-              "id": "ses_efac3d945ffebcoqfY7H0icEXf",
+              "id": "ses_ef86bcee7ffe1kt4xgrzFO4L9L",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             },
             {
-              "id": "ses_efac3d91dffe6K2VPk4kMPJ5Qg",
+              "id": "ses_ef86bce72ffeJReuUi4D16qTCg",
               "agent": "build",
               "model": "opencode/nemotron-3.5-lightning-free"
             }
@@ -595,7 +599,7 @@
       "command": "none",
       "finalPhase": "failed",
       "sessionIDs": [
-        "ses_efac3dc61ffeQI3vJtS9ug20j2"
+        "ses_ef86bd51dffe3WITspX2vK4kGr"
       ],
       "observedExecutor": {
         "agent": "build",
@@ -607,31 +611,31 @@
       "scenarioId": 17,
       "scenarioName": "stale evidence / rodada errada",
       "tier": "REAL OPENCODE + CONTROLLED HUMAN GATE + SQLITE EVIDENCE FAULT INJECTION",
-      "runID": "auto-ses_efac3d850ffe5Itt1UMoaCb5fP-msg_e2e_c17_1791089190835-444c8659b051",
+      "runID": "auto-ses_ef86bcd10ffeJWU6lObYbDhQ2D-msg_e2e_c17_1791128515331-d99ad353140e",
       "requestID": "human:1:1:jev-human",
       "initialPhase": "awaiting-human",
       "round": 1,
       "evidenceRoundBefore": 1,
       "evidenceRoundInjected": 2,
       "workerSessionIDsBefore": [
-        "ses_efac3d83cffenh97L7hT3Jjcm9"
+        "ses_ef86bccb8ffeQsCTorXh79HAn1"
       ],
       "workerSessionIDsAfter": [
-        "ses_efac3d83cffenh97L7hT3Jjcm9"
+        "ses_ef86bccb8ffeQsCTorXh79HAn1"
       ],
       "criticSessionIDsBefore": [
-        "ses_efac3d820ffeGRUOvcD82i2tiS"
+        "ses_ef86bcc2affeOIfVsfAUTTnbAt"
       ],
       "criticSessionIDsAfter": [
-        "ses_efac3d820ffeGRUOvcD82i2tiS"
+        "ses_ef86bcc2affeOIfVsfAUTTnbAt"
       ],
-      "callerSessionID": "ses_efac3d742ffeKtXFJTR4cx2706",
+      "callerSessionID": "ses_ef86bcaecffeUO05AR9myxCT0g",
       "callerPromptStatus": 200,
       "callerProcessed": true,
       "executor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free",
-        "sessionID": "ses_efac3d83cffenh97L7hT3Jjcm9"
+        "sessionID": "ses_ef86bccb8ffeQsCTorXh79HAn1"
       },
       "invalidResumableRunObserved": true,
       "staleEvidenceDiagnosticObserved": true,
@@ -639,7 +643,7 @@
       "toolInputObserved": true,
       "observedResumeInput": [
         {
-          "runID": "auto-ses_efac3d850ffe5Itt1UMoaCb5fP-msg_e2e_c17_1791089190835-444c8659b051",
+          "runID": "auto-ses_ef86bcd10ffeJWU6lObYbDhQ2D-msg_e2e_c17_1791128515331-d99ad353140e",
           "requestID": "human:1:1:jev-human"
         }
       ],
@@ -659,7 +663,7 @@
       "observedExecutor": {
         "agent": "build",
         "model": "opencode/nemotron-3.5-lightning-free",
-        "sessionID": "ses_efac3d83cffenh97L7hT3Jjcm9"
+        "sessionID": "ses_ef86bccb8ffeQsCTorXh79HAn1"
       },
       "observedDecision": "invalid-resumable-run: stale evidence.round rejected before decision or dispatch"
     }

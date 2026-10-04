@@ -1,45 +1,74 @@
 {
-  "schemaVersion": 1,
-  "scope": "Issue #3 adaptive/hard-budget policy slice",
+  "schemaVersion": 2,
+  "scope": "Issue #3 adaptive/hard-budget policy slice and Zen free-tier tool visibility compatibility",
   "baseSha": "c5e4bed9b30b54ca1b378624bf339c229be87e38",
-  "validatedHeadSha": "2f3fdfd11af271a7fb937853f2deaf3a26f8de9a",
-  "validationProvenance": "The fresh gateway diagnostic ran against runtime source HEAD 2f3fdfd11af271a7fb937853f2deaf3a26f8de9a. The other listed gates were last executed on 0e708d091753e3afbaf8d408186dfaa5c18dc6cd, whose runtime source is unchanged in 2f3fdfd (the intervening commit only updated evidence). No code or harness change was retained.",
   "branch": "feat/issue-3-adaptive-budget-policy",
+  "headAtStart": "e0097897c38056fe6f614d23b021f27a3e0c05c6",
+  "validatedHeadSha": "82914f331af1bf67942159e85a17b8ab28ff2c88",
+  "testedRuntimeSource": "Runtime changes in 82914f331af1bf67942159e85a17b8ab28ff2c88 were byte-identical to the source used by the gateway run. The gateway ran before commit creation at working HEAD e0097897c38056fe6f614d23b021f27a3e0c05c6; the test-only follow-up assertion was corrected afterward and does not alter runtime source.",
+  "testHarnessHeadSha": "27e8b052e60e2fb5d5b0079a4e9e268a58678ce9",
   "executedAt": "2026-10-04",
   "runtime": {
     "openCode": "2.0.11",
+    "authProvenance": "env-present",
     "jev": "live SystemOne for multiround-real; controlled boundary for injected failures"
   },
+  "rootCause": {
+    "historicalProviderThrottle": "Earlier gateway runs recorded real 429s and resource-budget:rate-high. Those runs remain valid evidence of provider throttling; the governor correctly stopped additional spend.",
+    "authenticatedBlocker": "A later authenticated run no longer showed the old rate-high symptom. It instead exposed provider.auth 403 stating that the OpenCode free tier could only be used within OpenCode; internal critic/orchestrator tool restrictions were removing tools from the provider-facing request.",
+    "correction": "Critic and orchestrator sessions now advertise the Zen-compatible toolset. Their local authority remains a fail-closed execute.before boundary using control-plane session metadata; only read/glob/grep execute for these roles. Worker keeps its own permission boundary.",
+    "upstreamContext": "OpenCode issues anomalyco/opencode#50627 and #49723 were cited as matching upstream reports. They are upstream context, not OPJEV runtime evidence.",
+    "currentGatewayObservation": "The authenticated gateway run below passed all 55 assertions; no provider.auth 403, 429/529, or resource-budget denial was observed in the run summary."
+  },
+  "testReconciliation": {
+    "previousBaseline": 632,
+    "finalTotal": 641,
+    "addedSecurityTests": 9,
+    "baselineTestsRemoved": 0,
+    "baselineTestsSkipped": 0,
+    "skippedFinal": 0,
+    "explanation": "The initial working tree had replaced six readonly-policy tests with one, leaving a new nine-case suite outside npm test's glob; this accounted for the 632-to-627 drop. The six policy cases are restored/reworked in src/readonly-policy.test.mjs, and all nine tool-authority tests now reside in src/tool-authority.test.mjs and run under npm test."
+  },
   "gates": {
-    "typecheck": { "status": "PASS", "command": "npm run typecheck" },
-    "unit": { "status": "PASS", "command": "npm test", "tests": 632, "passed": 632, "failed": 0 },
-    "matrix": { "status": "PASS", "command": "npm run e2e:matrix", "scenarios": 17, "passed": 17 },
+    "typecheck": {
+      "status": "PASS",
+      "command": "npm run typecheck"
+    },
+    "unit": {
+      "status": "PASS",
+      "command": "npm test",
+      "tests": 641,
+      "passed": 641,
+      "failed": 0,
+      "skipped": 0,
+      "previousBaseline": 632
+    },
+    "matrix": {
+      "status": "PASS",
+      "command": "npm run e2e:matrix",
+      "scenarios": 17,
+      "passed": 17,
+      "failed": 0
+    },
     "gateway": {
-      "status": "FAIL",
-      "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:gateway",
+      "status": "PASS",
+      "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:gateway (launched from bash -ic; OPENCODE_API_KEY was present)",
+      "authProvenance": "env-present",
       "assertions": 55,
-      "passed": 51,
-      "failed": 4,
-      "failedAssertions": [
-        "orchestrate completed without resource-budget denial",
-        "follow-up record consumed with boundary",
-        "follow-up storage isolation and consumption",
-        "follow-up message delivered exactly once to real worker input"
-      ],
-      "observedBoundary": "resource-budget:rate-high stopped worker spending; admitted follow-ups were not consumed",
-      "tuiHarness": "PASS; pre-submit canary baseline avoids a lost-notice race",
-      "diagnosticRun": "/tmp/opjev-e2e/runs/2026-10-04T12-40-52-029Z/",
-      "diagnosticTimeline": "resource-pressure-timeline.jsonl (bounded whitelisted ledger facts; no prompt, output, or provider error text)",
-      "pressureCause": "REAL_PROVIDER_THROTTLE",
-      "pressureTimeline": {
-        "beforeNormal": { "at": "2026-10-04T12:40:52Z", "observations": 0 },
-        "beforeOrchestrate": { "at": "2026-10-04T12:40:57Z", "observations": 2, "throttle429": 1, "retry": 1, "source": "normal scenario session" },
-        "afterOrchestrate": { "at": "2026-10-04T12:41:09Z", "observations": 12, "throttle429": 5, "retry": 2, "source": "includes repeated 429s from orchestrate execution sessions" },
-        "beforeFollowUpReset": { "observations": 12 },
-        "immediatelyAfterFollowUpReset": { "observations": 0 },
-        "afterFollowUpSessions": { "observations": 18, "throttle429": 6, "retry": 2, "source": "new 429s from follow-up worker/critic sessions after clean reset" }
-      },
-      "diagnosis": "Cross-phase pressure existed before ORCHESTRATE (one actual 429 from NORMAL), but ORCHESTRATE also produced repeated 429s. FOLLOW-UP began with an empty ledger after reset and then produced six actual 429 observations itself. The four failures therefore reproduce under provider pressure within the tested scenarios, not solely from inherited telemetry. No harness or production policy change was made."
+      "passed": 55,
+      "failed": 0,
+      "providerAuth403": false,
+      "resourceBudgetDenial": false,
+      "realTui": true,
+      "pluginLoaded": true,
+      "parentExecs": 0,
+      "uniqueDispatch": true,
+      "followupConsumedExactlyOnce": true,
+      "sessionIsolation": true,
+      "inboxPatchWake": false,
+      "credentialLeakAssertion": "PASS",
+      "artifactDirectory": "/tmp/opjev-e2e/runs/2026-10-04T15-29-00-668Z/",
+      "artifact": "/tmp/opjev-e2e/runs/2026-10-04T15-29-00-668Z/e2e-result.json"
     },
     "multiroundReal": {
       "status": "PASS",
@@ -47,19 +76,24 @@
       "scenarios": 17,
       "passed": 17,
       "failed": 0,
-      "runtimeEvidence": "OpenCode 2.0.11 with live Jev SystemOne and HTTP 429 fault injection",
-      "notableEvidence": [
-        "scenario 13: injected HTTP 429 stopped after one worker; no switch storm",
-        "scenario 14: maxRounds=2 reached awaiting-human"
-      ]
+      "runtime": "OpenCode 2.0.11 with live Jev SystemOne and HTTP 429 fault injection",
+      "scenario7": "PASS: real orchestrator session persisted provider-compatible wildcard tool visibility; local read-only denial is separately canary-tested at execute.before"
     },
-    "diffCheck": { "status": "PASS", "command": "git diff --check" }
+    "diffCheck": {
+      "status": "PASS",
+      "command": "git diff --check"
+    }
+  },
+  "securityEvidence": {
+    "localBoundary": "OpenCode plugin execute.before hook; thrown deny occurs before tool execution according to the OpenCode plugin runtime contract.",
+    "canaryTests": "src/tool-authority.test.mjs and adapter hook tests call the registered boundary before a canary executor and assert zero invocation for shell, edit/write, subagent/task, execute/code, question, web and unknown tools; orchestrator has the same rule. Worker isolation and ambiguous/missing control-plane metadata fail-closed cases are covered.",
+    "gatewayScope": "The gateway E2E proves the plugin was loaded and the real orchestration/follow-up/TUI path completed. It did not ask a live model to attempt a forbidden critic/orchestrator tool call; the explicit zero-executor canaries are deterministic local hook tests."
   },
   "limitations": [
-    "The gateway E2E gate remains BLOCKED at 51/55 under real provider 429 pressure. Follow-up starts with an empty Issue #3 ledger, then its own worker/critic sessions generate six 429 observations; the governor correctly blocks further spend. Do not report PASS or merge.",
-    "Provider reset times and remaining quota are not available; the policy uses a local 15 minute observation window.",
-    "The keyed throttle reservation lock is process-local and does not provide cross-process atomicity."
+    "Provider quota reset times and remaining quota are unavailable; Issue #3 uses a local 15-minute heuristic window, not a provider reset claim.",
+    "The serialized throttle reservation is process-local and does not provide cross-process atomicity.",
+    "The evaluator tool boundary depends on OpenCode 2.0.11 execute.before behavior and control-plane session metadata; unknown internal state fails closed.",
+    "No fan-out telemetry is fabricated. Issue #3 remains open for maintainer evaluation against all remaining criteria."
   ],
-  "testIsolation": "The real E2E harness clears only Issue #3 telemetry and the fixed throttle counter between independent scenarios; the diagnostic run proved the follow-up ledger was empty immediately after reset. Runtime storage and sessions remain real.",
   "secretsIncluded": false
 }
