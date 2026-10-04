@@ -9,11 +9,11 @@ export interface ResourceEnforcementStorage {
   set(key: string, value: unknown): Promise<void>;
 }
 
-let emergencyQuotaExpiresAt = 0;
+const emergencyQuotaByStorage = new WeakMap<object, number>();
 
 /** Mark in-process deny synchronously, including the storage-write failure path. */
-export function markEmergencyQuotaLatch(at: number): void {
-  emergencyQuotaExpiresAt = Math.max(emergencyQuotaExpiresAt, at + QUOTA_LATCH_TTL_MS);
+export function markEmergencyQuotaLatch(storage: object, at: number): void {
+  emergencyQuotaByStorage.set(storage, Math.max(emergencyQuotaByStorage.get(storage) ?? 0, at + QUOTA_LATCH_TTL_MS));
 }
 
 export async function readQuotaLatch(storage: ResourceEnforcementStorage, now: number): Promise<boolean> {
@@ -28,12 +28,12 @@ export async function readQuotaLatch(storage: ResourceEnforcementStorage, now: n
     ) throw new Error("invalid bounded quota enforcement state");
     durable = now < Number(x.expiresAt);
   }
-  return durable || now < emergencyQuotaExpiresAt;
+  return durable || now < (emergencyQuotaByStorage.get(storage) ?? 0);
 }
 
 /** Persist the hard latch under the same lock used by policy reads. */
 export async function latchQuotaLimit(storage: ResourceEnforcementStorage, at: number): Promise<void> {
-  markEmergencyQuotaLatch(at);
+  markEmergencyQuotaLatch(storage, at);
   await withKeyedLock(RESOURCE_ENFORCEMENT_LOCK, async () => {
     await storage.set(QUOTA_ENFORCEMENT_KEY, {
       schema: 1,
@@ -41,5 +41,6 @@ export async function latchQuotaLimit(storage: ResourceEnforcementStorage, at: n
       trippedAt: at,
       expiresAt: at + QUOTA_LATCH_TTL_MS,
     });
+    emergencyQuotaByStorage.delete(storage);
   });
 }
