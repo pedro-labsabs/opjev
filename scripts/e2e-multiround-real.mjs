@@ -1707,10 +1707,11 @@ async function main() {
   {
     const id = 17;
     log(`[${id}/17] Cenário 17: evidence.round stale injetado no SQLite real; rejeição via tool host real...`);
+    const c17Objective = `C17 stale evidence guard ${Date.now()}`;
     let c17JevRequests = 0;
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async (reqBody) => {
-      c17JevRequests += 1;
+      if (reqBody?.state?.objective === c17Objective) c17JevRequests += 1;
       if (reqBody?.questions?.done) {
         return { model: "jev-1.13-free", answers: stdAnswers({
           done: { type: "noul", noul: 0 },
@@ -1725,7 +1726,7 @@ async function main() {
     const sourceSessionID = await createRealSession();
     const messageID = `msg_e2e_c17_${Date.now()}`;
     const admission = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", {
-      input: { sessionID: sourceSessionID, messageID, objective: "Pause with a valid current-round evidence packet", maxRounds: 1 },
+      input: { sessionID: sourceSessionID, messageID, objective: c17Objective, maxRounds: 1 },
     });
     const runID = getRunId(admission);
     const awaitingHuman = await waitFor(() => {
@@ -1802,7 +1803,7 @@ async function main() {
     const lockCountZero = lockTelemetry?.endsWith("=0") ?? false;
     const staleInputConfirmed = evidenceRoundBefore === roundBefore && injected.injectedEvidenceRound === roundBefore + 1 && injectedRun.state.evidence.round === roundBefore + 1;
     const pass = awaitingHuman.state.phase === "awaiting-human" && typeof decision.requestID === "string" &&
-      promptResult.status === 200 && callerProcessed && toolInputObserved && invalidResumableRunObserved &&
+      jevRequestsBefore > 0 && promptResult.status === 200 && callerProcessed && toolInputObserved && invalidResumableRunObserved &&
       staleEvidenceDiagnosticObserved && staleInputConfirmed && persistedStateUnchangedAfterInjection &&
       finalRun?.state?.phase === "awaiting-human" && finalRun.state.round === roundBefore &&
       finalRun.state.evidence.round === roundBefore + 1 && noNewWorkers && noNewCritics &&
