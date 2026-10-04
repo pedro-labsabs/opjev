@@ -1363,7 +1363,7 @@ async function main() {
       const idleBefore = before.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
       before.close();
       const marker = { "jev-role": role, "jev-router": "orchestration-internal" };
-      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: { text: `Internal ${role} recursion guard E2E probe`, metadata: marker }, delivery: "steer", resume: true });
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: { text: `Internal ${role} recursion guard E2E probe`, metadata: marker, delivery: "steer", resume: true } });
       let promptComplete = false;
       if (promptResult.status >= 200 && promptResult.status < 300) {
         try {
@@ -1376,7 +1376,7 @@ async function main() {
           }, 30000, `Cenário 15 prompt ${role} processado`));
         } catch { promptComplete = false; }
       }
-      promptProofs.push({ role, sessionID: promptSessionID, sourceRunID: internalSession.runID, status: promptResult.status, processed: Boolean(promptComplete), markerSent: true, baselineAssistantMessages: assistantBefore, baselineIdleEvents: idleBefore });
+      promptProofs.push({ role, sessionID: promptSessionID, sourceRunID: internalSession.runID, status: promptResult.status, ...(promptResult.status >= 400 ? { errorTag: promptResult.data?._tag, error: promptResult.data?.message } : {}), processed: Boolean(promptComplete), markerSent: true, baselineAssistantMessages: assistantBefore, baselineIdleEvents: idleBefore });
     }
     const sid = internalSessions.find((candidate) => candidate.role === "worker").id;
     const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", { input: { sessionID: sid, messageID: "msg_internal_recurse", objective: "Internal recurse attempt" } });
