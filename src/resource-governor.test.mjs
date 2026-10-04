@@ -4,6 +4,8 @@ import { UsageLedger, aggregateUsage, sanitizeObservation } from "./resource-gov
 import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
 import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY, RESOURCE_LEDGER_CAPACITY, RESOURCE_LEDGER_PENDING_LIMIT } from "./resource-governor/storage-sink.ts";
 import { decideResourceBudget, RESOURCE_POLICY_WINDOW_MS } from "./resource-governor/budget-policy.ts";
+import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
+import { latchQuotaLimit, QUOTA_ENFORCEMENT_KEY, QUOTA_LATCH_TTL_MS } from "./resource-governor/enforcement-state.ts";
 
 test("ledger has fixed retention, sanitizes payloads, and does not grow without bound", () => {
   const ledger = new UsageLedger({ capacity: 3 });
@@ -156,8 +158,9 @@ test("budget policy is deterministic, preserves unknown, and never expands maxRo
 
 test("quota and throttle policy deny additional spending without route authority", () => {
   const quota = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "quota-limit" }], { from: 0, to: 2 }));
-  const denied = decideResourceBudget({ pressure: quota, maxRounds: 4, round: 1, stage: "jev-decision" });
+  const denied = decideResourceBudget({ pressure: quota, hardQuotaLatch: true, maxRounds: 4, round: 1, stage: "jev-decision" });
   assert.equal(denied.allowed, false);
+  assert.equal(decideResourceBudget({ pressure: quota, maxRounds: 4, round: 1, stage: "jev-decision" }).allowed, true, "observation alone is not the authoritative hard latch");
   assert.equal("model" in denied, false);
   const throttle = estimateResourcePressure(aggregateUsage(Array.from({ length: 3 }, (_, i) => ({ at: i, kind: "throttle" })), { from: 0, to: 4 }));
   assert.equal(decideResourceBudget({ pressure: throttle, maxRounds: 4, round: 1, stage: "switch" }).allowed, false);
@@ -171,4 +174,41 @@ test("moderate independent pressure lowers the effective round cap without choos
   assert.equal(switchAllowed.effectiveMaxRounds, 2);
   assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 2, stage: "switch" }).allowed, false);
   assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 3, stage: "new-round" }).allowed, false);
+});
+
+test("durable quota latch denies a later session even when the observation sink drops its ledger write", async () => {
+  const now = 50_000;
+  const storage = new Map();
+  const state = {
+    get: async key => storage.get(key),
+    set: async (key, value) => { if (key !== RESOURCE_LEDGER_KEY) storage.set(key, structuredClone(value)); },
+  };
+  await latchQuotaLimit(state, now);
+  const sink = createBoundedStorageObservationSink({}, state);
+  await sink({ at: now, kind: "quota-limit", errorCode: "FreeUsageLimitError", failureDomain: "quota" });
+  assert.equal(storage.has(RESOURCE_LEDGER_KEY), false, "best-effort factual write was dropped");
+  assert.deepEqual(storage.get(QUOTA_ENFORCEMENT_KEY), {
+    schema: 1, signal: "quota-limit", trippedAt: now, expiresAt: now + QUOTA_LATCH_TTL_MS,
+  });
+  const budget = await evaluateResourceBudget(state, { stage: "jev-decision", maxRounds: 3, round: 1 }, now + 1);
+  assert.equal(budget.allowed, false);
+  assert.equal(budget.basis.includes("quota-enforcement-latch"), true);
+  assert.equal("model" in budget, false);
+  const recovered = await evaluateResourceBudget(state, { stage: "jev-decision", maxRounds: 3, round: 1 }, now + QUOTA_LATCH_TTL_MS + 1);
+  assert.equal(recovered.allowed, true, "local latch expires after the documented heuristic TTL");
+});
+
+test("quota enforcement storage failures reject policy evaluation instead of granting budget", async () => {
+  const badRead = { get: async () => { throw new Error("unavailable"); }, set: async () => {} };
+  await assert.rejects(evaluateResourceBudget(badRead, { stage: "provider-retry", maxRounds: 1, round: 1 }));
+  let emergencyWrites = 0;
+  const badWrite = {
+    get: async () => undefined,
+    set: async () => { emergencyWrites += 1; throw new Error("write unavailable"); },
+  };
+  const syntheticNow = 1_000;
+  await assert.rejects(latchQuotaLimit(badWrite, syntheticNow));
+  assert.equal(emergencyWrites, 1);
+  const denied = await evaluateResourceBudget(badWrite, { stage: "provider-retry", maxRounds: 1, round: 1 }, syntheticNow + 1);
+  assert.equal(denied.allowed, false, "failed durable write retains an in-process hard deny");
 });

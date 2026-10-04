@@ -38,9 +38,9 @@ import {
 } from "./src/orchestration/agent-catalog.ts";
 import { attemptKey } from "./src/orchestration/dispatcher.ts";
 import { createBoundedStorageObservationSink } from "./src/resource-governor/storage-sink.ts";
-import { aggregateUsage } from "./src/resource-governor/usage-ledger.ts";
-import { estimateResourcePressure } from "./src/resource-governor/pressure-estimator.ts";
-import { decideResourceBudget, RESOURCE_POLICY_WINDOW_MS } from "./src/resource-governor/budget-policy.ts";
+import { evaluateResourceBudget } from "./src/resource-governor/runtime-policy.ts";
+import { latchQuotaLimit } from "./src/resource-governor/enforcement-state.ts";
+import { reserveThrottleRetry } from "./src/resource-governor/throttle-retry-budget.ts";
 import type { AgentCatalogEntry } from "./src/orchestration/agent-catalog.ts";
 import {
   OrchestrationResultRpc,
@@ -886,18 +886,7 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
-    resourceBudget: async (input) => {
-      const now = Date.now();
-      // Unlike observational writes, enforcement reads fail closed. An unreadable
-      // governor snapshot must not silently become permission to spend.
-      const stored: any = await ctx.storage.get("resource/usage-ledger/v1");
-      if (stored !== undefined && stored !== null && (stored.schema !== 1 || !Array.isArray(stored.observations))) {
-        throw new OrchestrationError("resource-budget-state", "resource usage ledger has an invalid bounded schema");
-      }
-      const observations = stored?.schema === 1 && Array.isArray(stored.observations) ? stored.observations : [];
-      const pressure = estimateResourcePressure(aggregateUsage(observations, { from: now - RESOURCE_POLICY_WINDOW_MS, to: now }), now);
-      return decideResourceBudget({ pressure, ...input });
-    },
+    resourceBudget: (input) => evaluateResourceBudget(ctx.storage, input),
     observeResource: createBoundedStorageObservationSink(ctx, {
       get: async (key) => await safeStorageGet(ctx, key),
       set: async (key, value) => await ctx.storage.set(key, value),
@@ -1721,41 +1710,49 @@ export default Plugin.define({
       };
       const errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
       if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
-        // Critical quota is a hard stop: no Jev escalation, model switch, or retry.
+        // Set the runtime boundary first, then establish the authoritative latch
+        // before this hook returns. The observation ledger remains best-effort.
         event.decision = { retry: false };
+        try { await latchQuotaLimit(ctx.storage, Date.now()); } catch { /* in-process emergency latch stays active */ }
+        recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
         return;
       } else if (isContextOverflow(event?.error)) {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
       } else if (isGlobalThrottle(event?.error)) {
         const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
+        try {
+          const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+          if (!budget.allowed) {
+            event.decision = { retry: false };
+            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+            return;
+          }
+        } catch {
+          event.decision = { retry: false };
+          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+          return;
+        }
+        let retryAllowed = false;
+        let reservation = { allowed: false, retries: 0 };
+        try { reservation = await reserveThrottleRetry(ctx.storage, Date.now()); } catch { /* failed reservation denies */ }
+        retryAllowed = reservation.allowed;
+        event.decision = retryAllowed ? { retry: true, delay: Math.min(5000 * reservation.retries, 15000) } : { retry: false };
         await recordRuntimeResource(ctx, {
           ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
           ...(Number.isFinite(status) ? { statusCode: status } : {}),
         });
-        // Two retries maximum globally in the same explicit local policy window.
-        // This fixed-key counter is enforcement state; ledger telemetry alone
-        // is best-effort and cannot safely authorize retries when storage fails.
-        const now = Date.now();
-        let retries = 2;
-        let retryAllowed = false;
-        try {
-          const key = "resource/throttle-retry/v1";
-          const prior: any = await ctx.storage.get(key);
-          if (prior == null) retries = 0;
-          else if (Number.isFinite(prior.windowStart) && Number.isInteger(prior.retries) && prior.retries >= 0) {
-            retries = now - prior.windowStart >= RESOURCE_POLICY_WINDOW_MS ? 0 : Math.min(prior.retries, 2);
-          }
-          retryAllowed = retries < 2;
-          if (retryAllowed) await ctx.storage.set(key, { windowStart: retries === 0 ? now : prior?.windowStart, retries: retries + 1 });
-        } catch { retryAllowed = false; }
-        event.decision = retryAllowed ? { retry: true, delay: Math.min(5000 * (retries + 1), 15000) } : { retry: false };
         if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
       }
+      // Provider 5xx and other ordinary failures keep the historical Jev
+      // escalation only when the authoritative resource policy grants it.
+      try {
+        const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+        if (!budget.allowed) { event.decision = { retry: false }; return; }
+      } catch { event.decision = { retry: false }; return; }
       if (!sessionID) return;
       const stored = (await safeStorageGet(ctx, `route/${sessionID}`)) as RouteState | undefined;
       // O modelo que REALMENTE falhou: o retry hook dispara imediatamente apos
@@ -1801,6 +1798,10 @@ export default Plugin.define({
         return;
       }
       // Guardrail: so troca para modelo disponivel no catalogo.
+      try {
+        const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+        if (!budget.allowed) { event.decision = { retry: false }; return; }
+      } catch { event.decision = { retry: false }; return; }
       const candidates = [esk.model, ...chain];
       const valid = await firstAvailable(ctx, candidates);
       if (!valid) {

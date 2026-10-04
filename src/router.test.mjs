@@ -354,7 +354,8 @@ describe("retry hook", () => {
   });
 
   it("quota-limit encerra imediatamente sem Jev, switch ou retry", async () => {
-    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage: makeStorage(), options: PLUGIN_OPTS });
+    const storage = makeStorage();
+    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage, options: PLUGIN_OPTS });
     const stub = stubFetch(() => { throw new Error("quota must not call Jev"); });
     try {
       const ev = { sessionID: "s1", model: { providerID: "opencode", id: "big-pickle" }, error: { name: "FreeUsageLimitError", message: "free usage exhausted" }, attempt: 0, decision: {} };
@@ -362,26 +363,65 @@ describe("retry hook", () => {
       assert.deepEqual(ev.decision, { retry: false });
       assert.equal(m.calls.switchModel.length, 0);
       assert.equal(stub.calls.length, 0);
+      assert.equal(storage._map.get("resource/enforcement/quota-latch/v1")?.signal, "quota-limit", "hard latch is durable before hook boundary returns");
     } finally { stub.restore(); }
   });
 
-  it("global throttle permite no máximo duas tentativas por janela e recupera após expiração", async () => {
+  it("reserva atomicamente no máximo dois retries throttle concorrentes e recupera após expiração", async () => {
     const storage = makeStorage();
     const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage, options: PLUGIN_OPTS });
     const stub = stubFetch(() => { throw new Error("throttle never consults Jev"); });
     try {
       const makeEvent = () => ({ sessionID: "s-throttle-budget", model: { providerID: "opencode", id: "big-pickle" }, error: { type: "http_error", message: "rate limit", status: 429 }, decision: {} });
-      const first = makeEvent(); await m.hooks.session.retry(first);
-      const second = makeEvent(); await m.hooks.session.retry(second);
-      const third = makeEvent(); await m.hooks.session.retry(third);
-      assert.equal(first.decision.retry, true);
-      assert.equal(second.decision.retry, true);
-      assert.deepEqual(third.decision, { retry: false });
-      storage._map.set("resource/throttle-retry/v1", { windowStart: Date.now() - 16 * 60 * 1000, retries: 2 });
-      const recovered = makeEvent(); await m.hooks.session.retry(recovered);
-      assert.equal(recovered.decision.retry, true);
+      const concurrent = [makeEvent(), makeEvent(), makeEvent()];
+      await Promise.all(concurrent.map(event => m.hooks.session.retry(event)));
+      assert.equal(concurrent.filter(event => event.decision.retry === true).length, 2);
+      assert.equal(concurrent.filter(event => event.decision.retry === false).length, 1);
+      assert.equal(storage._map.get("resource/throttle-retry/v1").retries, 2, "persisted count equals granted reservations");
       assert.equal(m.calls.switchModel.length, 0);
       assert.equal(stub.calls.length, 0);
+      for (let i = 0; i < 20 && (storage._map.get("resource/usage-ledger/v1")?.observations ?? []).filter(x => x.kind === "retry").length < 2; i++) await new Promise(resolve => setTimeout(resolve, 0));
+      storage._map.set("resource/throttle-retry/v1", { windowStart: Date.now() - 16 * 60 * 1000, retries: 2 });
+      storage._map.delete("resource/usage-ledger/v1");
+      const recovered = makeEvent(); await m.hooks.session.retry(recovered);
+      assert.equal(recovered.decision.retry, true);
+      assert.equal(storage._map.get("resource/throttle-retry/v1").retries, 1, "expired window starts a new reservation count");
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("provider 500 hard deny encerra antes do Jev, switch e retry", async () => {
+    const now = Date.now();
+    const storage = makeStorage({
+      "resource/enforcement/quota-latch/v1": { schema: 1, signal: "quota-limit", trippedAt: now, expiresAt: now + 900_000 },
+    });
+    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage, options: PLUGIN_OPTS });
+    const stub = stubFetch(() => { throw new Error("hard deny must not consult Jev"); });
+    try {
+      const ev = { sessionID: "s1", model: { providerID: "opencode", id: "big-pickle" }, error: { type: "http_error", message: "500 internal", status: 500 }, attempt: 1, decision: {} };
+      await m.hooks.session.retry(ev);
+      assert.deepEqual(ev.decision, { retry: false });
+      assert.equal(stub.calls.length, 0);
+      assert.equal(m.calls.switchModel.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("provider 500 com falha ao ler enforcement state falha fechado antes do Jev", async () => {
+    const storage = makeStorage();
+    const read = storage.get;
+    storage.get = async key => {
+      if (key === "resource/enforcement/quota-latch/v1") throw new Error("enforcement storage unavailable");
+      return read(key);
+    };
+    const m = await bootCtx({ models: ALL_MODELS, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } }, storage, options: PLUGIN_OPTS });
+    const stub = stubFetch(() => { throw new Error("failed read must not consult Jev"); });
+    try {
+      const ev = { sessionID: "s1", model: { providerID: "opencode", id: "big-pickle" }, error: { type: "http_error", message: "500 internal", status: 500 }, attempt: 1, decision: {} };
+      await m.hooks.session.retry(ev);
+      assert.deepEqual(ev.decision, { retry: false });
+      assert.equal(stub.calls.length, 0);
+      assert.equal(m.calls.switchModel.length, 0);
     } finally { stub.restore(); }
   });
 

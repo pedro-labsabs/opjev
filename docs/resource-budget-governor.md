@@ -15,8 +15,9 @@ reason, and evidence basis. It never emits an executor, route, model, agent,
 or `nextAction`. The cap is always at most the current `ExecutionContract.maxRounds`;
 the contract remains the absolute ceiling. Moderate rate, execution, or
 availability pressure caps a run at two rounds; a switch/replan can still be
-considered before the cap. High rate/execution pressure and critical quota
-deny additional spending. The kernel checks before executor
+considered before the cap. High rate/execution pressure and an active
+authoritative quota latch deny additional spending; an observed quota fact alone
+is not enforcement authority. The kernel checks before executor
 selection, each worker round (including resume), and each Jev judgement. A denied
 spend follows the existing bounded kernel failure/persistence path. A human
 resume passes the same checks and cannot override an active signal.
@@ -46,7 +47,26 @@ The record is a fixed-capacity ring of 2,048 observations. Appends are serialize
 per plugin context with at most 256 queued writes. The dispatcher waits at most
 50 ms for each asynchronous observation before continuing. Storage or telemetry
 failures are isolated from orchestration; under storage pressure, new facts may
-be dropped rather than creating an unbounded queue.
+be dropped rather than creating an unbounded queue. This ledger is observational
+and reusable by #5; it is never the sole authority for a hard quota denial.
+
+Quota-limit events also update a separate authoritative, fixed-key enforcement
+record (`resource/enforcement/quota-latch/v1`) before the retry hook returns.
+It contains only a schema, signal, trip timestamp and expiry timestamp. The
+record expires after 15 minutes of local wall-clock time, the same local
+heuristic duration used by policy; that expiry is not evidence of provider reset.
+Read or write failures fail closed. If persistence fails, an in-process emergency
+latch remains active until its local expiry. Thus dropping the factual ledger
+observation cannot release an unexpired hard latch. A malformed enforcement
+record also fails closed.
+
+Global throttle retries use a second fixed-key record and the existing
+process-local keyed lock. The lock covers read, window validation, reservation
+increment and write; storage errors deny the reservation. At most two retry
+slots are granted in each 15-minute local window, with bounded 5/10 second
+backoff. The event itself is recorded separately in the observational ledger.
+The lock is process-local; deployments sharing storage across multiple plugin
+processes do not get a cross-process atomic primitive from this implementation.
 
 ## Facts and estimates
 
@@ -90,15 +110,27 @@ percentages.
 
 ## Authority and reuse
 
-The ledger and estimator are pure reusable modules under
-`src/resource-governor/`; #5 can consume the same `UsageObservation` facts and
-derive capability/efficiency interpretations separately. The kernel and
-dispatcher remain the only execution authority. `FREE_POOL`, hard
-`ExecutionContract.maxRounds`, critic read-only policy, and explicit Jev
-recovery verdicts are unchanged. There is no governor scheduler or implicit
-fallback path in this slice.
+The ledger, estimator and pure policy modules under `src/resource-governor/`
+remain separable; #5 can consume the same `UsageObservation` facts and derive
+capability/efficiency interpretations independently. Enforcement state is
+separate from that shared ledger. The kernel and dispatcher remain the only
+execution authority. `FREE_POOL`, hard `ExecutionContract.maxRounds`, critic
+read-only policy, and explicit Jev recovery verdicts remain intact. There is no
+governor scheduler, route selection, model/agent choice or implicit fallback.
 
-This PR is `Refs #3`: it delivers the shared bounded facts, aggregation,
-independent pressure estimates and observational profiles. It does not yet
-apply adaptive hard-budget policies to fan-out, retries or rounds, nor observe
-every provider/Jev internal request, native compaction, or subagent event.
+Runtime enforcement checks policy before executor selection, each worker round
+(including resume), each Jev judgement, and the provider retry/switch boundary.
+Provider 500 can continue through the existing Jev escalation path only when
+policy allows it; denial or enforcement-state read failure means no Jev, switch
+or retry. Quota stops immediately without Jev or automatic retry. 429/529 uses
+the atomic bounded retry reservation and never switches model or asks Jev.
+Context overflow remains on native compaction, and availability remains
+separate from capability.
+
+Remaining limits: policy windows and thresholds are local heuristics; they do
+not know official provider quota/reset state. Cross-process atomic retry
+reservation is not provided by the process-local lock. Runtime-internal Jev
+requests, provider usage that the host does not expose, native compaction and
+subagent/fan-out events are not fully observable, and the governor cannot make
+claims about them. This PR references Issue #3; the issue remains open for any
+criteria not yet backed by implementation and runtime evidence.

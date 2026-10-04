@@ -15,12 +15,14 @@ const rank: Record<PressureLevel, number> = { unknown: 0, low: 1, moderate: 2, h
 
 export function decideResourceBudget(input: {
   pressure: ResourcePressure;
+  /** Authoritative quota latch; independent of best-effort observation storage. */
+  hardQuotaLatch?: boolean;
   maxRounds: number;
   round: number;
   stage: BudgetStage;
 }): ResourceBudgetDecision {
   const { pressure, stage } = input;
-  const hardQuota = pressure.quota.level === "critical";
+  const hardQuota = input.hardQuotaLatch === true;
   const hardThrottle = rank[pressure.rate.level] >= rank.high;
   const retryStorm = rank[pressure.execution.level] >= rank.high;
   const adaptivePressure = rank[pressure.rate.level] >= rank.moderate || rank[pressure.execution.level] >= rank.moderate || rank[pressure.availability.level] >= rank.moderate;
@@ -30,7 +32,7 @@ export function decideResourceBudget(input: {
   const hardPressure = hardThrottle || retryStorm;
   const capReached = adaptiveCapActive && ((stage === "new-round" && input.round > effectiveMaxRounds) || ((stage === "switch" || stage === "replan") && input.round >= effectiveMaxRounds));
   const blocked = hardQuota || (spendStage && hardPressure) || capReached;
-  const basis = [hardQuota && "quota-critical", hardThrottle && "rate-high", retryStorm && "execution-high", adaptivePressure && "adaptive-round-cap"].filter(Boolean) as string[];
+  const basis = [input.hardQuotaLatch && "quota-enforcement-latch", hardThrottle && "rate-high", retryStorm && "execution-high", adaptivePressure && "adaptive-round-cap"].filter(Boolean) as string[];
   return {
     allowed: !blocked,
     stage,
