@@ -1084,6 +1084,11 @@ async function main() {
     let releaseBarrier;
     const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
     const callers = await Promise.all([createRealSession(), createRealSession()]);
+    const callerIdleBaseline = callers.map((callerID) => {
+      const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+      const count = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(callerID).n;
+      db.close(); return count;
+    });
     const callerTokens = callers.map((callerID, index) => `C8_REAL_RESUME_${index}_${callerID}`);
     activeResumeToolRequests = {
       expected: 2,
@@ -1107,6 +1112,16 @@ async function main() {
       }, 60000, "Cenário 8 conclusão após duas tool calls reais");
     } catch { resumed = readRunFromDb(homeDir, runID); }
     const finalRunState = resumed ?? readRunFromDb(homeDir, runID) ?? runState;
+    const callerPromptsProcessed = await Promise.all(callers.map(async (callerID, index) => {
+      try {
+        await waitFor(() => {
+          const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+          const count = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(callerID).n;
+          db.close(); return count > callerIdleBaseline[index];
+        }, 30000, `Cenário 8 caller ${index + 1} prompt concluído`);
+        return true;
+      } catch { return false; }
+    }));
     const runSessions = getSessionsForRun(homeDir, runID);
     const workerSessions = runSessions.filter((session) => session.role === "worker");
     const criticSessions = runSessions.filter((session) => session.role === "critic");
@@ -1122,17 +1137,17 @@ async function main() {
     const noExtraRound = finalRunState.state.round === 2 && workerSessions.length === 2 && criticSessions.length === 2;
     const promptAdmissionsPassed = promptResults.every((result) => result.status === 200);
     const realToolCallsObserved = activeResumeToolRequests.arrived === 2 && !activeResumeToolRequests.unsupported;
-    const pass = promptAdmissionsPassed && realToolCallsObserved &&
+    const pass = promptAdmissionsPassed && callerPromptsProcessed.every(Boolean) && realToolCallsObserved &&
       finalRunState.state.phase === "completed" && finalRunState.state.round === 2 &&
       loserCount === 1 && humanDecisionCount === 1 && exactlyOneWorkerAndCritic && noExtraRound;
     const lockTelemetry = up.lines.filter((line) => line.includes("[opjev-e2e] resume-lock-release=")).at(-1);
     const lockCountZero = lockTelemetry?.endsWith("=0") ?? false;
-    results.push({ id, name: SCENARIO_DEFS[7].name, pass: pass && lockCountZero, phase: finalRunState.state.phase, round: finalRunState.state.round, runID, toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount, workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing" });
+    results.push({ id, name: SCENARIO_DEFS[7].name, pass: pass && lockCountZero, phase: finalRunState.state.phase, round: finalRunState.state.round, runID, toolCallCount: activeResumeToolRequests.arrived, callerPromptsProcessed, loserCount, humanDecisionCount, workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing" });
     evidenceRecords.push({
       scenarioId: id, scenarioName: SCENARIO_DEFS[7].name, tier: SCENARIO_DEFS[7].tier,
       runID, round: finalRunState.state.round, workerSessionID: workerSessions[1]?.id ?? runState.workerSessionID,
       criticSessionID: criticSessions[1]?.id ?? runState.criticSessionID, executor: finalRunState.state.executor,
-      callerSessionIDs: callers, toolNamesObserved: activeResumeToolRequests.toolNames,
+      callerSessionIDs: callers, callerPromptsProcessed, toolNamesObserved: activeResumeToolRequests.toolNames,
       toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount,
       workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing",
       verdict: pass && lockCountZero ? "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser" : "BLOCKED/FAIL: real tool invocation or exactly-once assertions missing",
