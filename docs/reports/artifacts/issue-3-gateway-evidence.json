@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "provenance": {
-    "sourceSha": "4f4bd08af63dad102f837390e48da44970315056",
+    "sourceSha": "7191e11a69098bf712ca89a677604017e2899901",
     "openCodeRuntimeVersion": "v2.0.11",
-    "executedAt": "2026-10-04T03:55:20.169Z",
+    "executedAt": "2026-10-04T04:27:45.808Z",
     "runner": "scripts/e2e-gateway.mjs"
   },
   "summary": {
