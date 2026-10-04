@@ -144,7 +144,7 @@ npm run e2e:multiround-real
 ```
 [e2e-real] Iniciando Gate Definitivo de Estabilização E2E Multi-Round Real
 [e2e-real] OpenCode binary: /tmp/opencode-2.0.11/package/bin/opencode
-[e2e-real] Chave OpenCode Zen: oc_sk_4205...
+[e2e-real] Chave OpenCode Zen: [CONFIGURED]
 [e2e-real] Jev SystemOne Proxy ouvindo em :38799
 [e2e-real] Subindo upstream OpenCode v2.0.11 em :40397...
 [e2e-real] Upstream pronto: OpenCode v2.0.11
