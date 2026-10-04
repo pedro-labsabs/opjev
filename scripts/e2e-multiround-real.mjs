@@ -156,6 +156,19 @@ function readRunFromDb(homeDir, runID) {
   }
 }
 
+// Each numbered scenario is an independent control-plane probe. Keep the
+// Issue #3 throttle fixture from contaminating the following maxRounds case.
+// Only the governor telemetry key is removed; OpenCode/runtime state stays real.
+function clearResourceLedger(homeDir) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  const db = new DatabaseSync(dbPath);
+  try {
+    const suffixes = [":resource/usage-ledger/v1", ":resource/throttle-retry/v1"];
+    const stmt = db.prepare("DELETE FROM kv WHERE key = ? OR substr(key, -length(?)) = ?");
+    return suffixes.reduce((count, suffix) => count + Number(stmt.run(suffix.slice(1), suffix, suffix).changes ?? 0), 0);
+  } finally { db.close(); }
+}
+
 function injectStaleEvidenceRound(homeDir, runID, expectedRound, staleRound) {
   const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
   const target = `:orchestration/run/${runID}`;
@@ -1395,6 +1408,7 @@ async function main() {
   {
     const id = 13;
     log(`[${id}/17] Executando Cenário 13: provider / global throttle (HTTP 429 no chat completions do worker)...`);
+    clearResourceLedger(homeDir);
     activeWorkerCompletionsBehavior = "rate-limit";
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async () => ({ model: "jev-1.13-free", answers: stdAnswers() });
@@ -1448,6 +1462,7 @@ async function main() {
   {
     const id = 14;
     log(`[${id}/17] Executando Cenário 14: maxRounds exhaustion...`);
+    clearResourceLedger(homeDir);
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async () => {
       return {

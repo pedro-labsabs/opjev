@@ -312,6 +312,21 @@ function readPluginKv(homeDir) {
   }
 }
 
+// A new E2E phase is an independent control-plane scenario. Reset only the
+// Issue #3 bounded telemetry ring so earlier phases cannot spend its budget.
+function clearResourceLedger(homeDir) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  if (!fs.existsSync(dbPath)) return 0;
+  const require = createRequire(import.meta.url);
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    const suffixes = [":resource/usage-ledger/v1", ":resource/throttle-retry/v1"];
+    const stmt = db.prepare("DELETE FROM kv WHERE key = ? OR substr(key, -length(?)) = ?");
+    return suffixes.reduce((count, suffix) => count + Number(stmt.run(suffix.slice(1), suffix, suffix).changes ?? 0), 0);
+  } finally { db.close(); }
+}
+
 // ==================================================================== E2E
 async function main() {
   if (!fs.existsSync(BIN)) {
@@ -821,6 +836,7 @@ async function main() {
   // prompt -> novo run permitido. Evidencia crua do storage do plugin.
   const fu = { sid: null, runA: null, runF: null, sid2: null, runB: null };
   try {
+    clearResourceLedger(homeDir);
     const FU_MSG = "msg_e2efollowup0001";
     const mark = gwEvents.length;
     const mk = await api("POST", "/api/session", {});
