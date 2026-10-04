@@ -7,9 +7,8 @@
 //          -> JEV(julga) -> SCHEDULER(accept|repair-same|fresh-same|
 //     switch-model|switch-agent|replan|human|stop).
 //
-// Este slice (Orchestration Kernel v1) NAO esta conectado ao runtime ativo:
-// nada aqui executa efeitos; efeitos sao declarados como OrchestrationCommand
-// e serao executados pelo dispatcher do proximo slice.
+// O kernel segue puro: nao executa efeitos. OrchestrationCommand e interpretado
+// pelo dispatcher runtime em src/orchestration/dispatcher.ts.
 
 export class OrchestrationError extends Error {
   readonly code: string;
@@ -459,11 +458,11 @@ export type OrchestrationEvent =
   | { type: "COMMAND_FAILED"; command?: OrchestrationCommand["type"]; error?: string };
 
 /**
- * Intencoes declarativas para o futuro dispatcher. A state machine decide
+ * Intencoes declarativas para o dispatcher. A state machine decide
  * QUAL operacao precisa acontecer; o dispatcher decide COMO executa-la no
  * OpenCode (ctx.session.*, agentes, catalogo). O kernel nunca executa efeitos.
  * switch-model/switch-agent NAO escolhem destino: apenas emitem select-model /
- * select-agent (proximo slice consulta o Jev com candidatos validos).
+ * select-agent (o dispatcher consulta o Jev com candidatos validos).
  */
 export type OrchestrationCommand =
   | { type: "dispatch"; mode: "initial" | "replan" | "human-resume" }

@@ -71,6 +71,7 @@ export interface WorkerSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 /**
@@ -97,6 +98,7 @@ export interface OrchestratorSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 /**
@@ -124,6 +126,7 @@ export interface CriticSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 export interface ExecutorSelection {
@@ -211,6 +214,8 @@ export interface DispatcherDeps {
     at: number;
   }): Promise<void>;
   now?(): number;
+  /** Optional factual telemetry seam. Errors are isolated from kernel execution. */
+  observeResource?(observation: Record<string, unknown>): Promise<void> | void;
   /**
    * Consumo de follow-ups (#13): seam opcional injetado pelo adapter. Chamado
    * pelo scheduler no boundary de montagem do prompt de CADA rodada; suporta
@@ -220,6 +225,57 @@ export interface DispatcherDeps {
     | FollowupTakeSeam
     | ((runID: string, round: number) => Promise<PendingFollowup[]>);
   storage?: FollowupStorage;
+}
+
+async function observeResource(deps: DispatcherDeps, observation: Record<string, unknown>): Promise<void> {
+  try {
+    const pending = deps.observeResource?.(observation);
+    if (pending && typeof (pending as Promise<void>).then === "function") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pending,
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, 50); }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+    }
+  } catch { /* observational subsystem fails open */ }
+}
+
+function resourceErrorObservation(error: unknown, at: number, identity: Record<string, unknown>): Record<string, unknown> {
+  const e = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const rawCode = typeof e.code === "string" ? e.code : typeof e.name === "string" ? e.name : "";
+  const code = /freeusagelimit/i.test(rawCode) ? "FreeUsageLimitError" : "";
+  const response = e.response && typeof e.response === "object" ? e.response as Record<string, unknown> : {};
+  const status = Number(e.status ?? e.statusCode ?? response.status);
+  const structuredCode = `${rawCode} ${typeof e.type === "string" ? e.type : ""}`;
+  if (/freeusagelimit|quota.?limit|usage.?limit/i.test(structuredCode)) return { ...identity, at, kind: "quota-limit", errorCode: code || "quota-limit", failureDomain: "quota" };
+  if ([429, 529].includes(status) || /rate.?limit|too many requests|throttl|overload/i.test(structuredCode)) {
+    return { ...identity, at, kind: "throttle", ...(Number.isFinite(status) ? { statusCode: status } : {}), signal: "throttle", failureDomain: "provider" };
+  }
+  if (/context.?overflow|context.?length|max.?tokens/i.test(structuredCode)) return { ...identity, at, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" };
+  // Attribute provider failure only when the thrown value carries structured
+  // HTTP/provider provenance. A plain Error may come from local orchestration,
+  // persistence, follow-up bookkeeping, or an ambiguous integration seam.
+  const explicitHttp = Number.isInteger(status) && status >= 400 && status <= 599 &&
+    (typeof e.type === "string" && /http.?error|provider.?error/i.test(e.type) || response.status !== undefined);
+  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: "provider-error", failureDomain: "provider" };
+  return { ...identity, at, kind: "operational-failure", errorCode: "operational-failure", failureDomain: "operational" };
+}
+
+function observedTokenCounts(usage: unknown): Record<string, number> | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  const aliases: Record<string, string[]> = {
+    input: ["input", "inputTokens", "input_tokens"], output: ["output", "outputTokens", "output_tokens"],
+    reasoning: ["reasoning", "reasoningTokens", "reasoning_tokens"], cacheRead: ["cacheRead", "cacheReadTokens", "cache_read_input_tokens"],
+    cacheWrite: ["cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens"],
+  };
+  for (const [target, names] of Object.entries(aliases)) {
+    for (const name of names) if (Number.isFinite(u[name]) && Number(u[name]) >= 0) { out[target] = Number(u[name]); break; }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 async function resolveFrontier(deps: DispatcherDeps, runID: string): Promise<InputFrontier> {
@@ -758,6 +814,13 @@ async function executeSchedule(
         // recoverySessionID (reuso); demais, sessao nova.
         executor: { agent: roundAgent, model: roundModel, sessionID: workerSessionID },
       }).state;
+      await observeResource(deps, { at: now(), kind: "round", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      if (mode === "repair-same" || mode === "fresh-same" || mode === "human-resume") {
+        await observeResource(deps, { at: now(), kind: "recovery", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      }
+      if (mode === "switch-model" || mode === "switch-agent" || mode === "replan") {
+        await observeResource(deps, { at: now(), kind: "escalation", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      }
       // worker-created apos STARTED (phase running): o store nunca mostra
       // ready quando a rodada ja comecou a executar (RESUME4/RESUME6).
       await persist(deps, { kind: "worker-created", runID: contract.runID, workerSessionID, state, at: now() });
@@ -817,6 +880,7 @@ async function executeSchedule(
       }
       let promptDelivered = false;
       try {
+        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
         await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
         promptDelivered = true;
         if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
@@ -850,6 +914,7 @@ async function executeSchedule(
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
+      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
       // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed.
       // Persiste run-failed: storage nunca fica em ready quando a API falha.
       let interrupted = false;
@@ -881,6 +946,8 @@ async function executeSchedule(
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
     const agent = view.agent?.trim() || roundAgent;
     const model = view.model?.trim() || roundModel;
+    const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
+    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
 
     // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
     // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
@@ -967,6 +1034,7 @@ async function executeSchedule(
         resultSummary: baseEvidence.resultSummary,
         deterministicChecks: baseEvidence.deterministicChecks,
       });
+      await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round });
       await deps.critic.prompt({
         sessionID: criticSessionID,
         text: criticPrompt,
@@ -979,6 +1047,8 @@ async function executeSchedule(
         { code: "critic-timeout", label: "critic" },
       );
       const cView = await deps.critic.get({ sessionID: createdSessionID });
+      const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
+      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
       const ownOutcome = cView.outcome;
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
@@ -1016,6 +1086,7 @@ async function executeSchedule(
         }
       }
     } catch (err) {
+      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round }));
       criticProj = {
         sessionID: criticSessionID ?? "",
         agent,
@@ -1498,6 +1569,7 @@ async function executeSchedule(
           maxRounds: out.state.contract.maxRounds,
         });
         const orchMeta = { "jev-router": "orchestration-internal", "jev-role": "orchestrator", "jev-round": out.state.round };
+        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: orchestratorSessionID, model: orchModel, agent: orchAgent, role: "orchestrator", round: out.state.round });
         await deps.orchestrator.prompt({ sessionID: orchestratorSessionID, text: replanPrompt, metadata: orchMeta });
         await withTimeout(
           () => deps.orchestrator.wait({ sessionID: orchestratorSessionID }),
@@ -1510,6 +1582,8 @@ async function executeSchedule(
         // outcome); succeeded segue. get() nao vira autoridade de mais nada:
         // nao troca agent/model/executor, nao aprova, nao corrige output.
         const orchView = await deps.orchestrator.get({ sessionID: orchestratorSessionID });
+        const orchestratorTokens = observedTokenCounts(orchView?.usage ?? orchView?.metadata?.usage ?? orchView?.metadata?.tokens);
+        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
         const orchOutcome = orchView?.outcome;
         if (orchOutcome === "failed" || orchOutcome === "interrupted") {
           throw new OrchestrationError(

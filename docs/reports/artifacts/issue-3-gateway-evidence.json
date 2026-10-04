@@ -1,0 +1,295 @@
+{
+  "schemaVersion": 1,
+  "provenance": {
+    "sourceSha": "7191e11a69098bf712ca89a677604017e2899901",
+    "openCodeRuntimeVersion": "v2.0.11",
+    "executedAt": "2026-10-04T04:27:45.808Z",
+    "runner": "scripts/e2e-gateway.mjs"
+  },
+  "summary": {
+    "total": 55,
+    "passed": 55,
+    "failed": 0,
+    "partial": 0,
+    "admitted": 13,
+    "rpcDispatched": 8,
+    "patchInbox": 0
+  },
+  "checks": [
+    {
+      "name": "upstream e v2.0.11 (runtime autoritativo)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "RPC opjev.admission.v1 registrada no plugin (pre-flight differential)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "proxy transparente: /api/info via gateway = 2.0.11",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "normal: prompt 200 com identidade msg_",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "normal: exatamente 1 interceptacao/forward (transparente)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "normal: execucao NATIVA acontece (OpenCode segue funcionando)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "normal (negative control): transcript sem assistant e rejeitado pela verificação",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "normal: resposta do assistant realmente presente no transcript",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: 200 com identidade duravel",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: admission registrada (intercept=1, admitted=1)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: EXATAMENTE 1 dispatch de RPC (run=1)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: input preservado no inbox (persist-first)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: resultado PUBLICADO (notice synthetic) sem wake",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: parent=0 (ZERO execucao na sessao parent)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "orchestrate: run executou trabalho real (worker/critic >=1)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duplicata: ambas as submissoes 200 (contrato nativo)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duplicata: identidade msg_ compartilhada (mesmo item nativo)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duplicata CONCORRENTE: mesmo runID + EXATAMENTE 1 dispatch (run=1)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "replay tardio: 200 + NENHUM dispatch novo (idempotente)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duplicata: parent=0 na sessao",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duas sessoes: ambas 200",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duas sessoes: locks/records isolados — 2 dispatch com runIDs DISTINTOS",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "duas sessoes: parent=0 em AMBAS",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: turno inicial 200 com identidade",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: run R despachado exatamente 1x",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: F admitido 200 com o mesmo messageID",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: F associado ao run ATIVO R (evento carrega o dono)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: ZERO segundo run (rpc-dispatched continua 1)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: parent=0 na sessao",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: sessao 2 turno 200",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: S1 != S2 — cada F associado ao run da PROPRIA sessao",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: replay(F) => 200 + nenhum attach/dispatch adicional",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: 1 record duravel por F com provenance completa, state === consumed e consumedBoundary (storage real)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: isolamento no storage (record de S2 pertence a S2/R2 e consumido)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: texto e messageID de F entregues no INPUT REAL da worker exatamente 1x (OpenCode v2.0.11)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "follow-up: run terminal + nova mensagem => NOVO run (admission normal)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "route: prompt 200",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "route: decisao tomada com o router REAL (apply ou fallback documentado)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "route: exatamente 1 forward -> execucao nativa",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "interna: prompt com marcador 200 (nativo preservado)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "interna: bypass sem admissao nem dispatch (zero recursao)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "interna: bypass executa via caminho nativo (sem orchestration)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "fase TUI: driver concluiu todos os passos",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: prompt normal do TUI interceptado (cliente real atras do gateway)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: ORCH do TUI -> admission + EXATAMENTE 1 dispatch",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: mesma sessao no normal e no orchestrate",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI orchestrate: parent=0 (janela admission->ping limpa, exatamente o ping no final)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: tuiRunID deterministico observado",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: notice daquele run contem o tuiRunID",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "wire: ZERO PATCH de inbox (nenhum wake em nenhuma fase)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "wire: chamadas de orchestrate no sniffer == chamadas de orchestrate do gateway (dispatched + attached + dup)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "wire: admissao persist-first com resume:false observada",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "instalação: plugin server carregado do path documentado (./plugins/opencode-jev-free-router)",
+      "pass": true,
+      "required": true
+    },
+    {
+      "name": "log do gateway: NENHUMA senha/credential vazada",
+      "pass": true,
+      "required": true
+    }
+  ]
+}
