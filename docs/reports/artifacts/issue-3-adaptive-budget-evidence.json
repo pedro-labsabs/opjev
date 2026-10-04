@@ -2,7 +2,8 @@
   "schemaVersion": 1,
   "scope": "Issue #3 adaptive/hard-budget policy slice",
   "baseSha": "c5e4bed9b30b54ca1b378624bf339c229be87e38",
-  "validatedHeadSha": "0e708d091753e3afbaf8d408186dfaa5c18dc6cd",
+  "validatedHeadSha": "2f3fdfd11af271a7fb937853f2deaf3a26f8de9a",
+  "validationProvenance": "The fresh gateway diagnostic ran against runtime source HEAD 2f3fdfd11af271a7fb937853f2deaf3a26f8de9a. The other listed gates were last executed on 0e708d091753e3afbaf8d408186dfaa5c18dc6cd, whose runtime source is unchanged in 2f3fdfd (the intervening commit only updated evidence). No code or harness change was retained.",
   "branch": "feat/issue-3-adaptive-budget-policy",
   "executedAt": "2026-10-04",
   "runtime": {
@@ -26,7 +27,19 @@
         "follow-up message delivered exactly once to real worker input"
       ],
       "observedBoundary": "resource-budget:rate-high stopped worker spending; admitted follow-ups were not consumed",
-      "tuiHarness": "PASS; pre-submit canary baseline avoids a lost-notice race"
+      "tuiHarness": "PASS; pre-submit canary baseline avoids a lost-notice race",
+      "diagnosticRun": "/tmp/opjev-e2e/runs/2026-10-04T12-40-52-029Z/",
+      "diagnosticTimeline": "resource-pressure-timeline.jsonl (bounded whitelisted ledger facts; no prompt, output, or provider error text)",
+      "pressureCause": "REAL_PROVIDER_THROTTLE",
+      "pressureTimeline": {
+        "beforeNormal": { "at": "2026-10-04T12:40:52Z", "observations": 0 },
+        "beforeOrchestrate": { "at": "2026-10-04T12:40:57Z", "observations": 2, "throttle429": 1, "retry": 1, "source": "normal scenario session" },
+        "afterOrchestrate": { "at": "2026-10-04T12:41:09Z", "observations": 12, "throttle429": 5, "retry": 2, "source": "includes repeated 429s from orchestrate execution sessions" },
+        "beforeFollowUpReset": { "observations": 12 },
+        "immediatelyAfterFollowUpReset": { "observations": 0 },
+        "afterFollowUpSessions": { "observations": 18, "throttle429": 6, "retry": 2, "source": "new 429s from follow-up worker/critic sessions after clean reset" }
+      },
+      "diagnosis": "Cross-phase pressure existed before ORCHESTRATE (one actual 429 from NORMAL), but ORCHESTRATE also produced repeated 429s. FOLLOW-UP began with an empty ledger after reset and then produced six actual 429 observations itself. The four failures therefore reproduce under provider pressure within the tested scenarios, not solely from inherited telemetry. No harness or production policy change was made."
     },
     "multiroundReal": {
       "status": "PASS",
@@ -43,10 +56,10 @@
     "diffCheck": { "status": "PASS", "command": "git diff --check" }
   },
   "limitations": [
-    "The gateway E2E gate failed; this PR is not ready. The real provider path raised rate-high and correctly blocked additional spend, preventing its follow-up-consumption assertions.",
+    "The gateway E2E gate remains BLOCKED at 51/55 under real provider 429 pressure. Follow-up starts with an empty Issue #3 ledger, then its own worker/critic sessions generate six 429 observations; the governor correctly blocks further spend. Do not report PASS or merge.",
     "Provider reset times and remaining quota are not available; the policy uses a local 15 minute observation window.",
     "The keyed throttle reservation lock is process-local and does not provide cross-process atomicity."
   ],
-  "testIsolation": "The real E2E harness clears only Issue #3 telemetry and the fixed throttle counter between independent scenarios; runtime storage and sessions remain real.",
+  "testIsolation": "The real E2E harness clears only Issue #3 telemetry and the fixed throttle counter between independent scenarios; the diagnostic run proved the follow-up ledger was empty immediately after reset. Runtime storage and sessions remain real.",
   "secretsIncluded": false
 }
