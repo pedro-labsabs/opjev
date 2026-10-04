@@ -1363,7 +1363,7 @@ async function main() {
       const idleBefore = before.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
       before.close();
       const marker = { "jev-role": role, "jev-router": "orchestration-internal" };
-      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: { text: `Internal ${role} recursion guard E2E probe`, metadata: marker, delivery: "steer", resume: true } });
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: `Internal ${role} recursion guard E2E probe`, metadata: marker });
       let promptComplete = false;
       if (promptResult.status >= 200 && promptResult.status < 300) {
         try {
