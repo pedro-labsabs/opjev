@@ -1348,7 +1348,7 @@ async function main() {
       const sDb = new DatabaseSync(databasePath);
       sDb.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(JSON.stringify({ "jev-role": role, "jev-router": "orchestration-internal" }), promptSessionID);
       sDb.close();
-      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { prompt: [{ type: "text", text: `Internal ${role} recursion guard E2E probe` }] });
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { prompt: { text: `Internal ${role} recursion guard E2E probe` }, delivery: "steer", resume: true });
       let promptComplete = false;
       if (promptResult.status >= 200 && promptResult.status < 300) {
         try {
