@@ -242,6 +242,7 @@ async function main() {
   let customJevHandler = null;
   let activeWorkerCompletionsBehavior = "normal"; // "normal" | "fail" | "rate-limit" | "timeout"
   let activeCriticCompletionsBehavior = "normal"; // "normal" | "fail" | "finding"
+  let activeResumeToolRequests = null;
 
   const jevProxyServer = http.createServer(async (req, res) => {
     const chunks = [];
@@ -280,6 +281,37 @@ async function main() {
             }, 75000);
             req.on("close", () => clearTimeout(timer));
             return;
+          }
+        }
+
+        let forcedResumeToolCall = null;
+        if (activeResumeToolRequests) {
+          const token = [...activeResumeToolRequests.pending.keys()].find((candidate) => rawBody.includes(candidate));
+          if (token) {
+            const request = activeResumeToolRequests;
+            const input = request.pending.get(token);
+            request.pending.delete(token);
+            const definitions = (Array.isArray(body.tools) ? body.tools : []).map((item) => item?.function ?? item).filter(Boolean);
+            const codeMode = definitions.find((item) => item.name === "execute");
+            const directResume = definitions.find((item) => /orchestrate_resume/.test(String(item.name ?? "")));
+            if (codeMode) {
+              const properties = codeMode.parameters?.properties ?? {};
+              const codeKey = Object.hasOwn(properties, "code") ? "code" : Object.keys(properties)[0];
+              if (codeKey) {
+                forcedResumeToolCall = {
+                  name: codeMode.name,
+                  arguments: { [codeKey]: `return await tools.jev.orchestrate_resume(${JSON.stringify(input)});` },
+                };
+              }
+            } else if (directResume) {
+              forcedResumeToolCall = { name: directResume.name, arguments: input };
+            }
+            request.toolNames.push(...definitions.map((item) => String(item.name ?? "unknown")));
+            request.arrived += 1;
+            if (request.arrived >= request.expected) request.releaseBarrier();
+            if (!forcedResumeToolCall) request.unsupported = true;
+            await Promise.race([request.barrier, sleep(10000)]);
+            if (request.arrived < request.expected) request.unsupported = true;
           }
         }
 
@@ -323,12 +355,19 @@ async function main() {
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
           });
-          const c1 = JSON.stringify({
-            id: "chatcmpl-" + Date.now(),
+          const completionID = "chatcmpl-" + Date.now();
+          const c1 = JSON.stringify(forcedResumeToolCall ? {
+            id: completionID,
+            choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: forcedResumeToolCall.name, arguments: "" } }] }, finish_reason: null }],
+          } : {
+            id: completionID,
             choices: [{ delta: { role: "assistant", content: replyText }, finish_reason: null }],
           });
-          const c2 = JSON.stringify({
-            id: "chatcmpl-" + Date.now(),
+          const c2 = JSON.stringify(forcedResumeToolCall ? {
+            id: completionID,
+            choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: JSON.stringify(forcedResumeToolCall.arguments) } }] }, finish_reason: "tool_calls" }],
+          } : {
+            id: completionID,
             choices: [{ delta: {}, finish_reason: "stop" }],
           });
           res.write(`data: ${c1}\n\n`);
@@ -340,7 +379,9 @@ async function main() {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           id: "chatcmpl-" + Date.now(),
-          choices: [{ message: { role: "assistant", content: replyText }, finish_reason: "stop" }],
+          choices: [{ message: forcedResumeToolCall
+            ? { role: "assistant", tool_calls: [{ id: `call_${Date.now()}`, type: "function", function: { name: forcedResumeToolCall.name, arguments: JSON.stringify(forcedResumeToolCall.arguments) } }] }
+            : { role: "assistant", content: replyText }, finish_reason: forcedResumeToolCall ? "tool_calls" : "stop" }],
         }));
         return;
       }
@@ -433,6 +474,7 @@ async function main() {
     OPENCODE_CONFIG_DIR: path.join(homeDir, ".config", "opencode"),
     OPENCODE_DATA_DIR: path.join(homeDir, ".local", "share", "opencode"),
     OPJEV_JEV_ENDPOINT: `http://127.0.0.1:${jevProxyPort}/v1/systemone`,
+    OPJEV_E2E_RESUME_LOCK_DIAGNOSTICS: "1",
     OPENCODE_API_KEY: API_KEY,
   };
 
@@ -1012,7 +1054,7 @@ async function main() {
   // --- Cenário 8: human + resume ---
   {
     const id = 8;
-    log(`[${id}/17] Executando Cenário 8: pausa human; resume real bloqueado pela API pública do host...`);
+    log(`[${id}/17] Executando Cenário 8: pausa human; duas chamadas tool Code Mode em sessões OpenCode reais...`);
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async () => ({ model: "jev-1.13-free", answers: stdAnswers({
       done: { type: "noul", noul: 0 },
@@ -1030,16 +1072,68 @@ async function main() {
       const r = readRunFromDb(homeDir, runID);
       return r?.state?.phase === "awaiting-human" ? r : null;
     }, 45000, "Cenário 8 pausa em awaiting-human");
-    const pass = false; // sem tool execution público, não invocamos execute() internamente.
-    results.push({ id, name: SCENARIO_DEFS[7].name, pass, phase: runState.state.phase, round: runState.state.round, runID, blocker: "tool execution pela sessão real não disponível na API pública identificada" });
+
+    const decision = { requestID: runState.state.pendingHuman?.requestID, action: "resume", newMaxRounds: 2 };
+    let releaseBarrier;
+    const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+    const callers = await Promise.all([createRealSession(), createRealSession()]);
+    const callerTokens = callers.map((callerID, index) => `C8_REAL_RESUME_${index}_${callerID}`);
+    activeResumeToolRequests = {
+      expected: 2,
+      arrived: 0,
+      pending: new Map(callerTokens.map((token) => [token, { runID, decision }])),
+      barrier,
+      releaseBarrier,
+      toolNames: [],
+      unsupported: false,
+    };
+    const promptResults = await Promise.all(callers.map((callerID, index) => api(
+      "POST",
+      `/api/session/${callerID}/prompt`,
+      { text: `${callerTokens[index]} Use the Code Mode execute tool to call tools.jev.orchestrate_resume with this exact input: ${JSON.stringify({ runID, decision })}. Do not call any other tool.` },
+    )));
+    let resumed = null;
+    try {
+      resumed = await waitFor(() => {
+        const current = readRunFromDb(homeDir, runID);
+        return current?.state?.phase === "completed" && current.state.round === 2 ? current : null;
+      }, 60000, "Cenário 8 conclusão após duas tool calls reais");
+    } catch { resumed = readRunFromDb(homeDir, runID); }
+    const finalRunState = resumed ?? readRunFromDb(homeDir, runID) ?? runState;
+    const runSessions = getSessionsForRun(homeDir, runID);
+    const workerSessions = runSessions.filter((session) => session.role === "worker");
+    const criticSessions = runSessions.filter((session) => session.role === "critic");
+    const callerOutputs = callers.map((callerID) => {
+      const db = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
+      const rows = db.prepare("SELECT data FROM session_message WHERE session_id = ?").all(callerID);
+      db.close();
+      return { callerID, transcript: rows.map((row) => String(row.data)) };
+    });
+    const loserCount = callerOutputs.filter((caller) => caller.transcript.some((output) => output.includes("invalid-resumable-run"))).length;
+    const humanDecisionCount = finalRunState.state.history.filter((entry) => Boolean(entry.humanDecision)).length;
+    const exactlyOneWorkerAndCritic = workerSessions.length === 2 && criticSessions.length === 2;
+    const noExtraRound = finalRunState.state.round === 2 && workerSessions.length === 2 && criticSessions.length === 2;
+    const promptAdmissionsPassed = promptResults.every((result) => result.status === 200);
+    const realToolCallsObserved = activeResumeToolRequests.arrived === 2 && !activeResumeToolRequests.unsupported;
+    const pass = promptAdmissionsPassed && realToolCallsObserved &&
+      finalRunState.state.phase === "completed" && finalRunState.state.round === 2 &&
+      loserCount === 1 && humanDecisionCount === 1 && exactlyOneWorkerAndCritic && noExtraRound;
+    const lockTelemetry = up.lines.filter((line) => line.includes("[opjev-e2e] resume-lock-release=")).at(-1);
+    const lockCountZero = lockTelemetry?.endsWith("=0") ?? false;
+    results.push({ id, name: SCENARIO_DEFS[7].name, pass: pass && lockCountZero, phase: finalRunState.state.phase, round: finalRunState.state.round, runID, toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount, workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing" });
     evidenceRecords.push({
       scenarioId: id, scenarioName: SCENARIO_DEFS[7].name, tier: SCENARIO_DEFS[7].tier,
-      runID, round: runState.state.round, workerSessionID: runState.workerSessionID,
-      criticSessionID: runState.criticSessionID, executor: runState.state.executor,
-      verdict: "BLOCKER: host real tool execution seam not established", command: "none",
-      finalPhase: runState.state.phase,
+      runID, round: finalRunState.state.round, workerSessionID: workerSessions[1]?.id ?? runState.workerSessionID,
+      criticSessionID: criticSessions[1]?.id ?? runState.criticSessionID, executor: finalRunState.state.executor,
+      callerSessionIDs: callers, toolNamesObserved: activeResumeToolRequests.toolNames,
+      toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount,
+      workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing",
+      verdict: pass && lockCountZero ? "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser" : "BLOCKED/FAIL: real tool invocation or exactly-once assertions missing",
+      command: "real OpenCode session prompt -> Code Mode execute -> tools.jev.orchestrate_resume",
+      finalPhase: finalRunState.state.phase,
     });
-    log(`  -> Cenário 8: BLOCKER (run real ${runID} permanece ${runState.state.phase}; sem invocação simulada)`);
+    log(`  -> Cenário 8: ${pass && lockCountZero ? "PASS" : "BLOCKER/FAIL"} (calls=${activeResumeToolRequests.arrived}, losers=${loserCount}, decisions=${humanDecisionCount}, workers=${workerSessions.length}, critics=${criticSessions.length}, lockZero=${lockCountZero})`);
+    activeResumeToolRequests = null;
   }
 
   // --- Cenário 9: stop (terminação imediata em stopped) ---
@@ -1363,7 +1457,20 @@ async function main() {
       const idleBefore = before.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
       before.close();
       const marker = { "jev-role": role, "jev-router": "orchestration-internal" };
-      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: `Internal ${role} recursion guard E2E probe`, metadata: marker });
+      const callerGuardToken = role === "worker" ? `C15_INTERNAL_RESUME_${promptSessionID}` : undefined;
+      if (callerGuardToken) {
+        let releaseBarrier;
+        const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+        activeResumeToolRequests = {
+          expected: 1, arrived: 0,
+          pending: new Map([[callerGuardToken, { runID: "missing-internal-caller-probe", decision: { requestID: "invalid-probe", action: "resume" } }]]),
+          barrier, releaseBarrier, toolNames: [], unsupported: false,
+        };
+      }
+      const promptText = callerGuardToken
+        ? `Internal worker guard probe ${callerGuardToken}. Use Code Mode execute to attempt tools.jev.orchestrate_resume with the associated input.`
+        : `Internal ${role} recursion guard E2E probe`;
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: promptText, metadata: marker });
       let promptComplete = false;
       if (promptResult.status >= 200 && promptResult.status < 300) {
         try {
@@ -1376,7 +1483,12 @@ async function main() {
           }, 30000, `Cenário 15 prompt ${role} processado`));
         } catch { promptComplete = false; }
       }
-      promptProofs.push({ role, sessionID: promptSessionID, sourceRunID: internalSession.runID, status: promptResult.status, ...(promptResult.status >= 400 ? { errorTag: promptResult.data?._tag, error: promptResult.data?.message } : {}), processed: Boolean(promptComplete), markerSent: true, baselineAssistantMessages: assistantBefore, baselineIdleEvents: idleBefore });
+      const messagesDb = new DatabaseSync(databasePath, { readOnly: true });
+      const promptMessages = messagesDb.prepare("SELECT data FROM session_message WHERE session_id = ?").all(promptSessionID).map((row) => String(row.data));
+      messagesDb.close();
+      const callerGuardObserved = Boolean(callerGuardToken) && activeResumeToolRequests?.arrived === 1 && !activeResumeToolRequests.unsupported && promptMessages.some((data) => data.includes("chamada interna de orchestration"));
+      promptProofs.push({ role, sessionID: promptSessionID, sourceRunID: internalSession.runID, status: promptResult.status, ...(promptResult.status >= 400 ? { errorTag: promptResult.data?._tag, error: promptResult.data?.message } : {}), processed: Boolean(promptComplete), markerSent: true, ...(callerGuardToken ? { callerGuardToolCallObserved: callerGuardObserved, toolNamesObserved: activeResumeToolRequests?.toolNames ?? [] } : {}), baselineAssistantMessages: assistantBefore, baselineIdleEvents: idleBefore });
+      if (callerGuardToken) activeResumeToolRequests = null;
     }
     const sid = internalSessions.find((candidate) => candidate.role === "worker").id;
     const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", { input: { sessionID: sid, messageID: "msg_internal_recurse", objective: "Internal recurse attempt" } });
@@ -1386,11 +1498,12 @@ async function main() {
     const noNewRuns = afterRuns === beforeRuns;
     const noNewDispatches = afterDispatches === beforeDispatches;
     const promptPass = promptProofs.length === 3 && promptProofs.every((p) => p.status >= 200 && p.status < 300 && p.processed && p.markerSent);
-    const pass = false; // o caller guard de resume ainda não foi acionado pela tool real do host.
+    const callerGuardPass = promptProofs.find((p) => p.role === "worker")?.callerGuardToolCallObserved === true;
+    const pass = promptPass && admissionPass && noNewRuns && noNewDispatches && callerGuardPass;
     const runID = `auto-${sid}-msg_internal_recurse`;
     results.push({ id, name: SCENARIO_DEFS[14].name, pass, phase: "internal-bypass", round: 0, runID, admissionPass, promptPass, noNewRuns, noNewDispatches, blocker: "resume caller guard not invoked through real host tool execution" });
-    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[14].name, tier: SCENARIO_DEFS[14].tier, runID, round: 0, workerSessionID: sid, criticSessionID: "none", executor: { agent: "none", model: "none" }, promptProofs, admissionPass, baselineRunCount: beforeRuns, finalRunCount: afterRuns, noNewRuns, baselineDispatchCount: beforeDispatches, finalDispatchCount: afterDispatches, noNewDispatches, verdict: "BLOCKER: prompt and admission surfaces observed; real resume caller-guard tool call remains unavailable", command: "none", finalPhase: "internal-bypass" });
-    log(`  -> Cenário 15: BLOCKER (admission=${admissionPass}, prompts=${promptPass}, runs stable=${noNewRuns}, dispatches stable=${noNewDispatches}; caller guard host-tool invocation pendente)`);
+    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[14].name, tier: SCENARIO_DEFS[14].tier, runID, round: 0, workerSessionID: sid, criticSessionID: "none", executor: { agent: "none", model: "none" }, promptProofs, admissionPass, baselineRunCount: beforeRuns, finalRunCount: afterRuns, noNewRuns, baselineDispatchCount: beforeDispatches, finalDispatchCount: afterDispatches, noNewDispatches, verdict: pass ? "worker/critic/orchestrator prompt processing blocked recursion; admission and real resume caller guard blocked" : "BLOCKED/FAIL: one or more host recursion surfaces not proven", command: "OpenCode prompt API; worker Code Mode execute -> orchestrate_resume", finalPhase: "internal-bypass" });
+    log(`  -> Cenário 15: ${pass ? "PASS" : "BLOCKER/FAIL"} (admission=${admissionPass}, prompts=${promptPass}, callerGuard=${callerGuardPass}, runs stable=${noNewRuns}, dispatches stable=${noNewDispatches})`);
   }
 
   // --- Cenário 16: agent / model candidate inválido (4 casos no OpenCode real) ---
