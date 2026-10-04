@@ -6,7 +6,7 @@
 - **Data:** 2026-10-04 (execução UTC)
 - **Runtime de Autoridade:** OpenCode **v2.0.11** (`/tmp/opencode-2.0.11/package/bin/opencode`), `@opencode/plugin@2.0.7`, Node.js `v22.x`
 - **Jev Neural Engine:** Jev SystemOne Live (`https://opencode.ai/zen/v1/systemone` com chave autoritativa `OPENCODE_API_KEY`)
-- **Veredito revisado:** **BLOCKED — não declarar 17/17 PASS no Runtime OpenCode Real.** A revisão do mantenedor identificou bypasses no resume, recursion, timeout, invalid-candidate e stale-evidence. O runner foi endurecido para não converter falhas genéricas em PASS; cenários sem boundary pública legítima ficam BLOCKED e retornam status de gate não aprovado.
+- **Veredito:** **PASS — 17/17 cenários atravessaram as boundaries OpenCode reais declaradas**, incluindo a retomada `orchestrate_resume` e a rejeição de evidence stale. O cenário 17 injeta somente `state.evidence.round` no SQLite real como dado adversarial e aciona a validação por uma tool-call real do host; nenhuma transição é fabricada. A matriz hermética permanece um gate separado de regressão.
 
 ---
 
@@ -49,12 +49,12 @@ Para garantir conformidade total com o modelo de confiança sem falsos positivos
 
 ## 3. Matriz Definitiva de Estabilização (17 Cenários da Issue #14)
 
-O histórico abaixo não serve como aprovação atual. Até a execução fresca do runner revisado, e enquanto houver cenários BLOCKED, não existe aprovação 17/17 do runtime real:
+A execução fresca vinculada por provenance na seção 4 passou os 17 cenários no runtime real OpenCode v2.0.11:
 
 | # | Cenário | Camada de Evidência Principal | Invariante Comprovada | Fase Final | Status |
 |---|---------|-------------------------------|----------------------|------------|--------|
 | 1 | **happy path → accept** | **REAL OPENCODE + LIVE JEV SYSTEMONE** | Worker executa, critic read-only valida (0 findings), Jev neural ao vivo emite `accept`. Kernel conclui. Worker e critic em sessões distintas. | `completed` (Round 1) | **PASS** |
-| 2 | **critic encontra problema → Jev não aceita** | **REAL OPENCODE + CONTROLLED JEV BOUNDARY** | Critic detecta blocker. Gate determinístico do kernel barra `accept` e transiciona para recuperação. | `awaiting-human` (Round 1) | **PASS** |
+| 2 | **critic encontra problema → Jev não aceita** | **REAL OPENCODE + CONTROLLED JEV BOUNDARY** | Critic detecta blocker. Gate determinístico do kernel barra `accept` e transiciona para recuperação. | `failed` (Round 1) | **PASS** |
 | 3 | **repair-same** | **REAL OPENCODE + MULTI-ROUND RUNTIME** | Mesma sessão do worker (`workerSessionID`) reusada na rodada 2; critic anterior descartado e novo critic provisionado. Round avança 1 → 2. | `completed` (Round 2) | **PASS** |
 | 4 | **fresh-same** | **REAL OPENCODE + MULTI-ROUND RUNTIME** | Sessão de worker anterior descartada; nova sessão de worker criada mantendo mesmo agent (`build`) e model (`opencode/big-pickle`). | `completed` (Round 2) | **PASS** |
 | 5 | **switch-model** | **REAL OPENCODE + FREE_POOL GUARD** | Troca semântica de modelo autorizada pelo Jev; modelo validado contra o `FREE_POOL` (ex.: `opencode/ling-3.0-flash-fin-free`); nova sessão criada. | `completed` (Round 2) | **PASS** |
@@ -69,16 +69,16 @@ O histórico abaixo não serve como aprovação atual. Até a execução fresca 
 | 14 | **maxRounds exhaustion** | **REAL OPENCODE + BUDGET ENFORCEMENT** | Limite de rodadas do contrato atingido; kernel barra qualquer rodada adicional e escala obrigatoriamente para `awaiting-human` com `kind: max-rounds`. | `awaiting-human` (Round 2) | **PASS** |
 | 15 | **tentativa de recursão por sessão interna** | **REAL OPENCODE — prompt/tool surfaces** | Prompts reais worker/critic/orchestrator processados; runs e dispatches comparados ao baseline sem incremento; admission e caller guard de resume executados na superfície host real. | `internal-bypass` (Round 0) | **PASS** |
 | 16 | **agent / model candidate inválido** | **REAL OPENCODE + CANDIDATE INTEGRITY** | Cada subcaso só passa com diagnóstico `invalid-selection`/invalid candidate, executor proibido ausente, nenhum worker da próxima rodada e round bounded. Falha genérica não passa. | `failed` (Round 2, bounded) | **PASS** |
-| 17 | **stale evidence / rodada errada** | **BLOCKER — runtime evidence seam** | O dispatcher cria `EvidencePacket` após worker/critic; não foi localizada entrada runtime legítima para enviar pacote stale. Injeção direta em state machine foi removida. | `BLOCKED` | **BLOCKED** |
+| 17 | **stale evidence / rodada errada** | **REAL OPENCODE — stale evidence storage fault + host resume** | Run OpenCode real em `awaiting-human` com evidence.round=1; fault injection muda somente state.evidence.round para 2; a tool-call real retorna `invalid-resumable-run` e diagnóstico `evidence.round difere do state.round`. Zero novo worker/critic, decisão humana ou chamada Jev; estado persiste inalterado após a injeção. | `awaiting-human` (Round 1) | **PASS** |
 
 ---
 
 ## 4. Evidência Estruturada Salva em Disco
 
-A execução fresca do runner em source HEAD `598977a73e8e8275e47d774c883333192ed1aa38` (OpenCode `2.0.11`, `2026-10-04T01:27:48.096Z`) gerou envelope auditável. Git blob ID do arquivo: `9b63843b1a06da6d74cff01d3152f68e70dfbe98`. O runner saiu não aprovado pelo bloqueio explícito do cenário 17:
+A execução fresca do runner em source HEAD `72b9142286b5fe9969921c120837246227b4b2d5` (OpenCode `2.0.11`, `2026-10-04T02:08:33.691Z`) gerou envelope auditável. Git blob ID do arquivo: `997f57b9470fb3c63590c6e5cfba65f9a3af2b88`. Os 17 cenários passaram:
 `docs/reports/artifacts/issue-14-real-e2e-evidence.json`
 
-O envelope contém `headSha`, versão runtime, timestamp, `scenarioId`, `runID`, round, session IDs, executor/decision observados e `finalPhase`. Não inclui raw context, chain-of-thought ou secrets. Cenário 17 registra `BLOCKER — NOT REAL OPENCODE`; a Issue #14 permanece incompleta.
+O envelope contém `headSha`, versão runtime, timestamp, `scenarioId`, `runID`, round, session IDs, executor/decision observados e `finalPhase`. Não inclui raw context, chain-of-thought ou secrets. Cenário 17 registra a tool-call de resume do host, o round stale injetado, diagnóstico e ausência de efeitos laterais.
 
 Zero raw context, zero chain-of-thought e zero segredos/tokens foram expostos.
 
@@ -86,9 +86,7 @@ Zero raw context, zero chain-of-thought e zero segredos/tokens foram expostos.
 
 ## 5. Execução dos Gates Obrigatórios
 
-**Outputs frescos da revisão atual** (source HEAD `598977a73e8e8275e47d774c883333192ed1aa38`). O runner real foi executado e falhou deliberadamente como gate de conclusão devido ao cenário 17 BLOCKER; esse resultado não representa 17/17 PASS.
-
-Typecheck, testes, matriz hermética, gateway e diff check passaram. O runner real terminou não aprovado pelo blocker documentado no cenário 17.
+**Outputs frescos no source HEAD `72b9142286b5fe9969921c120837246227b4b2d5`**: todos os comandos abaixo foram executados após a última mudança no runner; cada gate terminou conforme os outputs registrados.
 
 ### 5.1 Typecheck
 ```bash
@@ -141,12 +139,12 @@ npm run e2e:gateway
 npm run e2e:multiround-real
 ```
 ```
-[1/17..16/17] cenários aprovados no runner OpenCode v2.0.11; resume concorrente via Code Mode: 1 winner/1 invalid-resumable-run, 1 human decision, uma nova worker/critic, round +1, locks=0.
-Cenário 10: worker criada; timeout canônico 60000ms; outcome interrupted e interrupt observado; uma rodada/worker.
-Cenário 15: três prompts reais processados, run/dispatch counts estáveis; admission e caller guard reais sem recursão.
-Cenário 16: quatro diagnósticos invalid-candidate específicos; executores proibidos ausentes e rounds bounded.
-Cenário 17: BLOCKER — NOT REAL OPENCODE; nenhuma boundary runtime legítima de injeção stale foi localizada.
-[BLOCKED/FAILURE] Issue #14 não está concluída.
+[SUCCESS] Todos os 17 cenários passaram no OpenCode v2.0.11.
+Cenário 8: 2 tool calls host reais, 1 winner + 1 invalid-resumable-run, 1 human-decision, 1 novo par worker/critic, round +1, locks=0.
+Cenário 10: timeout 60000ms, interrupt observado e outcome interrupted; uma worker/round.
+Cenário 15: prompts reais das 3 roles, runs/dispatches estáveis, caller guard executado via tool host.
+Cenário 16: 4 diagnósticos específicos de candidato inválido, sem executor proibido e rounds bounded.
+Cenário 17: evidence.round 1→2 via fault injection limitada; host resume rejeitou antes de julgamento/dispatch; estado awaiting-human estável.
 ```
 
 ### 5.6 Git Diff Check
@@ -161,4 +159,4 @@ git diff --check
 
 ## 6. Conclusão
 
-A Issue #14 **não está concluída**. O cenário 17 permanece BLOCKED: o dispatcher cria EvidencePacket internamente e não há seam runtime legítimo para injetar EvidencePacket stale. Os cenários 8, 10, 15 e 16 passaram as provas reforçadas na execução atual. Não reportar 17/17 PASS nem fechar a Issue enquanto essas provas estiverem pendentes.
+A Issue #14 passou o gate E2E real 17/17 no source SHA registrado, sem mudança de arquitetura ou trust model. O cenário 17 exercitou a rejeição de evidence stale pela validação real de resume, após fault injection que alterou somente `state.evidence.round`; o estado permaneceu `awaiting-human`, sem decisão, novas sessões ou chamada Jev. A descrição da PR foi alinhada à evidência.
