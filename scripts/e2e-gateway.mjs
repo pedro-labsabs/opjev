@@ -1108,6 +1108,7 @@ async function main() {
     const RPC_RE = '"type":"rpc-dispatched"';
     const normalBaseline = countFileMatches(gwLogPath, NORMAL_RE);
     const rpcBaseline = countFileMatches(gwLogPath, RPC_RE);
+    const tuiNoticeBaseline = countFileMatches(tuiCanaryPath, "ORCH_TUI_NOTICE");
     // Ordem ESTRUTURAL: ORCH primeiro (composer livre — nada executando),
     // ping normal depois. Isso elimina a corrida em que o submit do ORCH se
     // perdia com o composer ocupado pela execucao do ping.
@@ -1135,7 +1136,7 @@ async function main() {
             timeout_ms: 180000,
           },
         },
-        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
+        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", baseline: tuiNoticeBaseline, min_extra: 1, timeout_ms: 330000 } },
         // Prova DETERMINISTA da apresentacao: o driver so segue quando o render
         // real (toast) ja apareceu no dump do PTY. O assert required no fim
         // continua exigindo notice + identidade do run — apenas o harness deixa
