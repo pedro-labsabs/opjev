@@ -290,6 +290,7 @@ async function main() {
           if (token) {
             const request = activeResumeToolRequests;
             const input = request.pending.get(token);
+            request.observedInputs.push(input);
             request.pending.delete(token);
             const definitions = (Array.isArray(body.tools) ? body.tools : []).map((item) => item?.function ?? item).filter(Boolean);
             const codeMode = definitions.find((item) => item.name === "execute");
@@ -1094,6 +1095,7 @@ async function main() {
       expected: 2,
       arrived: 0,
       pending: new Map(callerTokens.map((token) => [token, { runID, decision }])),
+      observedInputs: [],
       barrier,
       releaseBarrier,
       toolNames: [],
@@ -1139,8 +1141,8 @@ async function main() {
     const realToolCallsObserved = activeResumeToolRequests.arrived === 2 && !activeResumeToolRequests.unsupported;
     const sameHumanRequest = runState.state.phase === "awaiting-human" &&
       typeof decision.requestID === "string" && decision.requestID.length > 0 &&
-      callers.length === 2 && activeResumeToolRequests.pending.size === 2 &&
-      [...activeResumeToolRequests.pending.values()].every((request) => request.runID === runID && request.decision.requestID === decision.requestID);
+      callers.length === 2 && activeResumeToolRequests.observedInputs.length === 2 &&
+      activeResumeToolRequests.observedInputs.every((request) => request.runID === runID && request.decision.requestID === decision.requestID);
     const pass = sameHumanRequest && promptAdmissionsPassed && callerPromptsProcessed.every(Boolean) && realToolCallsObserved &&
       finalRunState.state.phase === "completed" && finalRunState.state.round === 2 &&
       loserCount === 1 && humanDecisionCount === 1 && exactlyOneWorkerAndCritic && noExtraRound;
@@ -1152,7 +1154,9 @@ async function main() {
       runID, requestID: decision.requestID, initialPhase: runState.state.phase, initialRound: runState.state.round,
       round: finalRunState.state.round, workerSessionID: workerSessions[1]?.id ?? runState.workerSessionID,
       criticSessionID: criticSessions[1]?.id ?? runState.criticSessionID, executor: finalRunState.state.executor,
-      sameRunAndRequestID: sameHumanRequest, callerSessionIDs: callers, callerPromptsProcessed, toolNamesObserved: activeResumeToolRequests.toolNames,
+      sameRunAndRequestID: sameHumanRequest,
+      observedResumeInputs: activeResumeToolRequests.observedInputs.map((request) => ({ runID: request.runID, requestID: request.decision.requestID })),
+      callerSessionIDs: callers, callerPromptsProcessed, toolNamesObserved: activeResumeToolRequests.toolNames,
       toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount,
       workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing",
       verdict: pass && lockCountZero ? "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser" : "BLOCKED/FAIL: real tool invocation or exactly-once assertions missing",
@@ -1502,7 +1506,7 @@ async function main() {
         activeResumeToolRequests = {
           expected: 1, arrived: 0,
           pending: new Map([[callerGuardToken, { runID: "missing-internal-caller-probe", decision: { requestID: "invalid-probe", action: "resume" } }]]),
-          barrier, releaseBarrier, toolNames: [], unsupported: false,
+          observedInputs: [], barrier, releaseBarrier, toolNames: [], unsupported: false,
         };
       }
       const promptText = callerGuardToken
@@ -1540,7 +1544,7 @@ async function main() {
     const pass = promptPass && admissionPass && noNewRuns && noNewDispatches && callerGuardPass;
     const runID = `auto-${sid}-msg_internal_recurse`;
     results.push({ id, name: SCENARIO_DEFS[14].name, pass, phase: "internal-bypass", round: 0, runID, admissionPass, promptPass, noNewRuns, noNewDispatches, blocker: "resume caller guard not invoked through real host tool execution" });
-    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[14].name, tier: SCENARIO_DEFS[14].tier, runID, round: 0, workerSessionID: sid, criticSessionID: "none", executor: { agent: "none", model: "none" }, promptProofs, admissionPass, baselineRunCount: beforeRuns, finalRunCount: afterRuns, noNewRuns, baselineDispatchCount: beforeDispatches, finalDispatchCount: afterDispatches, noNewDispatches, verdict: pass ? "worker/critic/orchestrator prompt processing blocked recursion; admission and real resume caller guard blocked" : "BLOCKED/FAIL: one or more host recursion surfaces not proven", command: "OpenCode prompt API; worker Code Mode execute -> orchestrate_resume", finalPhase: "internal-bypass" });
+    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[14].name, tier: SCENARIO_DEFS[14].tier, runID, round: 0, workerSessionID: sid, criticSessionID: "none", executor: { agent: "none", model: "none" }, promptProofs, admissionPass, baselineRunCount: beforeRuns, finalRunCount: afterRuns, noNewRuns, baselineDispatchCount: beforeDispatches, finalDispatchCount: afterDispatches, noNewDispatches, verdict: pass ? "PASS: real worker/critic/orchestrator prompts, admission bypass, and resume caller guard produced no new runs or dispatches" : "BLOCKED/FAIL: one or more host recursion surfaces not proven", command: "OpenCode prompt API; worker Code Mode execute -> orchestrate_resume", finalPhase: "internal-bypass" });
     log(`  -> Cenário 15: ${pass ? "PASS" : "BLOCKER/FAIL"} (admission=${admissionPass}, prompts=${promptPass}, callerGuard=${callerGuardPass}, runs stable=${noNewRuns}, dispatches stable=${noNewDispatches})`);
   }
 
