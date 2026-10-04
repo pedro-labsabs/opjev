@@ -159,7 +159,7 @@ function readRunFromDb(homeDir, runID) {
 function getSessionsForRun(homeDir, runID) {
   try {
     const db = getSqliteDb(homeDir);
-    const rows = db.prepare("SELECT id, agent, model, permission, metadata FROM session_v2").all();
+    const rows = db.prepare("SELECT id, agent, model, permission, metadata, idle_outcome FROM session_v2").all();
     db.close();
     const sessions = [];
     for (const r of rows) {
