@@ -66,12 +66,13 @@ export function resolveInternalToolRole(metadata: unknown, sessionID?: string): 
 }
 
 function deny(reason: "session state unavailable" | "role metadata ambiguous" | "local read-only authority"): never {
-  throw new Error(`OPJEV_INTERNAL_TOOL_DENIED: ${reason}`);
+  throw new Tool.Error({ message: `OPJEV_INTERNAL_TOOL_DENIED: ${reason}` });
 }
 
 /**
- * Called by OpenCode's `tool.execute.before` hook. Throwing fails that tool
- * operation; OpenCode 2.0.11 invokes this hook before the selected executor.
+ * Called by OpenCode's `tool.execute.before` hook. Reject with OpenCode's
+ * typed Tool.Error so its Promise adapter can carry the failure through the
+ * Effect hook contract without converting an arbitrary Error into a defect.
  * Unknown internal roles and unreadable session state fail closed.
  */
 export async function enforceInternalToolAuthority(
@@ -93,3 +94,4 @@ export async function enforceInternalToolAuthority(
   const tool = typeof event.tool === "string" ? event.tool : "";
   if (!TOOL_READ_ALLOWLIST.has(tool)) deny("local read-only authority");
 }
+import { Tool } from "@opencode/schema/tool";
