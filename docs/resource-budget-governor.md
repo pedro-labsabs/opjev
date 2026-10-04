@@ -20,10 +20,10 @@ facts but excluded from time-window estimates.
 
 `aggregateUsage` selects a caller-specified time window and sums observed facts.
 Token counters stay absent if no runtime counter was provided. The dispatcher
-currently observes worker and critic prompt boundaries, rounds, recoveries,
-escalations, provider retry-hook failures, retry decisions and exposed worker
-token usage. It does not fabricate fan-out, completed compactions or usage data
-that OpenCode does not expose at those boundaries.
+currently observes worker, critic and orchestrator prompt boundaries, rounds,
+recoveries, escalations, provider retry-hook failures, retry decisions and
+token usage exposed by those sessions. It does not fabricate fan-out, completed
+compactions or usage data that OpenCode does not expose at those boundaries.
 
 `estimateResourcePressure` derives five separate dimensions: quota, rate,
 context, execution and availability. Each contains a level, confidence,

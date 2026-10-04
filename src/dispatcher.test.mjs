@@ -1062,7 +1062,10 @@ function fakeDeps(over = {}) {
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
   it("O0: observations enter at worker/critic runtime boundaries without changing authority", async () => {
-    const t = fakeDeps({ view: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", usage: { input_tokens: 12, output_tokens: 4 } } });
+    const t = fakeDeps({
+      view: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", usage: { input_tokens: 12, output_tokens: 4 } },
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", usage: { output_tokens: 3 } },
+    });
     const observations = [];
     const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
       runtime: t.runtime, critic: t.critic, decisions: t.decisions,
@@ -1074,6 +1077,7 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.deepEqual(observations.filter(x => x.kind === "request").map(x => x.role), ["worker", "critic"]);
     assert.equal(observations.find(x => x.kind === "round").round, 1);
     assert.deepEqual(observations.find(x => x.kind === "token-usage").tokens, { input: 12, output: 4 });
+    assert.equal(observations.some(x => x.kind === "token-usage" && x.role === "critic" && x.tokens.output === 3), true);
     assert.equal(observations.some(x => "prompt" in x || "rawOutput" in x), false);
     assert.equal(result.selection.model, "opencode/big-pickle", "observer does not route");
   });
@@ -3742,13 +3746,16 @@ describe("dispatcher replan runtime (REPLAN1-REPLAN6)", () => {
       workerSessionIDs: ["w1", "w2"],
       criticSessionIDs: ["c1", "c2"],
       orchestratorSessionIDs: ["o1"],
+      orchestratorView: { outcome: "succeeded", agent: "build", model: "opencode/big-pickle", usage: { reasoning_tokens: 6 } },
       viewsByRound: [
         { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
         { agent: "build", model: "opencode/big-pickle", outcome: "succeeded" },
       ],
     });
+    const observations = [];
     const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
       runtime: t.runtime, critic: t.critic, decisions: t.decisions, orchestrator: t.orchestrator,
+      observeResource: event => observations.push(event),
     });
     assert.equal(result.phase, "completed");
     assert.equal(result.round, 2);
@@ -3766,6 +3773,8 @@ describe("dispatcher replan runtime (REPLAN1-REPLAN6)", () => {
     assert.equal(t.orchestratorCalls[0].metadata?.["jev-router"], "orchestration-internal");
     // ORCH6: sessao distinta de ambas as workers
     assert.equal(t.orchestratorPromptCalls[0].sessionID, "o1", "orchestrator em sessao propria");
+    assert.equal(observations.some(x => x.kind === "request" && x.role === "orchestrator" && x.sessionID === "o1"), true);
+    assert.equal(observations.some(x => x.kind === "token-usage" && x.role === "orchestrator" && x.tokens.reasoning === 6), true);
     assert.ok(!["w1", "w2"].includes(t.orchestratorPromptCalls[0].sessionID), "distinta das workers");
     // worker round2 recebeu o revised contract como ativo
     const w2prompts = t.promptCalls.filter((p) => p.sessionID === "w2");

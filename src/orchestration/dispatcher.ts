@@ -98,6 +98,7 @@ export interface OrchestratorSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 /**
@@ -125,6 +126,7 @@ export interface CriticSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 export interface ExecutorSelection {
@@ -1039,6 +1041,8 @@ async function executeSchedule(
         { code: "critic-timeout", label: "critic" },
       );
       const cView = await deps.critic.get({ sessionID: createdSessionID });
+      const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
+      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
       const ownOutcome = cView.outcome;
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
@@ -1559,6 +1563,7 @@ async function executeSchedule(
           maxRounds: out.state.contract.maxRounds,
         });
         const orchMeta = { "jev-router": "orchestration-internal", "jev-role": "orchestrator", "jev-round": out.state.round };
+        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: orchestratorSessionID, model: orchModel, agent: orchAgent, role: "orchestrator", round: out.state.round });
         await deps.orchestrator.prompt({ sessionID: orchestratorSessionID, text: replanPrompt, metadata: orchMeta });
         await withTimeout(
           () => deps.orchestrator.wait({ sessionID: orchestratorSessionID }),
@@ -1571,6 +1576,8 @@ async function executeSchedule(
         // outcome); succeeded segue. get() nao vira autoridade de mais nada:
         // nao troca agent/model/executor, nao aprova, nao corrige output.
         const orchView = await deps.orchestrator.get({ sessionID: orchestratorSessionID });
+        const orchestratorTokens = observedTokenCounts(orchView?.usage ?? orchView?.metadata?.usage ?? orchView?.metadata?.tokens);
+        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
         const orchOutcome = orchView?.outcome;
         if (orchOutcome === "failed" || orchOutcome === "interrupted") {
           throw new OrchestrationError(
