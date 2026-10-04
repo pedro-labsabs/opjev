@@ -75,7 +75,7 @@ O histórico abaixo não serve como aprovação atual. Até a execução fresca 
 
 ## 4. Evidência Estruturada Salva em Disco
 
-A execução fresca do runner em source HEAD `598977a73e8e8275e47d774c883333192ed1aa38` (OpenCode `2.0.11`, `2026-10-04T01:27:48.096Z`) gerou envelope auditável. SHA-256 Git blob do arquivo: `9b63843b1a06da6d74cff01d3152f68e70dfbe98`. O runner saiu não aprovado pelo bloqueio explícito do cenário 17:
+A execução fresca do runner em source HEAD `598977a73e8e8275e47d774c883333192ed1aa38` (OpenCode `2.0.11`, `2026-10-04T01:27:48.096Z`) gerou envelope auditável. Git blob ID do arquivo: `9b63843b1a06da6d74cff01d3152f68e70dfbe98`. O runner saiu não aprovado pelo bloqueio explícito do cenário 17:
 `docs/reports/artifacts/issue-14-real-e2e-evidence.json`
 
 O envelope contém `headSha`, versão runtime, timestamp, `scenarioId`, `runID`, round, session IDs, executor/decision observados e `finalPhase`. Não inclui raw context, chain-of-thought ou secrets. Cenário 17 registra `BLOCKER — NOT REAL OPENCODE`; a Issue #14 permanece incompleta.
