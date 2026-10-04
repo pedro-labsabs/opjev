@@ -1055,13 +1055,20 @@ async function main() {
   {
     const id = 8;
     log(`[${id}/17] Executando Cenário 8: pausa human; duas chamadas tool Code Mode em sessões OpenCode reais...`);
+    let c8DecisionCalls = 0;
     activeProxyBehavior = { mode: "custom" };
-    customJevHandler = async () => ({ model: "jev-1.13-free", answers: stdAnswers({
-      done: { type: "noul", noul: 0 },
-      failure_class: { type: "choice", choice: "bad-contract" },
-      same_executor_can_repair: { type: "noul", noul: 0 },
-      next_action: { type: "choice", choice: "human", confidence: 0.95 },
-    }) });
+    customJevHandler = async (reqBody) => {
+      if (reqBody?.questions?.done) c8DecisionCalls += 1;
+      if (c8DecisionCalls > 1) {
+        return { model: "jev-1.13-free", answers: stdAnswers({ done: { type: "noul", noul: 1 }, next_action: { type: "choice", choice: "accept", confidence: 0.99 } }) };
+      }
+      return { model: "jev-1.13-free", answers: stdAnswers({
+        done: { type: "noul", noul: 0 },
+        failure_class: { type: "choice", choice: "bad-contract" },
+        same_executor_can_repair: { type: "noul", noul: 0 },
+        next_action: { type: "choice", choice: "human", confidence: 0.95 },
+      }) };
+    };
     const sid = await createRealSession();
     const msgId = `msg_e2e_c8_${Date.now()}`;
     const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", {
