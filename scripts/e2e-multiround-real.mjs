@@ -1137,7 +1137,11 @@ async function main() {
     const noExtraRound = finalRunState.state.round === 2 && workerSessions.length === 2 && criticSessions.length === 2;
     const promptAdmissionsPassed = promptResults.every((result) => result.status === 200);
     const realToolCallsObserved = activeResumeToolRequests.arrived === 2 && !activeResumeToolRequests.unsupported;
-    const pass = promptAdmissionsPassed && callerPromptsProcessed.every(Boolean) && realToolCallsObserved &&
+    const sameHumanRequest = runState.state.phase === "awaiting-human" &&
+      typeof decision.requestID === "string" && decision.requestID.length > 0 &&
+      callers.length === 2 && activeResumeToolRequests.pending.size === 2 &&
+      [...activeResumeToolRequests.pending.values()].every((request) => request.runID === runID && request.decision.requestID === decision.requestID);
+    const pass = sameHumanRequest && promptAdmissionsPassed && callerPromptsProcessed.every(Boolean) && realToolCallsObserved &&
       finalRunState.state.phase === "completed" && finalRunState.state.round === 2 &&
       loserCount === 1 && humanDecisionCount === 1 && exactlyOneWorkerAndCritic && noExtraRound;
     const lockTelemetry = up.lines.filter((line) => line.includes("[opjev-e2e] resume-lock-release=")).at(-1);
@@ -1145,9 +1149,10 @@ async function main() {
     results.push({ id, name: SCENARIO_DEFS[7].name, pass: pass && lockCountZero, phase: finalRunState.state.phase, round: finalRunState.state.round, runID, toolCallCount: activeResumeToolRequests.arrived, callerPromptsProcessed, loserCount, humanDecisionCount, workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing" });
     evidenceRecords.push({
       scenarioId: id, scenarioName: SCENARIO_DEFS[7].name, tier: SCENARIO_DEFS[7].tier,
-      runID, round: finalRunState.state.round, workerSessionID: workerSessions[1]?.id ?? runState.workerSessionID,
+      runID, requestID: decision.requestID, initialPhase: runState.state.phase, initialRound: runState.state.round,
+      round: finalRunState.state.round, workerSessionID: workerSessions[1]?.id ?? runState.workerSessionID,
       criticSessionID: criticSessions[1]?.id ?? runState.criticSessionID, executor: finalRunState.state.executor,
-      callerSessionIDs: callers, callerPromptsProcessed, toolNamesObserved: activeResumeToolRequests.toolNames,
+      sameRunAndRequestID: sameHumanRequest, callerSessionIDs: callers, callerPromptsProcessed, toolNamesObserved: activeResumeToolRequests.toolNames,
       toolCallCount: activeResumeToolRequests.arrived, loserCount, humanDecisionCount,
       workerCount: workerSessions.length, criticCount: criticSessions.length, lockCountZero, lockTelemetry: lockTelemetry ?? "missing",
       verdict: pass && lockCountZero ? "two real concurrent Code Mode resume calls: one winner, one invalid-resumable-run loser" : "BLOCKED/FAIL: real tool invocation or exactly-once assertions missing",
@@ -1230,11 +1235,12 @@ async function main() {
     activeWorkerCompletionsBehavior = "normal";
 
     const workerSession = runState.workerSessionID && getSessionsForRun(homeDir, runID).find((s) => s.id === runState.workerSessionID);
-    const timeoutDiagnostic = /worker-timeout|excedeu 60000ms|excedeu.*ms/i.test(String(runState.state.lastError ?? ""));
+    const timeoutDiagnostic = String(runState.state.lastError ?? "").includes("excedeu 60000ms");
     const outcomeInterrupted = workerSession?.outcome === "interrupted";
-    const interruptObserved = workerSession?.outcome === "interrupted" || /interrompido best-effort/i.test(String(runState.state.lastError ?? ""));
+    const interruptObserved = /interrompido best-effort/i.test(String(runState.state.lastError ?? ""));
+    const workerCount = getSessionsForRun(homeDir, runID).filter((s) => s.role === "worker").length;
     const noExtraRounds = runState.state.round === 1;
-    const noExtraWorker = getSessionsForRun(homeDir, runID).filter((s) => s.role === "worker").length === 1;
+    const noExtraWorker = workerCount === 1;
     const pass = Boolean(runState.workerSessionID) && timeoutDiagnostic && interruptObserved && outcomeInterrupted && noExtraRounds && noExtraWorker && runState.state.phase === "failed";
 
     results.push({ id, name: SCENARIO_DEFS[9].name, pass, phase: runState.state.phase, round: 1, runID });
@@ -1248,6 +1254,16 @@ async function main() {
       criticSessionID: "none",
       executor: { agent: "build", model: "opencode/big-pickle" },
       verdict: "worker-timeout-interrupted",
+      timeoutMs: 60000,
+      providerBehavior: "deliberately non-responsive",
+      timeoutDiagnostic: runState.state.lastError,
+      timeoutDiagnosticMatched: timeoutDiagnostic,
+      interruptObserved,
+      interruptDiagnostic: runState.state.lastError,
+      workerOutcome: workerSession?.outcome ?? "missing",
+      workerCount,
+      noExtraRounds,
+      noExtraWorker,
       command: "interrupt",
       finalPhase: runState.state.phase,
     });
