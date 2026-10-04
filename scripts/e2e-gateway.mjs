@@ -687,8 +687,8 @@ async function main() {
     const nm = /Orquestracao[^"\\]{0,200}/.exec(noticeRes.text);
     orch.notice = nm ? nm[0] : "";
     assert(
-      "orchestrate: resultado PUBLICADO (notice synthetic) sem wake",
-      /Orquestracao/.test(orch.notice),
+      "orchestrate: resultado concluido e PUBLICADO sem resource-budget denial (notice synthetic; sem wake)",
+      /Orquestracao/.test(orch.notice) && !/resource-budget:/.test(orch.notice),
       orch.notice.slice(0, 160),
     );
 
