@@ -1342,13 +1342,28 @@ async function main() {
     };
     const beforeRuns = runCount();
     const beforeDispatches = dispatchCount();
+    const sessionDb = new DatabaseSync(databasePath, { readOnly: true });
+    const internalSessions = sessionDb.prepare("SELECT id, metadata FROM session_v2 ORDER BY rowid DESC").all().flatMap((row) => {
+      try {
+        const metadata = JSON.parse(row.metadata ?? "{}");
+        if (metadata["jev-router"] === "orchestration-internal" && ["worker", "critic", "orchestrator"].includes(metadata["jev-role"])) {
+          return [{ id: row.id, role: metadata["jev-role"], runID: metadata["jev-run-id"] }];
+        }
+      } catch { /* malformed unrelated session metadata is ignored */ }
+      return [];
+    });
+    sessionDb.close();
     const promptProofs = [];
     for (const role of ["worker", "critic", "orchestrator"]) {
-      const promptSessionID = await createRealSession();
-      const sDb = new DatabaseSync(databasePath);
-      sDb.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(JSON.stringify({ "jev-role": role, "jev-router": "orchestration-internal" }), promptSessionID);
-      sDb.close();
-      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { prompt: { text: `Internal ${role} recursion guard E2E probe` }, delivery: "steer", resume: true });
+      const internalSession = internalSessions.find((candidate) => candidate.role === role);
+      if (!internalSession) throw new Error(`Cenário 15 sem sessão real de ${role} criada pelo dispatcher`);
+      const promptSessionID = internalSession.id;
+      const before = new DatabaseSync(databasePath, { readOnly: true });
+      const assistantBefore = before.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'assistant'").get(promptSessionID).n;
+      const idleBefore = before.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
+      before.close();
+      const marker = { "jev-role": role, "jev-router": "orchestration-internal" };
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { text: { text: `Internal ${role} recursion guard E2E probe`, metadata: marker }, delivery: "steer", resume: true });
       let promptComplete = false;
       if (promptResult.status >= 200 && promptResult.status < 300) {
         try {
@@ -1357,27 +1372,20 @@ async function main() {
             const assistant = verify.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'assistant'").get(promptSessionID).n;
             const idle = verify.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
             verify.close();
-            return assistant > 0 && idle > 0;
+            return assistant > assistantBefore && idle > idleBefore;
           }, 30000, `Cenário 15 prompt ${role} processado`));
         } catch { promptComplete = false; }
       }
-      const verify = new DatabaseSync(databasePath, { readOnly: true });
-      const row = verify.prepare("SELECT metadata FROM session_v2 WHERE id = ?").get(promptSessionID);
-      verify.close();
-      const metadata = row?.metadata ? JSON.parse(row.metadata) : {};
-      promptProofs.push({ role, sessionID: promptSessionID, status: promptResult.status, processed: Boolean(promptComplete), markerPreserved: metadata["jev-router"] === "orchestration-internal" && metadata["jev-role"] === role });
+      promptProofs.push({ role, sessionID: promptSessionID, sourceRunID: internalSession.runID, status: promptResult.status, processed: Boolean(promptComplete), markerSent: true, baselineAssistantMessages: assistantBefore, baselineIdleEvents: idleBefore });
     }
-    const sid = await createRealSession();
-    const db = new DatabaseSync(databasePath);
-    db.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(JSON.stringify({ "jev-role": "worker", "jev-router": "orchestration-internal" }), sid);
-    db.close();
+    const sid = internalSessions.find((candidate) => candidate.role === "worker").id;
     const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", { input: { sessionID: sid, messageID: "msg_internal_recurse", objective: "Internal recurse attempt" } });
     const admissionPass = getRpcStatus(rpcRes) === "internal-bypass";
     const afterRuns = runCount();
     const afterDispatches = dispatchCount();
     const noNewRuns = afterRuns === beforeRuns;
     const noNewDispatches = afterDispatches === beforeDispatches;
-    const promptPass = promptProofs.length === 3 && promptProofs.every((p) => p.status >= 200 && p.status < 300 && p.processed && p.markerPreserved);
+    const promptPass = promptProofs.length === 3 && promptProofs.every((p) => p.status >= 200 && p.status < 300 && p.processed && p.markerSent);
     const pass = false; // o caller guard de resume ainda não foi acionado pela tool real do host.
     const runID = `auto-${sid}-msg_internal_recurse`;
     results.push({ id, name: SCENARIO_DEFS[14].name, pass, phase: "internal-bypass", round: 0, runID, admissionPass, promptPass, noNewRuns, noNewDispatches, blocker: "resume caller guard not invoked through real host tool execution" });
