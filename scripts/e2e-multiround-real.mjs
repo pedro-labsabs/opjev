@@ -14,6 +14,7 @@
 // ==============================================================================
 
 import { spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -22,8 +23,6 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import pluginDefault from "../index.ts";
 import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
-import { withResumeLock, resumeLockCount } from "../src/orchestration/resume-lock.ts";
-import { OrchestrationError } from "../src/orchestration/types.ts";
 import { FREE_POOL } from "../src/config.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -184,6 +183,7 @@ function getSessionsForRun(homeDir, runID) {
             agentRole: meta["jev-agent-role"],
             agent: r.agent,
             model: modelStr,
+            outcome: r.idle_outcome,
             permissions: r.permission,
             meta,
           });
@@ -202,197 +202,6 @@ function getRunId(rpcRes) {
 
 function getRpcStatus(rpcRes) {
   return rpcRes.data?.output?.status || rpcRes.data?.data?.status || rpcRes.data?.status;
-}
-
-// ---------------------------------------------------------------- Public Resume Tool Harness
-async function getResumeTool(upOrigin, homeDir, apiKey, projectDir, jevProxyPort, auth) {
-  const tools = {};
-  const fakeCtx = {
-    directory: projectDir,
-    location: { directory: projectDir },
-    options: {
-      jevModel: "jev-1.13-free",
-      jevEndpoint: `http://127.0.0.1:${jevProxyPort}/v1/systemone`,
-      apiKeyEnv: "OPENCODE_API_KEY",
-      enableAutoRoute: true,
-    },
-    hook: async () => {},
-    tool: {
-      transform(cb) {
-        cb({
-          namespace() {},
-          add(t) {
-            tools[t.name] = t;
-          },
-        });
-      },
-      hook: async () => {},
-    },
-    rpc: {
-      async register() {},
-    },
-    storage: {
-      async get(key) {
-        try {
-          const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-          const db = new DatabaseSync(dbPath, { readOnly: true });
-          const target = ":" + key;
-          const row = db.prepare("SELECT value FROM kv WHERE key = ? OR substr(key, -length(?)) = ?").get(key, target, target);
-          db.close();
-          return row && row.value ? JSON.parse(row.value) : null;
-        } catch {
-          return null;
-        }
-      },
-      async set(key, value) {
-        try {
-          const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-          const db = new DatabaseSync(dbPath);
-          const target = ":" + key;
-          const row = db.prepare("SELECT key FROM kv WHERE key = ? OR substr(key, -length(?)) = ?").get(key, target, target);
-          if (row) {
-            db.prepare("UPDATE kv SET value = ? WHERE key = ?").run(JSON.stringify(value), row.key);
-          } else {
-            db.prepare("INSERT INTO kv (key, value) VALUES (?, ?)").run(key, JSON.stringify(value));
-          }
-          db.close();
-        } catch {}
-      },
-    },
-    session: {
-      hook: async () => {},
-      switchModel: async () => {},
-      switchAgent: async () => {},
-      async get(arg) {
-        const sessionID = typeof arg === "string" ? arg : arg?.sessionID;
-        let s = null;
-        try {
-          const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-          const db = new DatabaseSync(dbPath, { readOnly: true });
-          s = db.prepare("SELECT * FROM session_v2 WHERE id = ?").get(sessionID);
-          db.close();
-        } catch {}
-        let metadata = {};
-        if (s && s.metadata) {
-          try { metadata = typeof s.metadata === "string" ? JSON.parse(s.metadata) : s.metadata; } catch {}
-        }
-        return {
-          id: sessionID,
-          agent: s?.agent || "build",
-          model: s?.model ? (() => { try { const m = JSON.parse(s.model); return `${m.providerID}/${m.id}`; } catch { return s.model; } })() : "opencode/nemotron-3.5-lightning-free",
-          outcome: s?.idle_outcome || "succeeded",
-          metadata,
-        };
-      },
-      async create(input) {
-        const res = await fetch(`${upOrigin}/api/session`, {
-          method: "POST",
-          headers: { authorization: auth, "Content-Type": "application/json" },
-          body: JSON.stringify(input),
-        });
-        if (!res.ok) throw new Error(`create session failed: ${res.statusText}`);
-        const data = await res.json();
-        const sid = data.id || data.data?.id;
-        if (sid && (input.metadata || input.permissions || input.permission || input.agent || input.model)) {
-          try {
-            const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-            const db = new DatabaseSync(dbPath);
-            const s = db.prepare("SELECT * FROM session_v2 WHERE id = ?").get(sid);
-            if (s) {
-              const currentMeta = s.metadata ? JSON.parse(s.metadata) : {};
-              const mergedMeta = { ...currentMeta, ...(input.metadata || {}) };
-              const perms = input.permissions || input.permission;
-              db.prepare("UPDATE session_v2 SET metadata = ?, agent = COALESCE(?, agent), model = COALESCE(?, model), permission = COALESCE(?, permission) WHERE id = ?")
-                .run(
-                  JSON.stringify(mergedMeta),
-                  input.agent || null,
-                  input.model ? (typeof input.model === "string" ? input.model : JSON.stringify(input.model)) : null,
-                  perms ? JSON.stringify(perms) : null,
-                  sid
-                );
-            }
-            db.close();
-          } catch {}
-        }
-        return { id: sid, ...(data.data || {}), ...data };
-      },
-      async prompt(input) {
-        const res = await fetch(`${upOrigin}/api/session/${input.sessionID}/prompt`, {
-          method: "POST",
-          headers: { authorization: auth, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: input.text,
-            ...(input.metadata ? { metadata: input.metadata } : {}),
-          }),
-        });
-        if (!res.ok) {
-          const errText = await res.text();
-          throw new Error(`prompt session failed (${res.status}): ${errText}`);
-        }
-      },
-      async wait({ sessionID }) {
-        const deadline = Date.now() + 30000;
-        while (Date.now() < deadline) {
-          try {
-            const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-            const db = new DatabaseSync(dbPath, { readOnly: true });
-            const row = db.prepare("SELECT type FROM session_message WHERE session_id = ? AND type = 'idle'").get(sessionID);
-            db.close();
-            if (row) return;
-          } catch {}
-          await sleep(50);
-        }
-      },
-      async context({ sessionID }) {
-        try {
-          const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
-          const db = new DatabaseSync(dbPath, { readOnly: true });
-          const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY seq ASC").all(sessionID);
-          db.close();
-          return rows.map(r => {
-            let d = {};
-            try { d = JSON.parse(r.data); } catch {}
-            return { type: r.type, ...d };
-          });
-        } catch {
-          return [];
-        }
-      },
-      async interrupt({ sessionID }) {
-        await fetch(`${upOrigin}/api/session/${sessionID}/interrupt`, { method: "POST", headers: { authorization: auth } });
-      },
-      async synthetic({ sessionID, text }) {
-        await fetch(`${upOrigin}/api/session/${sessionID}/synthetic`, {
-          method: "POST",
-          headers: { authorization: auth, "Content-Type": "application/json" },
-          body: JSON.stringify({ text, resume: false }),
-        });
-      },
-    },
-    agent: {
-      async list() {
-        const res = await fetch(`${upOrigin}/api/agent`, { headers: { authorization: auth } });
-        if (!res.ok) return [{ id: "build", mode: "primary" }, { id: "plan", mode: "primary" }];
-        return await res.json();
-      },
-    },
-    model: {
-      async list() {
-        const res = await fetch(`${upOrigin}/api/model`, { headers: { authorization: auth } });
-        if (!res.ok) return [{ providerID: "opencode", id: "big-pickle" }];
-        return await res.json();
-      },
-    },
-  };
-
-  const pluginModule = await import("../index.ts");
-  const pluginDef = pluginModule.default || pluginModule;
-  if (typeof pluginDef.setup === "function") {
-    await pluginDef.setup(fakeCtx);
-  } else if (typeof pluginDef === "function") {
-    await pluginDef(fakeCtx);
-  }
-  return tools["orchestrate_resume"];
 }
 
 // ---------------------------------------------------------------- Scenario Definitions
@@ -1200,135 +1009,37 @@ async function main() {
     log(`  -> Cenário 7: ${pass ? "PASS" : "FAIL"} (orchestrator=${orchestratorCreated}, readOnly=${Boolean(readOnlyPolicyReal)}, freshWorker=${freshWorkerRound2})`);
   }
 
-  // --- Cenário 8: human + resume (pausa awaiting-human + concorrência serializada via orchestrate_resume) ---
+  // --- Cenário 8: human + resume ---
   {
     const id = 8;
-    log(`[${id}/17] Executando Cenário 8: human + resume (superfície pública real)...`);
-    let callRound = 0;
+    log(`[${id}/17] Executando Cenário 8: pausa human; resume real bloqueado pela API pública do host...`);
     activeProxyBehavior = { mode: "custom" };
-    customJevHandler = async (reqBody) => {
-      if (reqBody?.questions?.done) {
-        callRound += 1;
-        if (callRound === 1) {
-          return {
-            model: "jev-1.13-free",
-            answers: stdAnswers({
-              done: { type: "noul", noul: 0 },
-              failure_class: { type: "choice", choice: "bad-contract" },
-              same_executor_can_repair: { type: "noul", noul: 0 },
-              next_action: { type: "choice", choice: "human", confidence: 0.95 },
-            }),
-          };
-        }
-      }
-      return { model: "jev-1.13-free", answers: stdAnswers({ next_action: { type: "choice", choice: "accept" } }) };
-    };
-
+    customJevHandler = async () => ({ model: "jev-1.13-free", answers: stdAnswers({
+      done: { type: "noul", noul: 0 },
+      failure_class: { type: "choice", choice: "bad-contract" },
+      same_executor_can_repair: { type: "noul", noul: 0 },
+      next_action: { type: "choice", choice: "human", confidence: 0.95 },
+    }) });
     const sid = await createRealSession();
     const msgId = `msg_e2e_c8_${Date.now()}`;
     const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", {
       input: { sessionID: sid, messageID: msgId, objective: "Task needing human guidance", maxRounds: 1 },
     });
-
     const runID = getRunId(rpcRes);
     const runState = await waitFor(() => {
       const r = readRunFromDb(homeDir, runID);
-      if (r && r.state && r.state.phase === "awaiting-human") return r;
-      return null;
+      return r?.state?.phase === "awaiting-human" ? r : null;
     }, 45000, "Cenário 8 pausa em awaiting-human");
-
-    const pendingHuman = runState.state.pendingHuman;
-    const reqID = pendingHuman?.requestID;
-
-    // Obter a tool oficial orchestrate_resume configurada no runtime
-    const resumeTool = await getResumeTool(upOrigin, homeDir, API_KEY, projectDir, jevProxyPort, auth);
-    const humanSid = await createRealSession();
-
-    const decision = {
-      requestID: reqID,
-      action: "resume",
-      newMaxRounds: 2,
-    };
-
-    const events = [];
-    let seq = 0;
-    const origExecute = resumeTool.execute;
-    resumeTool.execute = async function (input, context) {
-      const callIdx = events.filter((e) => e.t === "enter").length;
-      events.push({ t: "enter", id: callIdx, s: seq++ });
-      try {
-        return await origExecute.call(this, input, context);
-      } finally {
-        events.push({ t: "exit", id: callIdx, s: seq++ });
-      }
-    };
-
-    // Duas chamadas concorrentes pela superfície pública oficial com mesmo runID + requestID
-    const [res1, res2] = await Promise.all([
-      resumeTool.execute({ runID, decision }, { sessionID: humanSid }),
-      resumeTool.execute({ runID, decision }, { sessionID: humanSid }),
-    ]);
-
-    const enters = events.filter((e) => e.t === "enter").map((e) => e.s);
-    const exits = events.filter((e) => e.t === "exit").map((e) => e.s);
-    const overlap = enters.length >= 2 && exits.length >= 1 && enters[1] < exits[0];
-
-    const parseResult = (r) => {
-      try {
-        const parsed = JSON.parse(r?.content || "{}");
-        if (parsed.phase === "completed") return { ok: true, data: parsed };
-      } catch {}
-      return { ok: false, error: r?.content || String(r) };
-    };
-
-    const out1 = parseResult(res1);
-    const out2 = parseResult(res2);
-    const wins = [out1, out2].filter((r) => r.ok && r.data?.phase === "completed");
-    const losses = [out1, out2].filter((r) => !r.ok && /invalid-resumable-run/.test(r.error));
-
-    // Aguardar conclusão e verificar sessões reais no banco
-    const finalRunState = await waitFor(() => {
-      const r = readRunFromDb(homeDir, runID);
-      if (r && r.state && r.state.phase === "completed" && r.state.round === 2) return r;
-      return null;
-    }, 45000, "Cenário 8 conclusão do run retomado");
-
-    const runSessions = getSessionsForRun(homeDir, runID);
-    const workerSessions = runSessions.filter((s) => s.role === "worker");
-    const criticSessions = runSessions.filter((s) => s.role === "critic");
-
-    const exactlyOneNewWorker = workerSessions.length === 2;
-    const exactlyOneNewCritic = criticSessions.length === 2;
-    const lockCountZero = resumeLockCount() === 0;
-
-    const pass = reqID !== undefined &&
-      overlap &&
-      wins.length === 1 &&
-      losses.length === 1 &&
-      finalRunState.state.phase === "completed" &&
-      finalRunState.state.round === 2 &&
-      exactlyOneNewWorker &&
-      exactlyOneNewCritic &&
-      lockCountZero;
-
-    results.push({ id, name: SCENARIO_DEFS[7].name, pass, phase: "completed", round: 2, runID });
+    const pass = false; // sem tool execution público, não invocamos execute() internamente.
+    results.push({ id, name: SCENARIO_DEFS[7].name, pass, phase: runState.state.phase, round: runState.state.round, runID, blocker: "tool execution pela sessão real não disponível na API pública identificada" });
     evidenceRecords.push({
-      scenarioId: id,
-      scenarioName: SCENARIO_DEFS[7].name,
-      tier: SCENARIO_DEFS[7].tier,
-      runID,
-      round: 2,
-      workerSessionID: workerSessions[1]?.id || finalRunState.workerSessionID,
-      criticSessionID: criticSessions[1]?.id || finalRunState.criticSessionID,
-      executor: {
-        agent: workerSessions[1]?.agent || finalRunState.state.executor?.agent || "build",
-        model: workerSessions[1]?.model || finalRunState.state.executor?.model || "opencode/big-pickle",
-      },
-      verdict: "human -> resume (concurrency serialized)",
-      command: "none",
-      finalPhase: "completed",
+      scenarioId: id, scenarioName: SCENARIO_DEFS[7].name, tier: SCENARIO_DEFS[7].tier,
+      runID, round: runState.state.round, workerSessionID: runState.workerSessionID,
+      criticSessionID: runState.criticSessionID, executor: runState.state.executor,
+      verdict: "BLOCKER: host real tool execution seam not established", command: "none",
+      finalPhase: runState.state.phase,
     });
-    log(`  -> Cenário 8: ${pass ? "PASS" : "FAIL"} (overlap=${overlap}, wins=${wins.length}, losses=${losses.length}, lockZero=${lockCountZero})`);
+    log(`  -> Cenário 8: BLOCKER (run real ${runID} permanece ${runState.state.phase}; sem invocação simulada)`);
   }
 
   // --- Cenário 9: stop (terminação imediata em stopped) ---
@@ -1402,11 +1113,13 @@ async function main() {
 
     activeWorkerCompletionsBehavior = "normal";
 
-    const outcomeInterrupted = runState.state.worker?.outcome === "interrupted" ||
-      runState.checkpoint === "run-failed" ||
-      runState.state.phase === "failed";
+    const workerSession = runState.workerSessionID && getSessionsForRun(homeDir, runID).find((s) => s.id === runState.workerSessionID);
+    const timeoutDiagnostic = /worker-timeout|excedeu 60000ms|excedeu.*ms/i.test(String(runState.state.lastError ?? ""));
+    const outcomeInterrupted = runState.state.worker?.outcome === "interrupted";
+    const interruptObserved = workerSession?.outcome === "interrupted" || /interrompido best-effort/i.test(String(runState.state.lastError ?? ""));
     const noExtraRounds = runState.state.round === 1;
-    const pass = runState.state.phase === "failed" && noExtraRounds && outcomeInterrupted;
+    const noExtraWorker = getSessionsForRun(homeDir, runID).filter((s) => s.role === "worker").length === 1;
+    const pass = Boolean(runState.workerSessionID) && timeoutDiagnostic && interruptObserved && outcomeInterrupted && noExtraRounds && noExtraWorker && runState.state.phase === "failed";
 
     results.push({ id, name: SCENARIO_DEFS[9].name, pass, phase: runState.state.phase, round: 1, runID });
     evidenceRecords.push({
@@ -1606,71 +1319,70 @@ async function main() {
     log(`  -> Cenário 14: ${pass ? "PASS" : "FAIL"} (phase=${runState.state.phase}, kind=${pending?.kind})`);
   }
 
-  // --- Cenário 15: tentativa de recursão por sessão interna (worker, critic, orchestrator) ---
+  // --- Cenário 15: recursion guard ---
   {
     const id = 15;
-    log(`[${id}/17] Executando Cenário 15: tentativa de recursão por sessão interna (OpenCode host real)...`);
-    const sid = await createRealSession();
-    const db = new DatabaseSync(
-      path.join(homeDir, ".local", "share", "opencode", "opencode.db")
-    );
-    const meta = JSON.stringify({ "jev-role": "worker", "jev-router": "orchestration-internal" });
-    db.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(meta, sid);
-    db.close();
-
-    // 1. Admission RPC rejeita chamada vinda de sessão interna
-    const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", {
-      input: { sessionID: sid, messageID: "msg_internal_recurse", objective: "Internal recurse attempt" },
-    });
-    const bypassPass = getRpcStatus(rpcRes) === "internal-bypass";
-
-    // 2. Prompt hook no host OpenCode real preserva metadados internos para os 3 papéis
-    let allHooksPass = true;
+    log(`[${id}/17] Executando Cenário 15: admission e prompts processados no host...`);
+    const databasePath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+    const runCount = () => {
+      const db = new DatabaseSync(databasePath, { readOnly: true });
+      const n = db.prepare("SELECT COUNT(*) AS n FROM kv WHERE key LIKE '%orchestration/run/%'").get().n;
+      db.close(); return n;
+    };
+    const dispatchCount = () => {
+      const db = new DatabaseSync(databasePath, { readOnly: true });
+      const rows = db.prepare("SELECT metadata FROM session_v2").all();
+      db.close();
+      return rows.filter((row) => {
+        try {
+          const m = JSON.parse(row.metadata ?? "{}");
+          return Boolean(m["jev-run-id"]) && ["worker", "critic", "orchestrator"].includes(m["jev-role"]);
+        } catch { return false; }
+      }).length;
+    };
+    const beforeRuns = runCount();
+    const beforeDispatches = dispatchCount();
+    const promptProofs = [];
     for (const role of ["worker", "critic", "orchestrator"]) {
-      const sId = await createRealSession();
-      const sDb = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"));
-      sDb.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(
-        JSON.stringify({ "jev-role": role, "jev-router": "orchestration-internal" }),
-        sId
-      );
+      const promptSessionID = await createRealSession();
+      const sDb = new DatabaseSync(databasePath);
+      sDb.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(JSON.stringify({ "jev-role": role, "jev-router": "orchestration-internal" }), promptSessionID);
       sDb.close();
-
-      // Executa prompt real via HTTP no OpenCode
-      await api("POST", `/api/session/${sId}/prompt`, { prompt: [{ type: "text", text: "step check" }] });
-      const verifyDb = new DatabaseSync(path.join(homeDir, ".local", "share", "opencode", "opencode.db"), { readOnly: true });
-      const row = verifyDb.prepare("SELECT metadata FROM session_v2 WHERE id = ?").get(sId);
-      verifyDb.close();
-      const m = row?.metadata ? (typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata) : {};
-      if (m["jev-router"] !== "orchestration-internal" || m["jev-role"] !== role) {
-        allHooksPass = false;
+      const promptResult = await api("POST", `/api/session/${promptSessionID}/prompt`, { prompt: [{ type: "text", text: `Internal ${role} recursion guard E2E probe` }] });
+      let promptComplete = false;
+      if (promptResult.status >= 200 && promptResult.status < 300) {
+        try {
+          promptComplete = Boolean(await waitFor(() => {
+            const verify = new DatabaseSync(databasePath, { readOnly: true });
+            const assistant = verify.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'assistant'").get(promptSessionID).n;
+            const idle = verify.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(promptSessionID).n;
+            verify.close();
+            return assistant > 0 && idle > 0;
+          }, 30000, `Cenário 15 prompt ${role} processado`));
+        } catch { promptComplete = false; }
       }
+      const verify = new DatabaseSync(databasePath, { readOnly: true });
+      const row = verify.prepare("SELECT metadata FROM session_v2 WHERE id = ?").get(promptSessionID);
+      verify.close();
+      const metadata = row?.metadata ? JSON.parse(row.metadata) : {};
+      promptProofs.push({ role, sessionID: promptSessionID, status: promptResult.status, processed: Boolean(promptComplete), markerPreserved: metadata["jev-router"] === "orchestration-internal" && metadata["jev-role"] === role });
     }
-
-    // 3. Caller guard no orchestrate_resume rejeita chamada vinda de sessão interna
-    const resumeTool = await getResumeTool(upOrigin, homeDir, API_KEY, projectDir, jevProxyPort, auth);
-    const resumeCallerReject = await resumeTool.execute(
-      { runID: "fake-run", decision: { requestID: "req", action: "resume" } },
-      { sessionID: sid }
-    );
-    const callerGuardPass = /chamada interna de orchestration/.test(resumeCallerReject?.content || "");
-
-    const pass = bypassPass && allHooksPass && callerGuardPass;
+    const sid = await createRealSession();
+    const db = new DatabaseSync(databasePath);
+    db.prepare("UPDATE session_v2 SET metadata = ? WHERE id = ?").run(JSON.stringify({ "jev-role": "worker", "jev-router": "orchestration-internal" }), sid);
+    db.close();
+    const rpcRes = await api("POST", "/api/rpc/opjev.admission.v1/orchestrate", { input: { sessionID: sid, messageID: "msg_internal_recurse", objective: "Internal recurse attempt" } });
+    const admissionPass = getRpcStatus(rpcRes) === "internal-bypass";
+    const afterRuns = runCount();
+    const afterDispatches = dispatchCount();
+    const noNewRuns = afterRuns === beforeRuns;
+    const noNewDispatches = afterDispatches === beforeDispatches;
+    const promptPass = promptProofs.length === 3 && promptProofs.every((p) => p.status >= 200 && p.status < 300 && p.processed && p.markerPreserved);
+    const pass = false; // o caller guard de resume ainda não foi acionado pela tool real do host.
     const runID = `auto-${sid}-msg_internal_recurse`;
-    results.push({ id, name: SCENARIO_DEFS[14].name, pass, phase: "internal-bypass", round: 0, runID });
-    evidenceRecords.push({
-      scenarioId: id,
-      scenarioName: SCENARIO_DEFS[14].name,
-      tier: SCENARIO_DEFS[14].tier,
-      runID,
-      round: 0,
-      workerSessionID: sid,
-      criticSessionID: "none",
-      executor: { agent: "none", model: "none" },
-      verdict: "internal-bypass",
-      command: "none",
-      finalPhase: "internal-bypass",
-    });
-    log(`  -> Cenário 15: ${pass ? "PASS" : "FAIL"} (bypass=${bypassPass}, allHooks=${allHooksPass}, callerGuard=${callerGuardPass})`);
+    results.push({ id, name: SCENARIO_DEFS[14].name, pass, phase: "internal-bypass", round: 0, runID, admissionPass, promptPass, noNewRuns, noNewDispatches, blocker: "resume caller guard not invoked through real host tool execution" });
+    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[14].name, tier: SCENARIO_DEFS[14].tier, runID, round: 0, workerSessionID: sid, criticSessionID: "none", executor: { agent: "none", model: "none" }, promptProofs, admissionPass, baselineRunCount: beforeRuns, finalRunCount: afterRuns, noNewRuns, baselineDispatchCount: beforeDispatches, finalDispatchCount: afterDispatches, noNewDispatches, verdict: "BLOCKER: prompt and admission surfaces observed; real resume caller-guard tool call remains unavailable", command: "none", finalPhase: "internal-bypass" });
+    log(`  -> Cenário 15: BLOCKER (admission=${admissionPass}, prompts=${promptPass}, runs stable=${noNewRuns}, dispatches stable=${noNewDispatches}; caller guard host-tool invocation pendente)`);
   }
 
   // --- Cenário 16: agent / model candidate inválido (4 casos no OpenCode real) ---
@@ -1727,7 +1439,7 @@ async function main() {
       },
       r2Questions: { selected_model: { type: "choice", choice: "openai/gpt-4o", confidence: 0.99 } },
     });
-    const c16a = r16a?.state?.phase === "failed";
+    const c16a = r16a?.state?.phase === "failed" && /switch-model fora dos candidatos validos: openai\/gpt-4o/i.test(String(r16a.state.lastError ?? "")) && r16a.state.round <= r16a.state.contract.maxRounds && ![...FREE_POOL].includes("openai/gpt-4o") && getSessionsForRun(homeDir, r16a.state.contract.runID).filter((s) => s.role === "worker").length === 1;
 
     // 16b: modelo inexistente
     const r16b = await testInvalidCandidate({
@@ -1739,7 +1451,7 @@ async function main() {
       },
       r2Questions: { selected_model: { type: "choice", choice: "fake/nonexistent-model", confidence: 0.99 } },
     });
-    const c16b = r16b?.state?.phase === "failed";
+    const c16b = r16b?.state?.phase === "failed" && /switch-model fora dos candidatos validos: fake\/nonexistent-model/i.test(String(r16b.state.lastError ?? "")) && r16b.state.round <= r16b.state.contract.maxRounds && getSessionsForRun(homeDir, r16b.state.contract.runID).filter((s) => s.role === "worker").length === 1;
 
     // 16c: agente desconhecido
     const r16c = await testInvalidCandidate({
@@ -1751,7 +1463,7 @@ async function main() {
       },
       r2Questions: { selected_agent: { type: "choice", choice: "unknown-rogue-agent", confidence: 0.99 } },
     });
-    const c16c = r16c?.state?.phase === "failed";
+    const c16c = r16c?.state?.phase === "failed" && /agente selecionado nao existe no catalogo runtime: unknown-rogue-agent/i.test(String(r16c.state.lastError ?? "")) && r16c.state.round <= r16c.state.contract.maxRounds && getSessionsForRun(homeDir, r16c.state.contract.runID).filter((s) => s.role === "worker").length === 1;
 
     // 16d: agente subagent / não primário
     const r16d = await testInvalidCandidate({
@@ -1763,7 +1475,7 @@ async function main() {
       },
       r2Questions: { selected_agent: { type: "choice", choice: "explore", confidence: 0.99 } },
     });
-    const c16d = r16d?.state?.phase === "failed";
+    const c16d = r16d?.state?.phase === "failed" && /agente selecionado nao elegivel como primary no catalogo runtime: explore/i.test(String(r16d.state.lastError ?? "")) && r16d.state.round <= r16d.state.contract.maxRounds && getSessionsForRun(homeDir, r16d.state.contract.runID).filter((s) => s.role === "worker").length === 1;
 
     const pass = c16a && c16b && c16c && c16d;
     const runID = r16a?.state?.contract?.runID || "run_c16_invalid_candidate";
@@ -1778,65 +1490,46 @@ async function main() {
       criticSessionID: "none",
       executor: { agent: "build", model: "opencode/big-pickle" },
       verdict: "invalid-candidate-rejected-fast",
+      subcases: [
+        { label: "paid model", runID: r16a.state?.contract?.runID, candidate: "openai/gpt-4o", diagnostic: r16a.state?.lastError, round: r16a.state?.round, executorSessions: getSessionsForRun(homeDir, r16a.state?.contract?.runID).map((s) => ({ id: s.id, agent: s.agent, model: s.model })) },
+        { label: "nonexistent model", runID: r16b.state?.contract?.runID, candidate: "fake/nonexistent-model", diagnostic: r16b.state?.lastError, round: r16b.state?.round, executorSessions: getSessionsForRun(homeDir, r16b.state?.contract?.runID).map((s) => ({ id: s.id, agent: s.agent, model: s.model })) },
+        { label: "unknown agent", runID: r16c.state?.contract?.runID, candidate: "unknown-rogue-agent", diagnostic: r16c.state?.lastError, round: r16c.state?.round, executorSessions: getSessionsForRun(homeDir, r16c.state?.contract?.runID).map((s) => ({ id: s.id, agent: s.agent, model: s.model })) },
+        { label: "known non-primary agent", runID: r16d.state?.contract?.runID, candidate: "explore", diagnostic: r16d.state?.lastError, round: r16d.state?.round, executorSessions: getSessionsForRun(homeDir, r16d.state?.contract?.runID).map((s) => ({ id: s.id, agent: s.agent, model: s.model })) },
+      ],
       command: "none",
       finalPhase: "failed",
     });
     log(`  -> Cenário 16: ${pass ? "PASS" : "FAIL"} (16a=${c16a}, 16b=${c16b}, 16c=${c16c}, 16d=${c16d})`);
   }
 
-  // --- Cenário 17: stale evidence / rodada errada ---
+  // --- Cenário 17: stale evidence ---
   {
     const id = 17;
-    log(`[${id}/17] Executando Cenário 17: stale evidence / rodada errada (fronteira do kernel)...`);
-    const { createRunState, transitionRun } = await import("../src/orchestration/state-machine.ts");
-    const c = baseContract({ maxRounds: 3 });
-    let state = createRunState(c);
-    state = transitionRun(state, { type: "CONTRACT_READY" }).state;
-    state = transitionRun(state, { type: "EXECUTION_STARTED", executor: { agent: "build", model: "opencode/big-pickle", sessionID: "w1" } }).state;
-    state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "succeeded" }).state;
-
-    let threwStale = false;
-    let expectedErrCode = "";
-    try {
-      transitionRun(state, {
-        type: "EVIDENCE_READY",
-        evidence: {
-          round: 99,
-          executor: { agent: "build", model: "opencode/big-pickle" },
-          outcome: "succeeded",
-          deterministicChecks: [{ name: "worker-session-outcome", status: "pass" }],
-          criticFindings: [],
-          resultSummary: "stale round attempt",
-        },
-      });
-    } catch (err) {
-      if (err instanceof OrchestrationError && err.code === "invalid-evidence") {
-        threwStale = true;
-        expectedErrCode = err.code;
-      }
-    }
-
-    const pass = threwStale && expectedErrCode === "invalid-evidence" && state.phase === "evaluating" && state.round === 1;
-    const runID = c.runID;
-    results.push({ id, name: SCENARIO_DEFS[16].name, pass, phase: state.phase, round: 1, runID });
-    evidenceRecords.push({
-      scenarioId: id,
-      scenarioName: SCENARIO_DEFS[16].name,
-      tier: SCENARIO_DEFS[16].tier,
-      runID,
-      round: 1,
-      workerSessionID: "w1",
-      criticSessionID: "none",
-      executor: { agent: "build", model: "opencode/big-pickle" },
-      verdict: "stale-evidence-rejected-deterministic",
-      command: "none",
-      finalPhase: state.phase,
-    });
-    log(`  -> Cenário 17: ${pass ? "PASS" : "FAIL"} (code=${expectedErrCode}, statePhase=${state.phase}, round=${state.round})`);
+    log(`[${id}/17] Cenário 17: BLOCKER — dispatcher não expõe boundary runtime de EvidencePacket`);
+    const pass = false;
+    const runID = "none";
+    results.push({ id, name: SCENARIO_DEFS[16].name, pass, phase: "BLOCKED", round: 0, runID, blocker: "EvidencePacket is constructed inside dispatcher; no runtime injection seam" });
+    evidenceRecords.push({ scenarioId: id, scenarioName: SCENARIO_DEFS[16].name, tier: "BLOCKER — NOT REAL OPENCODE", runID, round: 0, workerSessionID: "none", criticSessionID: "none", executor: { agent: "none", model: "none" }, verdict: "BLOCKER: no legitimate runtime EvidencePacket injection boundary; prior direct kernel injection removed", command: "none", finalPhase: "BLOCKED" });
   }
 
   // ---------------------------------------------------------------- Persistir Evidência
-  fs.writeFileSync(EVIDENCE_FILE, JSON.stringify(evidenceRecords, null, 2));
+  const sourceHeadSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO, encoding: "utf8" }).trim();
+  const evidenceEnvelope = {
+    schemaVersion: 1,
+    provenance: {
+      headSha: sourceHeadSha,
+      openCodeRuntimeVersion: upInfo.version,
+      executedAt: new Date().toISOString(),
+      runner: "scripts/e2e-multiround-real.mjs",
+    },
+    scenarios: evidenceRecords.map((record) => ({
+      ...record,
+      sessionIDs: [record.workerSessionID, record.criticSessionID, record.orchestratorSessionID].filter((v) => v && v !== "none"),
+      observedExecutor: record.executor,
+      observedDecision: record.verdict,
+    })),
+  };
+  fs.writeFileSync(EVIDENCE_FILE, JSON.stringify(evidenceEnvelope, null, 2));
   log(`\nEvidência estruturada salva em: ${EVIDENCE_FILE}`);
 
   // ---------------------------------------------------------------- Emitir Matriz
@@ -1864,7 +1557,7 @@ async function main() {
     console.log("====================================================================================================\n");
     process.exit(0);
   } else {
-    console.error(" [FAILURE] Um ou mais cenários falharam no gate E2E.");
+    console.error(" [BLOCKED/FAILURE] Cenários sem boundary REAL comprovada permanecem BLOCKED; Issue #14 não está concluída.");
     console.error("====================================================================================================\n");
     process.exit(1);
   }
