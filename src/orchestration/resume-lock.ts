@@ -49,6 +49,9 @@ export async function withResumeLock<T>(runID: string, fn: () => Promise<T>): Pr
   } finally {
     releaseGate();
     if (tails.get(runID) === tail) tails.delete(runID);
+    if (typeof process !== "undefined" && process.env.OPJEV_E2E_RESUME_LOCK_DIAGNOSTICS === "1") {
+      console.info(`[opjev-e2e] resume-lock-release=${tails.size}`);
+    }
   }
 }
 
