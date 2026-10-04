@@ -71,6 +71,7 @@ export interface WorkerSessionView {
   model?: string;
   outcome?: ExecutionOutcome;
   metadata?: Record<string, unknown>;
+  usage?: unknown;
 }
 
 /**
@@ -211,6 +212,8 @@ export interface DispatcherDeps {
     at: number;
   }): Promise<void>;
   now?(): number;
+  /** Optional factual telemetry seam. Errors are isolated from kernel execution. */
+  observeResource?(observation: Record<string, unknown>): Promise<void> | void;
   /**
    * Consumo de follow-ups (#13): seam opcional injetado pelo adapter. Chamado
    * pelo scheduler no boundary de montagem do prompt de CADA rodada; suporta
@@ -220,6 +223,51 @@ export interface DispatcherDeps {
     | FollowupTakeSeam
     | ((runID: string, round: number) => Promise<PendingFollowup[]>);
   storage?: FollowupStorage;
+}
+
+async function observeResource(deps: DispatcherDeps, observation: Record<string, unknown>): Promise<void> {
+  try {
+    const pending = deps.observeResource?.(observation);
+    if (pending && typeof (pending as Promise<void>).then === "function") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pending,
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, 50); }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+    }
+  } catch { /* observational subsystem fails open */ }
+}
+
+function resourceErrorObservation(error: unknown, at: number, identity: Record<string, unknown>): Record<string, unknown> {
+  const e = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const rawCode = String(e.code ?? e.name ?? "");
+  const code = /freeusagelimit/i.test(rawCode) ? "FreeUsageLimitError" : "";
+  const response = e.response && typeof e.response === "object" ? e.response as Record<string, unknown> : {};
+  const status = Number(e.status ?? e.statusCode ?? response.status);
+  if (/freeusagelimit|quota.?limit|usage.?limit/i.test(`${rawCode} ${message}`)) return { ...identity, at, kind: "quota-limit", errorCode: code || "quota-limit", failureDomain: "quota" };
+  if ([429, 529].includes(status) || /429|529|rate.?limit|too many requests|throttl|overload/i.test(`${code} ${message}`)) {
+    return { ...identity, at, kind: "throttle", ...(Number.isFinite(status) ? { statusCode: status } : {}), signal: "throttle", failureDomain: "provider" };
+  }
+  if (/context.?overflow|context.?length|max.?tokens/i.test(`${code} ${message}`)) return { ...identity, at, kind: "context-overflow", errorCode: code || "context-overflow", failureDomain: "context" };
+  return { ...identity, at, kind: "provider-error", errorCode: code || "provider-error", failureDomain: "provider" };
+}
+
+function observedTokenCounts(usage: unknown): Record<string, number> | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  const aliases: Record<string, string[]> = {
+    input: ["input", "inputTokens", "input_tokens"], output: ["output", "outputTokens", "output_tokens"],
+    reasoning: ["reasoning", "reasoningTokens", "reasoning_tokens"], cacheRead: ["cacheRead", "cacheReadTokens", "cache_read_input_tokens"],
+    cacheWrite: ["cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens"],
+  };
+  for (const [target, names] of Object.entries(aliases)) {
+    for (const name of names) if (Number.isFinite(u[name]) && Number(u[name]) >= 0) { out[target] = Number(u[name]); break; }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 async function resolveFrontier(deps: DispatcherDeps, runID: string): Promise<InputFrontier> {
@@ -758,6 +806,13 @@ async function executeSchedule(
         // recoverySessionID (reuso); demais, sessao nova.
         executor: { agent: roundAgent, model: roundModel, sessionID: workerSessionID },
       }).state;
+      await observeResource(deps, { at: now(), kind: "round", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      if (mode === "repair-same" || mode === "fresh-same" || mode === "human-resume") {
+        await observeResource(deps, { at: now(), kind: "recovery", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      }
+      if (mode === "switch-model" || mode === "switch-agent" || mode === "replan") {
+        await observeResource(deps, { at: now(), kind: "escalation", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      }
       // worker-created apos STARTED (phase running): o store nunca mostra
       // ready quando a rodada ja comecou a executar (RESUME4/RESUME6).
       await persist(deps, { kind: "worker-created", runID: contract.runID, workerSessionID, state, at: now() });
@@ -817,6 +872,7 @@ async function executeSchedule(
       }
       let promptDelivered = false;
       try {
+        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
         await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
         promptDelivered = true;
         if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
@@ -850,6 +906,7 @@ async function executeSchedule(
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
+      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
       // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed.
       // Persiste run-failed: storage nunca fica em ready quando a API falha.
       let interrupted = false;
@@ -881,6 +938,8 @@ async function executeSchedule(
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
     const agent = view.agent?.trim() || roundAgent;
     const model = view.model?.trim() || roundModel;
+    const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
+    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
 
     // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
     // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
@@ -967,6 +1026,7 @@ async function executeSchedule(
         resultSummary: baseEvidence.resultSummary,
         deterministicChecks: baseEvidence.deterministicChecks,
       });
+      await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round });
       await deps.critic.prompt({
         sessionID: criticSessionID,
         text: criticPrompt,
@@ -1016,6 +1076,7 @@ async function executeSchedule(
         }
       }
     } catch (err) {
+      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round }));
       criticProj = {
         sessionID: criticSessionID ?? "",
         agent,

@@ -29,6 +29,7 @@ import { buildCriticPermissionRules } from "./orchestration/readonly-policy.ts";
 import * as workerHooks from "./worker-hooks.ts";
 import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
 import * as replanMod from "./orchestration/replan.ts";
+import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { isFreeModel, FREE_POOL } from "./config.ts";
 import pluginDefault from "../index.ts";
 import {
@@ -1060,6 +1061,77 @@ function fakeDeps(over = {}) {
 }
 
 describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev)", () => {
+  it("O0: observations enter at worker/critic runtime boundaries without changing authority", async () => {
+    const t = fakeDeps({ view: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", usage: { input_tokens: 12, output_tokens: 4 } } });
+    const observations = [];
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      observeResource: (event) => observations.push(event),
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 1);
+    assert.equal(result.rounds.length, 1);
+    assert.deepEqual(observations.filter(x => x.kind === "request").map(x => x.role), ["worker", "critic"]);
+    assert.equal(observations.find(x => x.kind === "round").round, 1);
+    assert.deepEqual(observations.find(x => x.kind === "token-usage").tokens, { input: 12, output: 4 });
+    assert.equal(observations.some(x => "prompt" in x || "rawOutput" in x), false);
+    assert.equal(result.selection.model, "opencode/big-pickle", "observer does not route");
+  });
+
+  it("O0b: broken observer degrades open and cannot add a round or change FREE_POOL", async () => {
+    const t = fakeDeps();
+    const result = await runOrchestrationOnce(contract({ maxRounds: 1 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      observeResource: () => { throw new Error("storage unavailable"); },
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 1);
+    assert.equal(t.effects.filter(x => x === "create").length, 1);
+    assert.equal(isFreeModel(result.worker.model), true);
+    assert.equal(t.selectModelCalls.length, 0);
+    assert.equal(t.selectAgentCalls.length, 0);
+  });
+
+  it("O0c: dispatcher facts reach the bounded runtime storage ledger", async () => {
+    const t = fakeDeps({ view: { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", usage: { input_tokens: 5 } } });
+    const storage = new Map();
+    const sink = createBoundedStorageObservationSink({}, {
+      get: async key => storage.get(key),
+      set: async (key, value) => storage.set(key, structuredClone(value)),
+    });
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, observeResource: sink,
+    });
+    const ledger = storage.get(RESOURCE_LEDGER_KEY);
+    assert.equal(result.phase, "completed");
+    assert.equal(ledger.schema, 1);
+    assert.equal(ledger.observations.some(x => x.kind === "request" && x.role === "worker" && x.model === "opencode/big-pickle"), true);
+    assert.equal(ledger.observations.some(x => x.kind === "request" && x.role === "critic"), true);
+    assert.equal(ledger.observations.some(x => x.kind === "token-usage" && x.tokens.input === 5), true);
+    assert.equal(JSON.stringify(ledger).includes("ORCHESTRATION_WORKER_OK"), false);
+  });
+
+  it("O0d: observed 429/529 and quota errors remain observations, never implicit reroutes", async () => {
+    for (const error of [
+      Object.assign(new Error("429 rate limit"), { status: 429 }),
+      Object.assign(new Error("529 overloaded"), { statusCode: 529 }),
+      Object.assign(new Error("free usage exhausted"), { name: "FreeUsageLimitError" }),
+    ]) {
+      const t = fakeDeps({ runtime: { prompt: async () => { throw error; } } });
+      const observations = [];
+      const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+        runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+        observeResource: event => observations.push(event),
+      });
+      assert.equal(result.phase, "failed");
+      assert.equal(result.round, 1);
+      assert.equal(t.effects.includes("select-model"), false);
+      assert.equal(t.effects.includes("select-agent"), false);
+      assert.equal(observations.some(x => x.kind === (error.name === "FreeUsageLimitError" ? "quota-limit" : "throttle")), true);
+      assert.equal(JSON.stringify(observations).includes(error.message), false);
+    }
+  });
+
   it("O1: happy path -> completed, round 1, worker criado UMA vez, judge UMA vez", async () => {
     const t = fakeDeps();
     const result = await runOrchestrationOnce(contract(), {

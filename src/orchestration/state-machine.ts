@@ -7,7 +7,7 @@
 //   - chama tools;
 //   - acessa `ctx`;
 //   - executa side-effects.
-// O dispatcher do proximo slice interpreta OrchestrationCommand no OpenCode.
+// O dispatcher interpreta OrchestrationCommand no runtime OpenCode.
 // Nenhum dos modulos de orchestration conhece `ctx`.
 
 import {

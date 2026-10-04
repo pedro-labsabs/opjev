@@ -147,8 +147,9 @@ Novas garantias desta rodada:
 
 ## Orchestration Kernel v1
 
-Kernel puro e deterministico do loop de orquestracao, **ainda NAO ligado ao
-runtime ativo** (nenhum hook/tool existente foi alterado). Vive em
+O kernel/state machine permanece puro e deterministico; o runtime ativo está
+integrado pelo dispatcher em `src/orchestration/dispatcher.ts` e pelos hooks
+em `index.ts` (estabilizado pela PR #32). Vive em
 `src/orchestration/` (`types.ts`, `judgement.ts`, `state-machine.ts`):
 
 - `ExecutionContract` (intencao, escopo, restricoes, acceptance criteria,
@@ -212,9 +213,12 @@ runtime ativo** (nenhum hook/tool existente foi alterado). Vive em
 - Transicoes invalidas (ex: `planning + EXECUTION_FINISHED`, `completed +
   VERDICT_RECEIVED`) falham deterministicamente com `OrchestrationError`.
 
-Proximo passo: dispatcher que executa os comandos no OpenCode
-(`ctx.session.*`), agentes `orchestrator`/`implementer`/`critic` via
-configuracao (`opencode.jsonc`) e a ligacao do loop aos hooks.
+O dispatcher executa esses comandos com as sessões OpenCode reais
+(`ctx.session.*`), mantendo worker, critic e orchestrator em papéis separados.
+
+O primeiro slice observacional de pressão de recursos (#3) usa o seam factual
+bounded do dispatcher. Veja [Resource/Budget Governor](docs/resource-budget-governor.md)
+para retenção, proveniência das estimativas e limites atuais.
 
 ## Uso
 

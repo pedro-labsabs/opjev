@@ -118,7 +118,7 @@ export function buildRoundJudgementQuestions(): RoundJudgementQuestions {
  *  - rosto da evidence (outcome, deterministicChecks, criticFindings, resultSummary);
  *  - previousVerdict (quando houver, para comparar progresso).
  * NUNCA: conversa completa, raw tool outputs, chain-of-thought nem prompts.
- * O dispatcher do proximo slice fara:
+ * O dispatcher runtime faz:
  *   state = buildRoundJudgementState(contract, evidence, previousVerdict)
  *   questions = buildRoundJudgementQuestions()
  * e enviara { state, questions } ao SystemOne — um formato canonico unico.

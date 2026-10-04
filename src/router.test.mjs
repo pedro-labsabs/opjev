@@ -321,10 +321,11 @@ describe("retry hook", () => {
   });
 
   it("6. throttle global nao causa troca inutil de modelo (sem Jev)", async () => {
+    const storage = makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] } });
     const m = await bootCtx({
       models: ALL_MODELS,
       session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
-      storage: makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] } }),
+      storage,
       options: PLUGIN_OPTS,
     });
     const stub = stubFetch(() => { throw new Error("nao deveria consultar o Jev"); });
@@ -341,16 +342,22 @@ describe("retry hook", () => {
       assert.deepEqual(ev.decision, { retry: true, delay: 5000 });
       assert.equal(m.calls.switchModel.length, 0, "throttle nao deve trocar modelo");
       assert.equal(stub.calls.length, 0, "throttle nao deve consultar o Jev");
+      for (let i = 0; i < 10 && !storage._map.get("resource/usage-ledger/v1"); i++) await new Promise(resolve => setTimeout(resolve, 0));
+      const observations = storage._map.get("resource/usage-ledger/v1")?.observations ?? [];
+      assert.equal(observations.some(x => x.kind === "throttle" && x.statusCode === 429), true, "429 real entra no ledger");
+      assert.equal(observations.some(x => x.kind === "retry" && x.retry === 2), true, "retry autorizado pelo runtime e observado");
+      assert.equal(JSON.stringify(observations).includes("rate limit exceeded for Zen free tier"), false, "erro bruto nao persiste");
     } finally {
       stub.restore();
     }
   });
 
   it("context overflow deixa compaction resolver (sem troca, sem Jev)", async () => {
+    const storage = makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] } });
     const m = await bootCtx({
       models: ALL_MODELS,
       session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
-      storage: makeStorage({ "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: [] } }),
+      storage,
       options: PLUGIN_OPTS,
     });
     const stub = stubFetch(() => { throw new Error("nao deveria consultar o Jev"); });
@@ -360,6 +367,8 @@ describe("retry hook", () => {
       assert.equal(ev.decision.retry, undefined, "overflow nao deve mutar decision");
       assert.equal(m.calls.switchModel.length, 0);
       assert.equal(stub.calls.length, 0);
+      for (let i = 0; i < 10 && !storage._map.get("resource/usage-ledger/v1"); i++) await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(storage._map.get("resource/usage-ledger/v1")?.observations.some(x => x.kind === "context-overflow"), true);
     } finally {
       stub.restore();
     }
