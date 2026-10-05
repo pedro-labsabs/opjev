@@ -2445,6 +2445,34 @@ describe("tool orchestrate_once: public description reflete #11 (DESC2)", () => 
 // ─────────────────────────── RCV. runtime recovery: repair-same / fresh-same ───────────────────────────
 
 describe("runtime recovery same-executor: repair-same e fresh-same (multi-round bounded)", () => {
+  it("recovery worker success is not recovered when Jev returns a non-accept verdict", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), stopAnswers()] });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+
+    assert.equal(result.phase, "stopped");
+    assert.equal(result.rounds[1].outcome, "succeeded");
+    assert.equal(result.rounds[1].verdict, "stop");
+    assert.notEqual(result.rounds[1].explanation.outcome, "recovered");
+    assert.match(result.rounds[1].explanation.recovery.outcome, /stop/);
+  });
+
+  it("recovery explanation never publishes arbitrary prior resultSummary text", async () => {
+    const marker = "WORKER_PRIVATE_RESULT_MARKER_7f93";
+    const t = fakeDeps({
+      judgeAnswersSeq: [repairAnswers(), stopAnswers()],
+      messages: [{ type: "assistant", content: [{ type: "text", text: marker }] }],
+    });
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+    });
+    const serializedExplanation = JSON.stringify(result.rounds[1].explanation);
+
+    assert.equal(result.rounds[0].resultSummary, marker);
+    assert.equal(serializedExplanation.includes(marker), false);
+  });
+
   it("RCV1: repair reutiliza a MESMA worker session (create 1x, prompt 2x em w1, agent/model iguais, round 2)", async () => {
     const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
     const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {

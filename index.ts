@@ -732,6 +732,7 @@ function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey
         model: d.model,
         via: d.via,
         route: d.route,
+        explanation: d.explanation,
         confidence: d.confidence,
         ...(d.overridden !== undefined ? { overridden: d.overridden } : {}),
         ...(d.error ? { error: d.error } : {}),
@@ -1344,6 +1345,7 @@ export default Plugin.define({
           return {
             content: JSON.stringify({
               route: d.route,
+        explanation: d.explanation,
               model: d.model,
               agent: d.agent,
               confidence: d.confidence,
