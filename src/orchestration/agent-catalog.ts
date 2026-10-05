@@ -174,7 +174,7 @@ export function checkDelegation(input: DelegationCheck): { allowed: boolean; rea
  * subagents sem tocar nas demais permissoes da sessao. Formato EXATO do
  * SessionCreateInput 2.0.7 (action "subagent", last-match-wins sobre o
  * allow-all base do app). Critic continua com a policy read-only propria
- * (buildCriticPermissionRules), que ja nega subagent entre outros.
+ * (the local execute-before role boundary denies every non-read tool).
  */
 export function buildImplementerPermissionRules(): Array<{ action: string; resource: string; effect: "deny" }> {
   return [{ action: SUBAGENT_ACTION, resource: "*", effect: "deny" }];

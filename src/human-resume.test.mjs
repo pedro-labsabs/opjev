@@ -762,6 +762,31 @@ describe("RESUME: runOrchestrationResume (scheduler compartilhado, seam unico)",
     assert.ok(!t.persistCalls.some((c, i) => i > hd && c.state.phase === "ready"), "nenhuma escrita ready apos a falha");
   });
 
+  it("RESUME4b: guarda maxRounds persiste run-failed e nao despacha worker", async () => {
+    const { t, state } = await pausedRun({ maxRounds: 3, judgeSeq: [humanAnswers()] });
+    const effectsBeforeResume = t.effects.length;
+    const persist = async (input) => {
+      t.persistCalls.push(input);
+      if (input.kind === "human-decision") {
+        // Simulate malformed resumed state reaching the scheduler after the
+        // validated human decision has been checkpointed.
+        input.state.round = input.state.contract.maxRounds + 1;
+      }
+    };
+
+    const result = await runOrchestrationResume(
+      { state, decision: resumeDecision(state) },
+      { ...resumeDeps(t), persist },
+    );
+
+    assert.equal(result.phase, "failed");
+    assert.match(result.error ?? "", /round budget exhausted/);
+    assert.equal(t.effects.slice(effectsBeforeResume).includes("create"), false, "guard nao despacha worker");
+    const last = t.persistCalls[t.persistCalls.length - 1];
+    assert.equal(last.kind, "run-failed", "ultima escrita representa a falha do scheduler");
+    assert.equal(last.state.phase, "failed");
+  });
+
   it("RESUME5: sem createRunState/selectExecutor — round/history/contract carregados do estado persistido", async () => {
     const { t, state } = await pausedRun({ maxRounds: 3, judgeSeq: [humanAnswers(), acceptAnswers()] });
     assert.equal(state.history.length, 1, "fixture tem a rodada pre-pausa");

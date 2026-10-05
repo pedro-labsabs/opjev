@@ -312,6 +312,21 @@ function readPluginKv(homeDir) {
   }
 }
 
+// A new E2E phase is an independent control-plane scenario. Reset only the
+// Issue #3 bounded telemetry ring so earlier phases cannot spend its budget.
+function clearResourceLedger(homeDir) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  if (!fs.existsSync(dbPath)) return 0;
+  const require = createRequire(import.meta.url);
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    const suffixes = [":resource/usage-ledger/v1", ":resource/throttle-retry/v1"];
+    const stmt = db.prepare("DELETE FROM kv WHERE key = ? OR substr(key, -length(?)) = ?");
+    return suffixes.reduce((count, suffix) => count + Number(stmt.run(suffix.slice(1), suffix, suffix).changes ?? 0), 0);
+  } finally { db.close(); }
+}
+
 // ==================================================================== E2E
 async function main() {
   if (!fs.existsSync(BIN)) {
@@ -672,8 +687,8 @@ async function main() {
     const nm = /Orquestracao[^"\\]{0,200}/.exec(noticeRes.text);
     orch.notice = nm ? nm[0] : "";
     assert(
-      "orchestrate: resultado PUBLICADO (notice synthetic) sem wake",
-      /Orquestracao/.test(orch.notice),
+      "orchestrate: resultado concluido e PUBLICADO sem resource-budget denial (notice synthetic; sem wake)",
+      /Orquestracao/.test(orch.notice) && !/resource-budget:/.test(orch.notice),
       orch.notice.slice(0, 160),
     );
 
@@ -821,6 +836,7 @@ async function main() {
   // prompt -> novo run permitido. Evidencia crua do storage do plugin.
   const fu = { sid: null, runA: null, runF: null, sid2: null, runB: null };
   try {
+    clearResourceLedger(homeDir);
     const FU_MSG = "msg_e2efollowup0001";
     const mark = gwEvents.length;
     const mk = await api("POST", "/api/session", {});
@@ -1092,6 +1108,7 @@ async function main() {
     const RPC_RE = '"type":"rpc-dispatched"';
     const normalBaseline = countFileMatches(gwLogPath, NORMAL_RE);
     const rpcBaseline = countFileMatches(gwLogPath, RPC_RE);
+    const tuiNoticeBaseline = countFileMatches(tuiCanaryPath, "ORCH_TUI_NOTICE");
     // Ordem ESTRUTURAL: ORCH primeiro (composer livre — nada executando),
     // ping normal depois. Isso elimina a corrida em que o submit do ORCH se
     // perdia com o composer ocupado pela execucao do ping.
@@ -1119,7 +1136,7 @@ async function main() {
             timeout_ms: 180000,
           },
         },
-        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", min_extra: 1, timeout_ms: 330000 } },
+        { wait_log: { file: tuiCanaryPath, regex: "ORCH_TUI_NOTICE", baseline: tuiNoticeBaseline, min_extra: 1, timeout_ms: 330000 } },
         // Prova DETERMINISTA da apresentacao: o driver so segue quando o render
         // real (toast) ja apareceu no dump do PTY. O assert required no fim
         // continua exigindo notice + identidade do run — apenas o harness deixa

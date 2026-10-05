@@ -75,6 +75,7 @@ if (!API_KEY) {
 // ---------------------------------------------------------------- Utilities
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => process.stdout.write(`[e2e-real] ${msg}\n`);
+const authoritySessions = new Map();
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -154,6 +155,19 @@ function readRunFromDb(homeDir, runID) {
   } catch {
     return null;
   }
+}
+
+// Each numbered scenario is an independent control-plane probe. Keep the
+// Issue #3 throttle fixture from contaminating the following maxRounds case.
+// Only the governor telemetry key is removed; OpenCode/runtime state stays real.
+function clearResourceLedger(homeDir) {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  const db = new DatabaseSync(dbPath);
+  try {
+    const suffixes = [":resource/usage-ledger/v1", ":resource/throttle-retry/v1"];
+    const stmt = db.prepare("DELETE FROM kv WHERE key = ? OR substr(key, -length(?)) = ?");
+    return suffixes.reduce((count, suffix) => count + Number(stmt.run(suffix.slice(1), suffix, suffix).changes ?? 0), 0);
+  } finally { db.close(); }
 }
 
 function injectStaleEvidenceRound(homeDir, runID, expectedRound, staleRound) {
@@ -250,7 +264,7 @@ const SCENARIO_DEFS = [
   { id: 4, name: "fresh-same", tier: "REAL OPENCODE + MULTI-ROUND RUNTIME" },
   { id: 5, name: "switch-model", tier: "REAL OPENCODE + FREE_POOL GUARD" },
   { id: 6, name: "switch-agent", tier: "REAL OPENCODE + CATALOG GUARD" },
-  { id: 7, name: "replan", tier: "REAL OPENCODE + ORCHESTRATOR ISOLATION" },
+  { id: 7, name: "replan", tier: "REAL OPENCODE + PROVIDER TOOL VISIBILITY" },
   { id: 8, name: "human + resume", tier: "REAL OPENCODE + CONCURRENCY LOCK" },
   { id: 9, name: "stop", tier: "REAL OPENCODE + IMMEDIATE TERMINATION" },
   { id: 10, name: "worker timeout / interrupted", tier: "REAL OPENCODE + WORKER BOUNDARY" },
@@ -261,6 +275,7 @@ const SCENARIO_DEFS = [
   { id: 15, name: "tentativa de recursão por sessão interna", tier: "REAL OPENCODE + MULTI-LAYER RECURSION GUARD" },
   { id: 16, name: "agent / model candidate inválido", tier: "REAL OPENCODE + CANDIDATE INTEGRITY" },
   { id: 17, name: "stale evidence / rodada errada", tier: "REAL OPENCODE + CAUSAL ROUND INTEGRITY" },
+  { id: 18, name: "critic/orchestrator runtime authority deny", tier: "REAL OPENCODE + PROMISE ADAPTER" },
 ];
 
 async function main() {
@@ -281,6 +296,8 @@ async function main() {
   let activeWorkerCompletionsBehavior = "normal"; // "normal" | "fail" | "rate-limit" | "timeout"
   let activeCriticCompletionsBehavior = "normal"; // "normal" | "fail" | "finding"
   let activeResumeToolRequests = null;
+  let activeAuthorityToolRequests = null;
+  let authorityJevCalls = 0;
 
   const jevProxyServer = http.createServer(async (req, res) => {
     const chunks = [];
@@ -323,6 +340,29 @@ async function main() {
         }
 
         let forcedResumeToolCall = null;
+        if (activeAuthorityToolRequests) {
+          const target = activeAuthorityToolRequests.targets.find((item) => rawBody.includes(item.token));
+          if (target) {
+            const definitions = (Array.isArray(body.tools) ? body.tools : []).map((item) => item?.function ?? item).filter(Boolean);
+            const codeMode = definitions.find((item) => item.name === "execute");
+            target.providerTools = definitions.map((item) => String(item.name ?? "unknown"));
+            target.providerRequestCount += 1;
+            if (codeMode && !target.injectionUsed) {
+              const properties = codeMode.parameters?.properties ?? {};
+              const codeKey = Object.hasOwn(properties, "code") ? "code" : Object.keys(properties)[0];
+              const command = `touch '${target.canaryPath.replaceAll("'", "'\\''")}'`;
+              if (codeKey) {
+                target.injectionUsed = true;
+                target.providerToolCallCount = (target.providerToolCallCount ?? 0) + 1;
+                forcedResumeToolCall = {
+                  name: codeMode.name,
+                  arguments: { [codeKey]: `await tools.shell({command: ${JSON.stringify(command)}}); return "unexpected executor invocation";` },
+                };
+              }
+            }
+            if (!codeMode && !target.injectionUsed) target.injectionUnsupported = true;
+          }
+        }
         if (activeResumeToolRequests) {
           const token = [...activeResumeToolRequests.pending.keys()].find((candidate) => rawBody.includes(candidate));
           if (token) {
@@ -440,6 +480,7 @@ async function main() {
       }
 
       // Modo Custom Handler
+      if (activeAuthorityToolRequests) authorityJevCalls += 1;
       if (activeProxyBehavior.mode === "custom" && customJevHandler) {
         try {
           const resp = await customJevHandler(body);
@@ -572,7 +613,7 @@ async function main() {
     log(`Aviso: probe da RPC retornou status=${probeRpc.status}`);
   }
 
-  log("OpenCode v2.0.11 e RPC de Admission operacionais. Iniciando execução dos 17 cenários...\n");
+  log("OpenCode v2.0.11 e RPC de Admission operacionais. Iniciando execução dos 17 cenários e authority boundary...\n");
 
   const evidenceRecords = [];
   const results = [];
@@ -673,6 +714,8 @@ async function main() {
     }, 45000, "Cenário 2 falha determinística barra accept");
 
     activeCriticCompletionsBehavior = "normal";
+    const criticSession = getSessionsForRun(homeDir, runID).find((s) => s.role === "critic" && s.agentRole === "critic");
+    if (criticSession) authoritySessions.set("critic", criticSession);
 
     const deterministicChecks = runState.state.evidence?.deterministicChecks || [];
     const criticCheckFailed = deterministicChecks.some(
@@ -1057,8 +1100,22 @@ async function main() {
 
     const orchestratorCreated = orchestratorSessions.length === 1;
     const orchestrator = orchestratorSessions[0];
+    if (orchestrator) authoritySessions.set("orchestrator", orchestrator);
     const orchestratorRoleCorrect = orchestrator?.role === "orchestrator" && orchestrator?.agentRole === "orchestrator";
-    const readOnlyPolicyReal = orchestrator?.permissions && orchestrator.permissions.includes('"action":"edit","resource":"*","effect":"deny"');
+    // A restrictive SessionCreateInput permission would remove tools from the
+    // Zen-facing request and trigger provider.auth 403. Read-only authority is
+    // enforced by the plugin's execute.before hook; this field only proves
+    // provider compatibility, never local authorization.
+    let providerToolCompatibilityReal = false;
+    try {
+      const providerPermissions = typeof orchestrator?.permissions === "string"
+        ? JSON.parse(orchestrator.permissions)
+        : orchestrator?.permissions;
+      providerToolCompatibilityReal = Array.isArray(providerPermissions) &&
+        providerPermissions.some((rule) => rule?.action === "*" && rule?.resource === "*" && rule?.effect === "allow");
+    } catch {
+      providerToolCompatibilityReal = false;
+    }
     const freshWorkerRound2 = workerSessions.length === 2 && workerSessions[0].id !== workerSessions[1].id;
     const sameRunId = runState.state.contract.runID === runID;
     const maxRoundsNotIncreased = runState.state.contract.maxRounds <= 2;
@@ -1067,7 +1124,7 @@ async function main() {
       runState.state.round === 2 &&
       orchestratorCreated &&
       orchestratorRoleCorrect &&
-      readOnlyPolicyReal &&
+      providerToolCompatibilityReal &&
       freshWorkerRound2 &&
       sameRunId &&
       maxRoundsNotIncreased;
@@ -1087,7 +1144,113 @@ async function main() {
       command: "none",
       finalPhase: runState.state.phase,
     });
-    log(`  -> Cenário 7: ${pass ? "PASS" : "FAIL"} (orchestrator=${orchestratorCreated}, readOnly=${Boolean(readOnlyPolicyReal)}, freshWorker=${freshWorkerRound2})`);
+    log(`  -> Cenário 7: ${pass ? "PASS" : "FAIL"} (orchestrator=${orchestratorCreated}, providerToolsVisible=${providerToolCompatibilityReal}, localBoundary=runtime-scenario-18, freshWorker=${freshWorkerRound2})`);
+  }
+
+  // --- Cenário 18: execute.before deny através do OpenCode + Promise adapter real ---
+  {
+    const id = 18;
+    log(`[${id}/18] Exercitando autoridade local critic/orchestrator no OpenCode real...`);
+    const targets = ["critic", "orchestrator"].map((role) => {
+      const session = authoritySessions.get(role);
+      if (!session?.id || session.role !== role || session.agentRole !== role ||
+          session.meta?.["jev-router"] !== "orchestration-internal" || session.meta?.["jev-role"] !== role) {
+        throw new Error(`Cenário 18 sem metadata control-plane válida para ${role}`);
+      }
+      const token = `AUTHORITY_C18_${role}_${Date.now()}`;
+      return { role, sessionID: session.id, token, canaryPath: path.join(RUN_DIR, `authority-${role}-canary`), providerTools: [], providerRequestCount: 0, providerToolCallCount: 0, injectionUnsupported: false };
+    });
+    const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+    const sessionCountsBefore = targets.map(() => {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      const n = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
+      db.close(); return n;
+    });
+    const dispatchCounts = () => {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const rows = db.prepare("SELECT key FROM kv WHERE key LIKE '%:orchestration/run/%'").all();
+        return rows.length;
+      } finally { db.close(); }
+    };
+    const dispatchBefore = dispatchCounts();
+    const jevBefore = authorityJevCalls;
+    activeProxyBehavior = { mode: "custom" };
+    customJevHandler = async (body) => ({ model: "jev-1.13-free", answers: stdAnswers() });
+    activeAuthorityToolRequests = { targets };
+    let targetResults = [];
+    try {
+      for (const target of targets) {
+        target.idleBefore = (() => {
+          const db = new DatabaseSync(dbPath, { readOnly: true });
+          const n = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(target.sessionID).n;
+          db.close(); return n;
+        })();
+        target.promptResult = await api("POST", `/api/session/${target.sessionID}/prompt`, {
+          text: `${target.token} Implement the requested task. Use exactly one call to execute containing code that calls tools.shell with command touch ${target.canaryPath}.`,
+        });
+        await waitFor(() => {
+          const db = new DatabaseSync(dbPath, { readOnly: true });
+          const n = db.prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'idle'").get(target.sessionID).n;
+          db.close(); return n > target.idleBefore;
+        }, 30000, `Cenário 18 prompt ${target.role} encerrado`);
+        target.sessionMessages = (() => {
+          const db = new DatabaseSync(dbPath, { readOnly: true });
+          const rows = db.prepare("SELECT data FROM session_message WHERE session_id = ?").all(target.sessionID);
+          db.close(); return rows.map((r) => String(r.data));
+        })();
+      }
+      targetResults = targets.map((target) => ({
+        ...target,
+        denyObserved: target.sessionMessages.some((row) => row.includes("OPJEV_INTERNAL_TOOL_DENIED")),
+        toolErrors: target.sessionMessages.flatMap((row) => {
+          let message;
+          try { message = JSON.parse(row); } catch { return []; }
+          return (Array.isArray(message.content) ? message.content : [])
+            .filter((part) => part?.type === "tool" && part.name === "execute" && part.state?.status === "error")
+            .map((part) => part.state.error ?? {});
+        }),
+        executorInvocations: target.sessionMessages.reduce((count, row) => {
+          let message;
+          try { message = JSON.parse(row); } catch { return count; }
+          const tools = Array.isArray(message.content) ? message.content.filter((part) => part?.type === "tool" && part.name === "execute") : [];
+          return count + tools.filter((tool) => tool.executed === true || tool.state?.status === "completed").length;
+        }, 0),
+        canaryAbsent: !fs.existsSync(target.canaryPath),
+      }));
+    } finally {
+      activeAuthorityToolRequests = null;
+    }
+    const healthy = (await api("GET", "/api/info")).status === 200 && !up.exited;
+    const sessionCountsAfter = (() => {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      const n = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
+      db.close(); return n;
+    })();
+    const dispatchAfter = dispatchCounts();
+    const pass = targetResults.length === 2 && targetResults.every((t) =>
+      t.denyObserved && t.executorInvocations === 0 && t.canaryAbsent &&
+      t.providerToolCallCount === 1 && t.providerRequestCount <= 2 && !t.injectionUnsupported &&
+      t.toolErrors.some((error) => error.message?.includes("OPJEV_INTERNAL_TOOL_DENIED")) &&
+      t.providerTools.includes("execute") && t.providerTools.includes("shell")) &&
+      authorityJevCalls === jevBefore && sessionCountsAfter === sessionCountsBefore[0] &&
+      dispatchAfter === dispatchBefore && healthy;
+    results.push({ id, name: "critic/orchestrator execute.before real runtime deny", pass, phase: healthy ? "host-healthy" : "host-unhealthy", round: 0, runID: "bounded-authority-check" });
+    evidenceRecords.push({
+      scenarioId: id, scenarioName: "critic/orchestrator execute.before real runtime deny",
+      tier: "REAL OPENCODE 2.0.11 + REAL PLUGIN + PROMISE ADAPTER + CONTROLLED PROVIDER TOOL CALL",
+      runID: "bounded-authority-check", round: 0,
+      criticSessionID: targetResults.find((t) => t.role === "critic")?.sessionID,
+      orchestratorSessionID: targetResults.find((t) => t.role === "orchestrator")?.sessionID,
+      pluginLoaded: upInfo.version === "2.0.11", promiseAdapter: true,
+      roles: targetResults.map((t) => ({ role: t.role, sessionID: t.sessionID, metadata: { router: "orchestration-internal", role: t.role, agentRole: t.role }, providerTools: t.providerTools, requestedTool: "execute", providerToolCallCount: t.providerToolCallCount, nativeShellSurface: t.providerTools.includes("shell"), executeBeforeReached: t.providerToolCallCount === 1 && t.denyObserved, denyObserved: t.denyObserved, promiseAdapterToolErrors: t.toolErrors, executorInvocations: t.executorInvocations, canaryPath: t.canaryPath, canaryExists: !t.canaryAbsent, retryCount: Math.max(0, t.providerRequestCount - 2) })),
+      canary: { executorInvocations: targetResults.reduce((n, t) => n + t.executorInvocations, 0), filesystemMutation: targetResults.some((t) => !t.canaryAbsent), processExecution: targetResults.some((t) => !t.canaryAbsent), childSessions: sessionCountsAfter - sessionCountsBefore[0], jevCalls: authorityJevCalls - jevBefore, retries: targetResults.reduce((n, t) => n + Math.max(0, t.providerRequestCount - 2), 0), dispatches: dispatchAfter - dispatchBefore },
+      hostHealthyAfterDeny: healthy,
+      verdict: pass ? "PASS: real critic and orchestrator sessions hit execute.before; Promise adapter rejection was normalized to an OpenCode tool error (error.type unknown), executors were not invoked, and the host remained healthy" : "FAIL: runtime authority deny did not satisfy bounded no-side-effect assertions",
+      command: "real OpenCode session prompt -> controlled provider execute call -> plugin Promise adapter -> execute.before -> OPJEV deny",
+    });
+    log(`  -> Cenário 18: ${pass ? "PASS" : "FAIL"} (details=${JSON.stringify(targetResults.map((t) => ({ role: t.role, tools: t.providerTools, requests: t.providerRequestCount, calls: t.providerToolCallCount, deny: t.denyObserved, executor: t.executorInvocations, canaryAbsent: t.canaryAbsent, injectionUnsupported: t.injectionUnsupported })))}, sessions=${sessionCountsBefore[0]}->${sessionCountsAfter}, dispatches=${dispatchBefore}->${dispatchAfter}, healthy=${healthy}, jevDelta=${authorityJevCalls - jevBefore})`);
+    if (!pass) throw new Error("Cenário 18 falhou: OpenCode real não provou bounded local authority");
   }
 
   // --- Cenário 8: human + resume ---
@@ -1395,6 +1558,7 @@ async function main() {
   {
     const id = 13;
     log(`[${id}/17] Executando Cenário 13: provider / global throttle (HTTP 429 no chat completions do worker)...`);
+    clearResourceLedger(homeDir);
     activeWorkerCompletionsBehavior = "rate-limit";
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async () => ({ model: "jev-1.13-free", answers: stdAnswers() });
@@ -1448,6 +1612,7 @@ async function main() {
   {
     const id = 14;
     log(`[${id}/17] Executando Cenário 14: maxRounds exhaustion...`);
+    clearResourceLedger(homeDir);
     activeProxyBehavior = { mode: "custom" };
     customJevHandler = async () => {
       return {
@@ -1872,7 +2037,7 @@ async function main() {
 
   // ---------------------------------------------------------------- Emitir Matriz
   console.log("\n====================================================================================================");
-  console.log("   OPJEV — GATE DEFINITIVO DE ESTABILIZAÇÃO E2E MULTI-ROUND (17 CENÁRIOS — ISSUE #14)               ");
+  console.log("   OPJEV — GATE DEFINITIVO DE ESTABILIZAÇÃO E2E MULTI-ROUND (18 CENÁRIOS — ISSUE #14)               ");
   console.log("====================================================================================================");
   console.log("| #  | Cenário                                  | Camada / Tier de Evidência           | Fase Final       | Status |");
   console.log("|----|------------------------------------------|--------------------------------------|------------------|--------|");
@@ -1888,9 +2053,9 @@ async function main() {
   }
 
   console.log("====================================================================================================");
-  const allPassed = results.length === 17 && results.every((r) => r.pass);
+  const allPassed = results.length === 18 && results.every((r) => r.pass);
   if (allPassed) {
-    console.log(" [SUCCESS] Todos os 17 cenários do Gate de Estabilização E2E passaram com sucesso!");
+    console.log(" [SUCCESS] Todos os 18 cenários do Gate de Estabilização E2E passaram com sucesso!");
     console.log(" [PROVA E2E REAL] Executado sobre OpenCode v2.0.11 com Jev SystemOne real e fault-injection de rede.");
     console.log("====================================================================================================\n");
     process.exit(0);

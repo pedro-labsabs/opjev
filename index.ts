@@ -27,7 +27,8 @@ import { OrchestrationError, validateExecutionContract, type ExecutionContract }
 import { createFollowupTakeSeam } from "./src/orchestration/followup.ts";
 import { validateResumableRunState } from "./src/orchestration/human-gate.ts";
 import { withResumeLock } from "./src/orchestration/resume-lock.ts";
-import { buildCriticPermissionRules, buildOrchestratorPermissionRules } from "./src/orchestration/readonly-policy.ts";
+import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./src/orchestration/readonly-policy.ts";
+import { enforceInternalToolAuthority, registerInternalToolSession, resolveInternalToolRole } from "./src/orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -38,6 +39,9 @@ import {
 } from "./src/orchestration/agent-catalog.ts";
 import { attemptKey } from "./src/orchestration/dispatcher.ts";
 import { createBoundedStorageObservationSink } from "./src/resource-governor/storage-sink.ts";
+import { evaluateResourceBudget } from "./src/resource-governor/runtime-policy.ts";
+import { latchQuotaLimit } from "./src/resource-governor/enforcement-state.ts";
+import { reserveThrottleRetry } from "./src/resource-governor/throttle-retry-budget.ts";
 import type { AgentCatalogEntry } from "./src/orchestration/agent-catalog.ts";
 import {
   OrchestrationResultRpc,
@@ -335,10 +339,13 @@ async function switchExecutor(
   route: RouteKind,
   model: string,
   agent: string,
+  eligibleModels?: string[],
 ): Promise<SwitchExecResult> {
   let validModel = model;
   if (!(await isModelAvailable(ctx, validModel))) {
-    const alt = await firstAvailable(ctx, chainFor(route).filter((m) => m !== validModel));
+    // Callers with a tried/failed allowlist keep that boundary through the
+    // final availability check; this helper must not widen it back to a lane.
+    const alt = await firstAvailable(ctx, (eligibleModels ?? chainFor(route)).filter((m) => m !== validModel));
     if (!alt) return { ok: false, model: validModel, agent, reason: "model-unavailable" };
     validModel = alt;
   }
@@ -531,6 +538,7 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
       if (!sessionID) {
         throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
       }
+      registerInternalToolSession(sessionID, "worker");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -560,11 +568,10 @@ function makeWorkerRuntime(ctx: any): WorkerRuntime {
 }
 
 /**
- * Runtime do critic: mesma API de sessao, mas a criacao injeta as permission
- * rules read-only (buildCriticPermissionRules) no `ctx.session.create` do
- * critic. Enforcement e do runtime OpenCode; o adapter apenas declara a
- * policy. O worker (makeWorkerRuntime) NUNCA recebe permission rules —
- * cria sem o campo, entao nao herda restricao do critic.
+ * Runtime do critic: anuncia toolset compativel ao provider. A autoridade
+ * read-only e aplicada localmente por `tool.execute.before`, que verifica
+ * metadata de role criada pelo dispatcher antes de qualquer tool side effect.
+ * Worker continua com sua permission boundary propria.
  */
 function makeCriticRuntime(ctx: any): CriticRuntime {
   return {
@@ -575,12 +582,13 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
         location: input.location,
         // Critic logico: mesma sessao kind critic, papel auditavel separado.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "critic" },
-        permissions: buildCriticPermissionRules(),
+        permissions: buildCriticProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
         throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
       }
+      registerInternalToolSession(sessionID, "critic");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -614,7 +622,8 @@ function makeCriticRuntime(ctx: any): CriticRuntime {
  * Canonical agent/model vindos do dispatcher (nunca selection hardcoded, nunca
  * escolha do planner); location atual; read-only (mesmo envelope do critic,
  * com execute=deny contra tools.jev.* e recursao); metadata com jev-role
- * orchestrator + jev-agent-role orchestrator. Nao registra agent novo.
+ * orchestrator + jev-agent-role orchestrator. Nao registra agent novo. O
+ * provider recebe o toolset compativel; enforcement read-only e local.
  */
 function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
   return {
@@ -624,12 +633,13 @@ function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
         model: input.model,
         location: input.location,
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "orchestrator" },
-        permissions: buildOrchestratorPermissionRules(),
+        permissions: buildOrchestratorProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) {
         throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
       }
+      registerInternalToolSession(sessionID, "orchestrator");
       return { sessionID };
     },
     async prompt({ sessionID, text, metadata }) {
@@ -883,6 +893,7 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
     orchestrator: makeOrchestratorRuntime(ctx),
     decisions: makeDispatcherDecisions(ctx, opts, getKey),
     persist: (p) => persistOrchestrationRun(ctx, p),
+    resourceBudget: (input) => evaluateResourceBudget(ctx.storage, input),
     observeResource: createBoundedStorageObservationSink(ctx, {
       get: async (key) => await safeStorageGet(ctx, key),
       set: async (key, value) => await ctx.storage.set(key, value),
@@ -912,9 +923,9 @@ function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: 
   };
 }
 
-function recordRuntimeResource(ctx: any, observation: Record<string, unknown>): void {
-  // Retry hooks must not wait on telemetry storage or change provider recovery.
-  void createBoundedStorageObservationSink(ctx, {
+function recordRuntimeResource(ctx: any, observation: Record<string, unknown>): Promise<void> {
+  // Ordinary retry telemetry is best effort; hard policy branches may await this bounded sink.
+  return createBoundedStorageObservationSink(ctx, {
     get: async (key) => await safeStorageGet(ctx, key),
     set: async (key, value) => await ctx.storage.set(key, value),
   })(observation).catch(() => {});
@@ -957,6 +968,15 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
   if (event?.status !== "error") return;
   const sessionID = String(event?.sessionID ?? "");
   if (!sessionID) return;
+  // Critic/orchestrator are evaluators/planners, never Jev decision clients.
+  // A local read-only denial must not turn into a Jev retry/recovery loop.
+  try {
+    const info: any = await ctx.session.get({ sessionID });
+    const role = resolveInternalToolRole(info?.metadata, sessionID);
+    if (role === "critic" || role === "orchestrator" || role === "ambiguous") return;
+  } catch {
+    return;
+  }
   const tool = String(event?.tool ?? "unknown");
   const message = String(event?.error?.message ?? event?.error ?? "");
   const errorClass = errorClassOf(message);
@@ -1057,10 +1077,14 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
       });
       const currentAgent = route?.agent ?? (snapshot.agent === "unknown" ? "build" : snapshot.agent);
       if (esk.model) {
-        const target = await firstAvailable(ctx, [esk.model, ...candidates]);
+        const eligibleModels = [
+          esk.model,
+          ...candidates.filter((model) => model !== failedRef && !tried.includes(model)),
+        ];
+        const target = await firstAvailable(ctx, eligibleModels);
         if (target) {
           // Mesma transacao do switch normal (valida antes, rollback best-effort).
-          const exec = await switchExecutor(ctx, sessionID, routeKind, target, currentAgent);
+          const exec = await switchExecutor(ctx, sessionID, routeKind, target, currentAgent, eligibleModels);
           if (exec.ok) {
             await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: exec.model, agent: exec.agent, chain: candidates });
             await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: exec.model });
@@ -1076,12 +1100,21 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
       // Qualquer agente que o runtime expose (ctx.agent.list) e elegivel.
       const next = agents.find((a) => a !== current);
       if (next) {
-        const currentModel = route?.model ?? (snapshot.model === "unknown" ? candidates[0] : snapshot.model);
-        const exec = await switchExecutor(ctx, sessionID, routeKind, currentModel, next);
-        if (exec.ok) {
-          await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: exec.model, agent: exec.agent, chain: candidates });
-          await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: exec.agent });
-          await ctx.storage.set(decidedKey, { at: Date.now(), action: `switch-agent:${exec.agent}` });
+        const currentModel = snapshot.model !== "unknown" ? snapshot.model : route?.model;
+        // switch-agent has authority over the agent only. Confirm the exact
+        // current model can be retained, then switch only the agent; never let
+        // switchExecutor widen this action into a model fallback.
+        let switched = false;
+        if (currentModel && await isModelAvailable(ctx, currentModel)) {
+          try {
+            await switchToAgent(ctx, sessionID, next);
+            switched = true;
+          } catch { /* failed agent switch leaves the recorded route unchanged */ }
+        }
+        if (switched) {
+          await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: currentModel, agent: next, chain: candidates });
+          await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: next });
+          await ctx.storage.set(decidedKey, { at: Date.now(), action: `switch-agent:${next}` });
         } else {
           await ctx.storage.set(decidedKey, { at: Date.now(), action: "switch-agent-failed" });
         }
@@ -1147,6 +1180,13 @@ export default Plugin.define({
     // Resolve por chamada (nao so no setup) para captar `export` ou
     // `/connect` feitos apos o load. resolveApiKey le a env primeiro.
     const getKey = () => resolveApiKey(ctx, opts.apiKeyEnv);
+
+    // Provider-compatible tools are still subject to local role authority.
+    // OpenCode 2.0.11 runs execute.before before item.execute; a thrown deny
+    // fails the tool call without invoking shell/write/MCP/other side effects.
+    await ctx.tool.hook("execute.before", async (event: any) => {
+      await enforceInternalToolAuthority(ctx, event);
+    });
 
     // Emissor do evento de apresentacao (presentation boundary, PR #27):
     // registro somete-eventos no mesmo seam RPC publico; `null` quando a
@@ -1364,13 +1404,16 @@ export default Plugin.define({
               next = esk.model;
             } else {
               via = "chain";
-              next = failed ? nextFallback(routeKind, failed) : chain[0];
+              // decideEscalation already filters failed and tried routes. A stop
+              // decision is terminal; never restart the chain as a side door.
+              next = undefined;
             }
           }
-          if (!next) return { content: "cadeia de fallback esgotada" };
-          // G3: valida o candidato escolhido (Jev/override/chain) no catalogo.
-          // Se nao estiver disponivel, usa o primeiro da cadeia que estiver.
-          const available = await firstAvailable(ctx, [next, ...chain]);
+          if (!next) return { content: `Fallback encerrado para a rota ${routeKind}: ${failed ? `falha em ${failed}; ` : ""}nenhum modelo elegivel e nao tentado permanece (tentados: ${tried.join(", ") || "nenhum"}). Habilite/configure outro provedor elegivel ou aguarde a cota/indisponibilidade antes de iniciar uma nova tentativa.` };
+          // Validate availability without silently selecting a failed/previously
+          // attempted route.
+          const eligibleModels = [next, ...chain.filter((m) => !tried.includes(m) && m !== failed)];
+          const available = await firstAvailable(ctx, eligibleModels);
           if (!available) {
             return { content: `nenhum modelo da rota ${routeKind} disponivel no catalogo (${next} indisponivel)` };
           }
@@ -1379,7 +1422,7 @@ export default Plugin.define({
           }
           // Mesma transacao do switch normal (valida antes, rollback best-effort).
           const currentAgent = stored?.agent ?? (snapshot.agent === "unknown" ? "build" : snapshot.agent);
-          const exec = await switchExecutor(ctx, sessionID, routeKind, available, currentAgent);
+          const exec = await switchExecutor(ctx, sessionID, routeKind, available, currentAgent, eligibleModels);
           if (!exec.ok) {
             const reason = exec.reason === "model-unavailable" ? "indisponivel no catalogo" : "switch-failed";
             return {
@@ -1706,22 +1749,54 @@ export default Plugin.define({
       };
       const errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
       if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
+        // Set the runtime boundary first, then establish the authoritative latch
+        // before this hook returns. The observation ledger remains best-effort.
+        event.decision = { retry: false };
+        try { await latchQuotaLimit(ctx.storage, Date.now()); } catch { /* in-process emergency latch stays active */ }
         recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
+        return;
       } else if (isContextOverflow(event?.error)) {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
       } else if (isGlobalThrottle(event?.error)) {
         const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
-        recordRuntimeResource(ctx, {
+        try {
+          const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+          if (!budget.allowed) {
+            event.decision = { retry: false };
+            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+            return;
+          }
+        } catch {
+          event.decision = { retry: false };
+          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+          return;
+        }
+        let retryAllowed = false;
+        let reservation = { allowed: false, retries: 0 };
+        try { reservation = await reserveThrottleRetry(ctx.storage, Date.now()); } catch { /* failed reservation denies */ }
+        retryAllowed = reservation.allowed;
+        // The shared reservation budget is the authoritative bounded throttle
+        // retry cap. Do not add a permanent per-session counter here: it would
+        // prevent recovery after the policy window expires.
+        if (!sessionID) retryAllowed = false;
+        const delay = Math.min(15000, Math.max(0, 5000 * (Number.isFinite(reservation.retries) ? Math.max(1, Math.floor(reservation.retries)) : 1)));
+        event.decision = retryAllowed ? { retry: true, delay } : { retry: false };
+        await recordRuntimeResource(ctx, {
           ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
           ...(Number.isFinite(status) ? { statusCode: status } : {}),
         });
-        event.decision = { retry: true, delay: 5000 };
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
+        if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
       }
+      // Provider 5xx and other ordinary failures keep the historical Jev
+      // escalation only when the authoritative resource policy grants it.
+      try {
+        const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+        if (!budget.allowed) { event.decision = { retry: false }; return; }
+      } catch { event.decision = { retry: false }; return; }
       if (!sessionID) return;
       const stored = (await safeStorageGet(ctx, `route/${sessionID}`)) as RouteState | undefined;
       // O modelo que REALMENTE falhou: o retry hook dispara imediatamente apos
@@ -1767,7 +1842,17 @@ export default Plugin.define({
         return;
       }
       // Guardrail: so troca para modelo disponivel no catalogo.
-      const candidates = [esk.model, ...chain];
+      try {
+        const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+        if (!budget.allowed) { event.decision = { retry: false }; return; }
+      } catch { event.decision = { retry: false }; return; }
+      // Retain the authorization made by decideEscalation through catalog
+      // validation. A listed failed model cannot re-enter as an availability
+      // fallback when Jev's selected model is unavailable.
+      const candidates = [
+        esk.model,
+        ...chain.filter((model) => model !== failedRef && !tried.includes(model)),
+      ];
       const valid = await firstAvailable(ctx, candidates);
       if (!valid) {
         await ctx.storage.set(`retry/${sessionID}`, { tried, at: Date.now() });
@@ -1800,8 +1885,10 @@ export default Plugin.define({
         recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         recordRuntimeResource(ctx, { ...resourceBase, kind: "escalation", failureDomain: "provider" });
       } catch {
-        event.decision = { retry: true, delay: 2000 };
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
+        // A failed transition must fail closed: retrying without persisted
+        // attempted-route state could repeat the same provider indefinitely.
+        event.decision = { retry: false };
+        recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", failureDomain: "provider" });
       }
     });
 

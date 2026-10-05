@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { UsageLedger, aggregateUsage, sanitizeObservation } from "./resource-governor/usage-ledger.ts";
 import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
 import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY, RESOURCE_LEDGER_CAPACITY, RESOURCE_LEDGER_PENDING_LIMIT } from "./resource-governor/storage-sink.ts";
+import { decideResourceBudget, RESOURCE_POLICY_WINDOW_MS } from "./resource-governor/budget-policy.ts";
+import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
+import { latchQuotaLimit, QUOTA_ENFORCEMENT_KEY, QUOTA_LATCH_TTL_MS } from "./resource-governor/enforcement-state.ts";
+import { reserveThrottleRetry, THROTTLE_RETRY_BUDGET_KEY, MAX_THROTTLE_RETRIES_PER_WINDOW } from "./resource-governor/throttle-retry-budget.ts";
 
 test("ledger has fixed retention, sanitizes payloads, and does not grow without bound", () => {
   const ledger = new UsageLedger({ capacity: 3 });
@@ -137,4 +141,95 @@ test("storage sink bounds pending writes during storage stalls", async () => {
   release();
   await Promise.all(pending);
   assert.equal(data.get(RESOURCE_LEDGER_KEY).observations.length, RESOURCE_LEDGER_PENDING_LIMIT);
+});
+
+test("budget policy is deterministic, preserves unknown, and never expands maxRounds", () => {
+  const unknown = estimateResourcePressure(aggregateUsage([], { from: 0, to: 1 }));
+  const a = decideResourceBudget({ pressure: unknown, maxRounds: 3, round: 1, stage: "new-round" });
+  assert.deepEqual(a, decideResourceBudget({ pressure: unknown, maxRounds: 3, round: 1, stage: "new-round" }));
+  assert.equal(a.allowed, true);
+  assert.equal(a.effectiveMaxRounds, 3);
+  assert.equal(a.reason.includes("normal"), false);
+  const storm = estimateResourcePressure(aggregateUsage(Array.from({ length: 5 }, (_, i) => ({ at: i, kind: "retry" })), { from: 0, to: 10 }));
+  const limited = decideResourceBudget({ pressure: storm, maxRounds: 2, round: 1, stage: "new-round" });
+  assert.equal(limited.allowed, false);
+  assert.ok(limited.effectiveMaxRounds <= 2);
+  assert.equal(RESOURCE_POLICY_WINDOW_MS, 900000);
+});
+
+test("quota and throttle policy deny additional spending without route authority", () => {
+  const quota = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "quota-limit" }], { from: 0, to: 2 }));
+  const denied = decideResourceBudget({ pressure: quota, hardQuotaLatch: true, maxRounds: 4, round: 1, stage: "jev-decision" });
+  assert.equal(denied.allowed, false);
+  assert.equal(decideResourceBudget({ pressure: quota, maxRounds: 4, round: 1, stage: "jev-decision" }).allowed, true, "observation alone is not the authoritative hard latch");
+  assert.equal("model" in denied, false);
+  const throttle = estimateResourcePressure(aggregateUsage(Array.from({ length: 3 }, (_, i) => ({ at: i, kind: "throttle" })), { from: 0, to: 4 }));
+  assert.equal(decideResourceBudget({ pressure: throttle, maxRounds: 4, round: 1, stage: "switch" }).allowed, false);
+  assert.equal(decideResourceBudget({ pressure: estimateResourcePressure(aggregateUsage([], { from: 0, to: 1 })), maxRounds: 4, round: 1, stage: "provider-retry" }).allowed, true);
+});
+
+test("moderate independent pressure lowers the effective round cap without choosing a switch", () => {
+  const rate = estimateResourcePressure(aggregateUsage([{ at: 1, kind: "throttle" }], { from: 0, to: 2 }));
+  const switchAllowed = decideResourceBudget({ pressure: rate, maxRounds: 5, round: 1, stage: "switch" });
+  assert.equal(switchAllowed.allowed, true);
+  assert.equal(switchAllowed.effectiveMaxRounds, 2);
+  assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 2, stage: "switch" }).allowed, false);
+  assert.equal(decideResourceBudget({ pressure: rate, maxRounds: 5, round: 3, stage: "new-round" }).allowed, false);
+});
+
+test("durable quota latch denies a later session even when the observation sink drops its ledger write", async () => {
+  const now = 50_000;
+  const storage = new Map();
+  const state = {
+    get: async key => storage.get(key),
+    set: async (key, value) => { if (key !== RESOURCE_LEDGER_KEY) storage.set(key, structuredClone(value)); },
+  };
+  await latchQuotaLimit(state, now);
+  const sink = createBoundedStorageObservationSink({}, state);
+  await sink({ at: now, kind: "quota-limit", errorCode: "FreeUsageLimitError", failureDomain: "quota" });
+  assert.equal(storage.has(RESOURCE_LEDGER_KEY), false, "best-effort factual write was dropped");
+  assert.deepEqual(storage.get(QUOTA_ENFORCEMENT_KEY), {
+    schema: 1, signal: "quota-limit", trippedAt: now, expiresAt: now + QUOTA_LATCH_TTL_MS,
+  });
+  const budget = await evaluateResourceBudget(state, { stage: "jev-decision", maxRounds: 3, round: 1 }, now + 1);
+  assert.equal(budget.allowed, false);
+  assert.equal(budget.basis.includes("quota-enforcement-latch"), true);
+  assert.equal("model" in budget, false);
+  const recovered = await evaluateResourceBudget(state, { stage: "jev-decision", maxRounds: 3, round: 1 }, now + QUOTA_LATCH_TTL_MS + 1);
+  assert.equal(recovered.allowed, true, "local latch expires after the documented heuristic TTL");
+});
+
+test("throttle retries are bounded per policy window and reset only after expiry", async () => {
+  const data = new Map();
+  const storage = { get: async key => data.get(key), set: async (key, value) => data.set(key, structuredClone(value)) };
+  const start = 1_000_000;
+  assert.deepEqual(await reserveThrottleRetry(storage, start), { allowed: true, retries: 1 });
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 1), { allowed: true, retries: 2 });
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 2), { allowed: false, retries: MAX_THROTTLE_RETRIES_PER_WINDOW });
+  assert.equal(data.get(THROTTLE_RETRY_BUDGET_KEY).retries, MAX_THROTTLE_RETRIES_PER_WINDOW);
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 900_000), { allowed: true, retries: 1 });
+});
+
+test("throttle retry budget fails closed on invalid state or storage failure", async () => {
+  const invalid = { get: async () => ({ windowStart: 10, retries: 99 }), set: async () => {} };
+  await assert.rejects(reserveThrottleRetry(invalid, 11), /invalid bounded throttle retry/);
+  const failedWrite = { get: async () => undefined, set: async () => { throw new Error("write unavailable"); } };
+  await assert.rejects(reserveThrottleRetry(failedWrite, 11), /write unavailable/);
+  const failedRead = { get: async () => { throw new Error("read unavailable"); }, set: async () => {} };
+  await assert.rejects(reserveThrottleRetry(failedRead, 11), /read unavailable/);
+});
+
+test("quota enforcement storage failures reject policy evaluation instead of granting budget", async () => {
+  const badRead = { get: async () => { throw new Error("unavailable"); }, set: async () => {} };
+  await assert.rejects(evaluateResourceBudget(badRead, { stage: "provider-retry", maxRounds: 1, round: 1 }));
+  let emergencyWrites = 0;
+  const badWrite = {
+    get: async () => undefined,
+    set: async () => { emergencyWrites += 1; throw new Error("write unavailable"); },
+  };
+  const syntheticNow = 1_000;
+  await assert.rejects(latchQuotaLimit(badWrite, syntheticNow));
+  assert.equal(emergencyWrites, 1);
+  const denied = await evaluateResourceBudget(badWrite, { stage: "provider-retry", maxRounds: 1, round: 1 }, syntheticNow + 1);
+  assert.equal(denied.allowed, false, "failed durable write retains an in-process hard deny");
 });

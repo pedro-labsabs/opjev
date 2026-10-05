@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "issue": 3,
+  "pullRequest": 34,
+  "classification": "PASS_FOR_MAINTAINER_REVIEW",
+  "branch": "feat/issue-3-adaptive-budget-policy",
+  "baseSha": "c5e4bed9b30b54ca1b378624bf339c229be87e38",
+  "testedHeadSha": "2d6e0b3203a819fba1c4a85ad837d97ab5fda2ca",
+  "executedAt": "2026-10-05",
+  "runtime": {
+    "openCode": "2.0.11",
+    "binary": "/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli",
+    "gatewayAuthentication": "authenticated environment; no credential value recorded"
+  },
+  "gates": {
+    "gateway": {
+      "status": "PASS",
+      "command": "OPENCODE_BIN=/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli npm run e2e:gateway",
+      "assertions": 55,
+      "passed": 55,
+      "failed": 0,
+      "partial": 0,
+      "artifactDirectory": "/tmp/opjev-e2e/runs/2026-10-05T22-23-40-928Z/",
+      "resultArtifact": "/tmp/opjev-e2e/runs/2026-10-05T22-23-40-928Z/e2e-result.json",
+      "resultArtifactSha256": "fbc3e9a32464145eebcc50c41d29aa8f947570221b66895aaeaefec5a41ee253",
+      "gatewayLogSha256": "76b22e0b6422f22e26f1593c6a3f24f996c863ef758d03c1802a03fe022c19ec",
+      "httpTraceSha256": "78796e056a118207417699edc1772c8f1c9e4cf57e8a1691f7175cb76c9930a0",
+      "notes": "Full harness bundle retained locally at artifactDirectory; raw traces are not copied into this report. Credential leak assertion passed."
+    },
+    "typecheck": {
+      "status": "PASS",
+      "command": "npm run typecheck"
+    },
+    "unit": {
+      "status": "PASS",
+      "command": "npm test",
+      "tests": 649,
+      "passed": 649,
+      "failed": 0,
+      "skipped": 0,
+      "suites": 101
+    },
+    "resourceGovernorAndRecovery": {
+      "status": "PASS",
+      "command": "node --test src/resource-governor.test.mjs src/dispatcher.test.mjs",
+      "tests": 226,
+      "passed": 226,
+      "failed": 0,
+      "skipped": 0
+    },
+    "matrix": {
+      "status": "PASS",
+      "command": "npm run e2e:matrix",
+      "scenarios": 17,
+      "passed": 17,
+      "failed": 0
+    },
+    "multiroundReal": {
+      "status": "PASS",
+      "command": "OPENCODE_BIN=/home/pedro/.config/ai.opencode.desktop/cli/2.0.11/opencode-cli npm run e2e:multiround-real",
+      "scenarios": 18,
+      "passed": 18,
+      "failed": 0,
+      "runtime": "OpenCode 2.0.11 with live Jev and controlled provider fault/tool-call boundary",
+      "artifact": "/tmp/opjev-e2e/multiround-real/2026-10-05-pr34-final/issue-14-real-e2e-evidence.json",
+      "artifactSha256": "be2581e59825b9fcd8fc25bbb1ce40f75f99fca2962830dd434b50d83a230d03"
+    },
+    "diffCheck": {
+      "status": "PASS",
+      "command": "git diff --check"
+    }
+  },
+  "invariantEvidence": {
+    "freePool": "unchanged at testedHeadSha",
+    "maxRounds": "not expanded; resource governor tests assert effectiveMaxRounds never exceeds the contract",
+    "hardBudget": "quota and throttle tests deny further spend before Jev/recovery stages",
+    "global429": "router and governor tests assert bounded retries with no model-switch or hidden fallback storm",
+    "criticOrchestrator": "read-only local execute.before boundary; unit canaries pass and fresh real multiround scenario 18 passes with no executor side effect or retry",
+    "workerApproval": "worker result remains evidence for external Jev judgement; dispatcher tests pass",
+    "deniedEvaluatorTool": "denial does not trigger hidden recovery/retry; real scenario 18 and dispatcher tests pass",
+    "evidencePacket": "bounded by field and array limits; contains structured summaries rather than raw conversation; gateway credential-leak assertion passed. The normalizer truncates strings but is not a generic secret-redaction filter.",
+    "policyChanges": "none"
+  },
+  "evidenceFreshness": {
+    "thisRun": "all listed gates executed against testedHeadSha on 2026-10-05",
+    "historical": "docs/reports/artifacts/issue-3-adaptive-budget-evidence.json remains unchanged and records earlier runs on older SHAs, including the earlier 51/55 throttled gateway run; it is not the source for the fresh 55/55 result"
+  },
+  "repositoryChanges": {
+    "runtimeOrPolicyCodeChanged": false,
+    "evidenceDocumentAdded": true,
+    "mergePerformed": false,
+    "pr36Touched": false
+  }
+}

@@ -478,13 +478,20 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
     assert.equal(out.phase, "completed");
     assert.equal(out.round, 2);
 
-    // Orquestrador foi criado como sessao read-only com role orchestrator
+    // Provider receives a compatible toolset; local hook retains read-only authority.
     const orchCreates = m.workerCalls.create.filter((c) => c.metadata?.["jev-role"] === "orchestrator");
     assert.equal(orchCreates.length, 1, "exatamente 1 sessao orchestrator criada");
     assert.ok(
-      orchCreates[0].permissions?.some((p) => p.effect === "deny" && p.action === "edit"),
-      "orchestrator possui politica read-only negando mutacao",
+      orchCreates[0].permissions?.some((p) => p.effect === "allow" && p.action === "*"),
+      "orchestrator anuncia tools ao provider para compatibilidade",
     );
+    const orchSession = [...m.workerSessions.values()].find((s) => s.metadata?.["jev-role"] === "orchestrator");
+    let sideEffects = 0;
+    await assert.rejects((async () => {
+      await m.hooks.tool["execute.before"]({ sessionID: orchSession.id, tool: "edit" });
+      sideEffects += 1;
+    })(), /OPJEV_INTERNAL_TOOL_DENIED/);
+    assert.equal(sideEffects, 0, "orchestrator mutating executor nao invocado");
   });
 
   // ─────────────────────────────────────────────────────────────────────────────

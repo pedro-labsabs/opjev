@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 2,
+  "scope": "Issue #3 adaptive/hard-budget policy slice and Zen free-tier tool visibility compatibility",
+  "baseSha": "c5e4bed9b30b54ca1b378624bf339c229be87e38",
+  "branch": "feat/issue-3-adaptive-budget-policy",
+  "headAtStart": "ee095267377666db143b9254b2998c9af43c9fe7",
+  "validatedHeadSha": "81a352675f524e2c0a4dfecea6b7aa7b956b402e",
+  "testedRuntimeSource": "Runtime and controlled E2E harness were tested from commit 81a352675f524e2c0a4dfecea6b7aa7b956b402e on OpenCode 2.0.11. The runtime deny raises @opencode/schema Tool.Error; the real Promise adapter serializes the rejection as an OpenCode tool error with type=unknown. The E2E records that representation rather than claiming typed Tool.Error propagation.",
+  "testHarnessHeadSha": "81a352675f524e2c0a4dfecea6b7aa7b956b402e",
+  "executedAt": "2026-10-04",
+  "runtime": {
+    "openCode": "2.0.11",
+    "authProvenance": "env-present",
+    "jev": "live SystemOne for multiround-real; controlled boundary for injected failures"
+  },
+  "rootCause": {
+    "historicalProviderThrottle": "Earlier gateway runs recorded real 429s and resource-budget:rate-high. Those runs remain valid evidence of provider throttling; the governor correctly stopped additional spend.",
+    "authenticatedBlocker": "A later authenticated run no longer showed the old rate-high symptom. It instead exposed provider.auth 403 stating that the OpenCode free tier could only be used within OpenCode; internal critic/orchestrator tool restrictions were removing tools from the provider-facing request.",
+    "correction": "Critic and orchestrator sessions now advertise the Zen-compatible toolset. Their local authority remains a fail-closed execute.before boundary using control-plane session metadata; only read/glob/grep execute for these roles. Worker keeps its own permission boundary.",
+    "upstreamContext": "OpenCode issues anomalyco/opencode#50627 and #49723 were cited as matching upstream reports. They are upstream context, not OPJEV runtime evidence.",
+    "currentGatewayObservation": "The authenticated gateway run below passed all 55 assertions; no provider.auth 403, 429/529, or resource-budget denial was observed in the run summary."
+  },
+  "testReconciliation": {
+    "previousBaseline": 632,
+    "finalTotal": 641,
+    "addedSecurityTests": 9,
+    "baselineTestsRemoved": 0,
+    "baselineTestsSkipped": 0,
+    "skippedFinal": 0,
+    "explanation": "The initial working tree had replaced six readonly-policy tests with one, leaving a new nine-case suite outside npm test's glob; this accounted for the 632-to-627 drop. The six policy cases are restored/reworked in src/readonly-policy.test.mjs, and all nine tool-authority tests now reside in src/tool-authority.test.mjs and run under npm test."
+  },
+  "gates": {
+    "typecheck": {
+      "status": "PASS",
+      "command": "npm run typecheck"
+    },
+    "unit": {
+      "status": "PASS",
+      "command": "npm test",
+      "tests": 641,
+      "passed": 641,
+      "failed": 0,
+      "skipped": 0,
+      "baselineRemoved": 0
+    },
+    "matrix": {
+      "status": "PASS",
+      "command": "npm run e2e:matrix",
+      "scenarios": 17,
+      "passed": 17,
+      "failed": 0
+    },
+    "gateway": {
+      "status": "FAIL_ON_LATEST_HEAD",
+      "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:gateway",
+      "latestAssertions": 55,
+      "latestPassed": 51,
+      "latestFailed": 4,
+      "latestProviderAuth403": false,
+      "latestProviderThrottle429": true,
+      "latestResourceBudgetDenial": true,
+      "latestArtifact": "/tmp/opjev-e2e/runs/2026-10-04T19-32-05-220Z/e2e-result.json",
+      "latestFailure": "Repeated real Zen HTTP 429 throttles on worker/critic caused Resource Governor rate-high denial; dependent follow-up-consumption assertions failed. No ledger/governor bypass was applied.",
+      "lastKnownGreenBeforeThisChange": {
+        "status": "PASS",
+        "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:gateway (launched from bash -ic; OPENCODE_API_KEY was present)",
+        "authProvenance": "env-present",
+        "assertions": 55,
+        "passed": 55,
+        "failed": 0,
+        "providerAuth403": false,
+        "resourceBudgetDenial": false,
+        "realTui": true,
+        "pluginLoaded": true,
+        "parentExecs": 0,
+        "uniqueDispatch": true,
+        "followupConsumedExactlyOnce": true,
+        "sessionIsolation": true,
+        "inboxPatchWake": false,
+        "credentialLeakAssertion": "PASS",
+        "artifactDirectory": "/tmp/opjev-e2e/runs/2026-10-04T15-29-00-668Z/",
+        "artifact": "/tmp/opjev-e2e/runs/2026-10-04T15-29-00-668Z/e2e-result.json"
+      },
+      "latestAttemptAt": "2026-10-04T19-32:05Z"
+    },
+    "multiroundReal": {
+      "status": "PASS",
+      "command": "OPENCODE_BIN=/tmp/opencode-2.0.11/node_modules/@opencode/cli-linux-x64/bin/opencode npm run e2e:multiround-real",
+      "scenarios": 18,
+      "passed": 18,
+      "failed": 0,
+      "runtime": "OpenCode 2.0.11; live Jev SystemOne + controlled provider fault/tool-call boundary",
+      "scenario7": "Provider tool visibility remains real and compatible; scenario 18 independently proves local execute.before authority at runtime.",
+      "artifact": "docs/reports/artifacts/issue-14-real-e2e-evidence.json",
+      "artifactExecutedAt": "2026-10-04T19:28:11.674Z",
+      "artifactHeadSha": "81a352675f524e2c0a4dfecea6b7aa7b956b402e"
+    },
+    "diffCheck": {
+      "status": "PASS",
+      "command": "git diff --check"
+    }
+  },
+  "securityEvidence": {
+    "localBoundary": "Runtime E2E scenario 18 uses real critic/orchestrator sessions, real OPJEV server plugin, @opencode/plugin 2.0.7 Promise adapter, real OpenCode tool registry, and controlled provider execute tool calls. OPJEV raises @opencode/schema Tool.Error. The Promise adapter wraps callback promises in Effect.promise; OpenCode records the rejection as tool error type=unknown, with executed=false. Both sessions complete, the host stays healthy, and no canary, worker, Jev call, retry storm, or dispatch occurs. This is runtime evidence of enforced denial; it does not claim typed Tool.Error propagation through the adapter.",
+    "canaryTests": "src/tool-authority.test.mjs and adapter hook tests call the registered boundary before a canary executor and assert zero invocation for shell, edit/write, subagent/task, execute/code, question, web and unknown tools; orchestrator has the same rule. Worker isolation and ambiguous/missing control-plane metadata fail-closed cases are covered.",
+    "gatewayScope": "The gateway E2E proves the plugin was loaded and the real orchestration/follow-up/TUI path completed. It did not ask a live model to attempt a forbidden critic/orchestrator tool call; the explicit zero-executor canaries are deterministic local hook tests.",
+    "runtimeArtifact": "docs/reports/artifacts/issue-14-real-e2e-evidence.json (scenarioId 18; head 81a352675f524e2c0a4dfecea6b7aa7b956b402e)",
+    "providerCompatibility": "Separately proven through the real gateway; provider visibility does not grant local execution authority."
+  },
+  "limitations": [
+    "Provider quota reset times and remaining quota are unavailable; Issue #3 uses a local 15-minute heuristic window, not a provider reset claim.",
+    "The serialized throttle reservation is process-local and does not provide cross-process atomicity.",
+    "The evaluator tool boundary depends on OpenCode 2.0.11 execute.before behavior and control-plane session metadata; unknown internal state fails closed.",
+    "No fan-out telemetry is fabricated. Issue #3 remains open for maintainer evaluation against all remaining criteria.",
+    "OpenCode 2.0.7 Promise adapter converts the rejected Tool.Error to an OpenCode tool error with type=unknown. The runtime E2E proves this is bounded and non-fatal in OpenCode 2.0.11 (executor skipped, host healthy); typed Tool.Error propagation is not preserved by this adapter path.",
+    "Latest gateway reruns on tested HEAD observed real provider 429 throttles and Resource Governor denial (51/55); the previously accepted 55/55 artifact is retained under lastKnownGreenBeforeThisChange. No provider.auth 403 appeared."
+  ],
+  "secretsIncluded": false,
+  "evidenceClassifications": {
+    "providerCompatibility": {
+      "surface": "gateway real",
+      "scope": "Provider-facing tool compatibility and admission/follow-up gateway behavior",
+      "latestArtifact": "/tmp/opjev-e2e/runs/2026-10-04T19-23-19-030Z/e2e-result.json",
+      "latestResult": "51/55; 429 throttles observed; provider.auth 403 absent"
+    },
+    "localAuthorityUnit": {
+      "surface": "deterministic unit canaries",
+      "scope": "Role metadata, fail-closed unknown tools, no executor invocation",
+      "tests": "src/tool-authority.test.mjs and src/readonly-policy.test.mjs"
+    },
+    "localAuthorityRuntime": {
+      "surface": "OpenCode 2.0.11 real E2E scenario 18",
+      "scope": "Real critic and orchestrator sessions -> controlled execute calls -> OPJEV execute.before -> denied before executor",
+      "artifact": "docs/reports/artifacts/issue-14-real-e2e-evidence.json#scenario-18"
+    }
+  }
+}
