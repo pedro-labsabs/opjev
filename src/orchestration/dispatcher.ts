@@ -33,6 +33,7 @@ import { validateResumableRunState } from "./human-gate.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
+import { sanitizeDecisionExplanation, type DecisionExplanation } from "./decision-explanation.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
 import {
@@ -138,6 +139,7 @@ export interface ExecutorSelection {
   confidence?: number;
   overridden?: boolean;
   error?: string;
+  explanation?: DecisionExplanation;
 }
 
 export interface DispatcherDecisions {
@@ -187,6 +189,8 @@ export interface RoundProjection {
   model: string;
   outcome: ExecutionOutcome;
   resultSummary: string;
+  /** Structured explanation for non-initial recovery rounds. */
+  explanation?: DecisionExplanation;
 }
 
 export interface DispatcherDeps {
@@ -1460,6 +1464,21 @@ async function executeSchedule(
       model: out.worker.model,
       outcome: out.worker.outcome,
       resultSummary: out.evidence.resultSummary,
+      ...(mode !== "initial" ? {
+        explanation: sanitizeDecisionExplanation({
+          category: "recovery",
+          outcome: out.worker.outcome === "succeeded" ? "recovered" : "continued",
+          selected: { agent: out.worker.agent, model: out.worker.model },
+          reason: mode === "switch-model" || mode === "switch-agent"
+            ? `Fallback selection ${mode} was made after the prior executor outcome: ${(prev?.evidence.resultSummary ?? "prior executor outcome").slice(0, 240)}`
+            : `Recovery round ${mode} executed after a prior round outcome: ${(prev?.evidence.resultSummary ?? "prior executor outcome").slice(0, 240)}`,
+          recovery: {
+            action: mode,
+            outcome: out.worker.outcome === "succeeded" ? "Recovery worker succeeded." : "Recovery worker completed; orchestration continues.",
+            route: { agent: out.worker.agent, model: out.worker.model },
+          },
+        }),
+      } : {}),
     };
     rounds.push(projection);
     last = out;

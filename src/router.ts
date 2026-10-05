@@ -15,6 +15,7 @@ import {
   type JevScoreAnswer,
 } from "./jev-client.ts";
 import type { DecisionSnapshot } from "./snapshot.ts";
+import { sanitizeDecisionExplanation, type DecisionExplanation } from "./orchestration/decision-explanation.ts";
 
 export interface RouteDecision {
   route: RouteKind;
@@ -28,6 +29,8 @@ export interface RouteDecision {
   overridden?: boolean;
   /** Escolha bruta do Jev quando rejeitada pelos guardrails (auditoria). */
   attemptedAgent?: string;
+  /** Structured, privacy-safe rationale for the selected route. */
+  explanation?: DecisionExplanation;
 }
 
 const ROUTES: RouteKind[] = ["fast-coding", "heavy-reasoning", "research-docs"];
@@ -64,6 +67,13 @@ export function heuristicRoute(prompt: string): RouteDecision {
     risky: /delet|drop|prod(ucao|uction)|auth|secret|infra|migrat/.test(p),
     complexity: heavy ? 2 : research ? 1 : 0,
     via: "heuristic",
+    explanation: sanitizeDecisionExplanation({
+      category: "routing",
+      outcome: "selected",
+      selected: { lane: route, agent, model: FALLBACK_CHAIN[route][0] },
+      reason: "Selected by deterministic heuristic routing.",
+      evidence: [{ name: "routing-method", result: "met", detail: "heuristic" }],
+    }),
   };
 }
 
@@ -177,6 +187,18 @@ export async function decideRoute(input: {
       // Rota invalida: fallback heuristico mantem via/error para diagnostico.
       const fb = heuristicRoute(input.prompt);
       fb.error = decisionError;
+      fb.explanation = sanitizeDecisionExplanation({
+        category: "fallback",
+        outcome: "selected",
+        selected: { lane: fb.route, agent: fb.agent, model: fb.model },
+        reason: "Invalid route choice; deterministic heuristic fallback selected.",
+        fallback: {
+          rejected: { lane: "jev-route" },
+          reason: "invalid-route-choice",
+          selected: { lane: fb.route, agent: fb.agent, model: fb.model },
+        },
+        evidence: [{ name: "route-choice-validation", result: "ineligible", detail: "invalid choice" }],
+      });
       return fb;
     }
 
@@ -190,10 +212,36 @@ export async function decideRoute(input: {
       via: "jev",
       overridden,
       ...(attemptedAgent !== undefined ? { attemptedAgent } : {}),
+      explanation: sanitizeDecisionExplanation({
+        category: "routing",
+        outcome: "selected",
+        selected: { lane: route, agent, model },
+        reason: overridden ? "Jev route adjusted to satisfy routing guardrails." : "Route selected from valid Jev choices.",
+        evidence: [
+          { name: "agent-eligibility", result: agentChoice && agentChoice.type === "choice" && isAgent(agentChoice.choice, validAgents) ? "eligible" : "ineligible", detail: `available-agents=${validAgents.length}` },
+          { name: "model-eligibility", result: modelChoice && modelChoice.type === "choice" && isFreeCandidate(modelChoice.choice, candidates) ? "eligible" : "ineligible", detail: `free-candidates=${candidates.length}` },
+          { name: "confidence-threshold", result: confidence >= input.confidenceThreshold ? "met" : "unmet", detail: `threshold=${input.confidenceThreshold}` },
+          { name: "risk-and-complexity-guardrails", result: wasUpgraded ? "unmet" : "met", detail: `risky=${risky}; complexity=${complexity}` },
+        ],
+      }),
     };
   } catch (err) {
     const fallback = heuristicRoute(input.prompt);
+    // Keep the public error for existing diagnostics, but explanation metadata
+    // uses a fixed safe category rather than forwarding arbitrary exception text.
     fallback.error = err instanceof Error ? err.message : String(err);
+    fallback.explanation = sanitizeDecisionExplanation({
+      category: "fallback",
+      outcome: "selected",
+      selected: { lane: fallback.route, agent: fallback.agent, model: fallback.model },
+      reason: "Jev route decision unavailable; deterministic heuristic fallback selected.",
+      fallback: {
+        rejected: { lane: "jev-route" },
+        reason: "decision-unavailable",
+        selected: { lane: fallback.route, agent: fallback.agent, model: fallback.model },
+      },
+      evidence: [{ name: "decision-service", result: "unknown", detail: "heuristic fallback" }],
+    });
     return fallback;
   }
 }
