@@ -33,6 +33,7 @@ import { validateResumableRunState } from "./human-gate.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
+import { sanitizeDecisionExplanation, type DecisionExplanation } from "./decision-explanation.ts";
 import { buildReplanPrompt, parseRevisedContract } from "./replan.ts";
 import { isFreeModel, splitModelRef } from "../config.ts";
 import {
@@ -138,6 +139,7 @@ export interface ExecutorSelection {
   confidence?: number;
   overridden?: boolean;
   error?: string;
+  explanation?: DecisionExplanation;
 }
 
 export interface DispatcherDecisions {
@@ -187,6 +189,8 @@ export interface RoundProjection {
   model: string;
   outcome: ExecutionOutcome;
   resultSummary: string;
+  /** Structured explanation for non-initial recovery rounds. */
+  explanation?: DecisionExplanation;
 }
 
 export interface DispatcherDeps {
@@ -1460,6 +1464,36 @@ async function executeSchedule(
       model: out.worker.model,
       outcome: out.worker.outcome,
       resultSummary: out.evidence.resultSummary,
+      ...(mode !== "initial" ? {
+        explanation: sanitizeDecisionExplanation({
+          category: "recovery",
+          outcome: out.verdict.nextAction === "accept" && out.state.phase === "completed"
+            ? "recovered"
+            : out.state.phase === "stopped"
+              ? "stopped"
+              : out.state.phase === "awaiting-human"
+                ? "awaiting-human"
+                : out.state.phase === "failed"
+                  ? "failed"
+                  : "continued",
+          selected: { agent: out.worker.agent, model: out.worker.model },
+          reason: `Recovery round ${mode} evaluated; Jev verdict: ${out.verdict.nextAction}.`,
+          evidence: [
+            { name: "failure-class", result: "unknown", detail: out.verdict.failureClass },
+            { name: "jev-next-action", result: out.verdict.nextAction === "accept" ? "met" : "unmet", detail: out.verdict.nextAction },
+            { name: "kernel-phase", result: out.state.phase === "completed" ? "met" : "unmet", detail: out.state.phase },
+            { name: "worker-outcome", result: out.worker.outcome === "succeeded" ? "met" : "unmet", detail: out.worker.outcome },
+            ...out.evidence.deterministicChecks
+              .filter((check) => ["worker-session-outcome", "worker-final-response", "critic-session-outcome"].includes(check.name))
+              .map((check) => ({ name: check.name, result: check.status === "pass" ? "met" as const : "unmet" as const, detail: check.status })),
+          ],
+          recovery: {
+            action: mode,
+            outcome: `Jev verdict ${out.verdict.nextAction}; kernel phase ${out.state.phase}.`,
+            route: { agent: out.worker.agent, model: out.worker.model },
+          },
+        }),
+      } : {}),
     };
     rounds.push(projection);
     last = out;
