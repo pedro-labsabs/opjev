@@ -4,6 +4,8 @@
 export type DecisionCategory = "routing" | "fallback" | "recovery";
 
 const MAX_DECISION_TEXT = 240;
+/** Maximum number of allowlisted evidence entries retained per explanation. */
+export const DECISION_EXPLANATION_LIMITS = { evidenceItems: 8 } as const;
 const SECRET_ASSIGNMENT = /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization)\b\s*[:=]\s*([^\s,;]+)/gi;
 const BEARER_CREDENTIAL = /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi;
 const COMMON_CREDENTIAL = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/g;
@@ -19,27 +21,6 @@ export function sanitizeDecisionText(value: unknown): string {
     .slice(0, MAX_DECISION_TEXT);
 }
 
-/** Construct a defensive copy containing only sanitized, bounded metadata. */
-export function sanitizeDecisionExplanation<T extends DecisionExplanation>(explanation: T): T {
-  const route = (value?: DecisionRoute): DecisionRoute | undefined => value && ({
-    ...(value.lane ? { lane: sanitizeDecisionText(value.lane) } : {}),
-    ...(value.agent ? { agent: sanitizeDecisionText(value.agent) } : {}),
-    ...(value.model ? { model: sanitizeDecisionText(value.model) } : {}),
-  });
-  const fallback = (value?: DecisionFallbackContext): DecisionFallbackContext | undefined => value && ({
-    ...(value.rejected ? { rejected: route(value.rejected) } : {}),
-    reason: sanitizeDecisionText(value.reason),
-    ...(value.selected ? { selected: route(value.selected) } : {}),
-  });
-  return {
-    ...explanation,
-    reason: sanitizeDecisionText(explanation.reason),
-    ...(explanation.selected ? { selected: route(explanation.selected) } : {}),
-    ...(explanation.evidence ? { evidence: explanation.evidence.map(item => ({ ...item, name: sanitizeDecisionText(item.name), ...(item.detail ? { detail: sanitizeDecisionText(item.detail) } : {}) })) } : {}),
-    ...(explanation.fallback ? { fallback: fallback(explanation.fallback) } : {}),
-    ...(explanation.recovery ? { recovery: { ...explanation.recovery, action: sanitizeDecisionText(explanation.recovery.action), outcome: sanitizeDecisionText(explanation.recovery.outcome), ...(explanation.recovery.route ? { route: route(explanation.recovery.route) } : {}), ...(explanation.recovery.fallback ? { fallback: fallback(explanation.recovery.fallback) } : {}) } } : {}),
-  };
-}
 export type DecisionOutcome = "selected" | "rejected" | "recovered" | "failed" | "continued" | "stopped" | "awaiting-human";
 
 /** Identifiers for the route considered or selected (task lane and executor). */
@@ -92,4 +73,87 @@ export interface DecisionExplanation {
   fallback?: DecisionFallbackContext;
   /** Present for recovery decisions. */
   recovery?: DecisionRecoveryContext;
+}
+
+const DECISION_CATEGORIES: readonly DecisionCategory[] = ["routing", "fallback", "recovery"];
+const DECISION_OUTCOMES: readonly DecisionOutcome[] = ["selected", "rejected", "recovered", "failed", "continued", "stopped", "awaiting-human"];
+const DECISION_EVIDENCE_RESULTS: readonly DecisionEvidence["result"][] = ["met", "unmet", "eligible", "ineligible", "unknown"];
+
+function inputRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`invalid decision explanation ${label}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function decisionCategory(value: unknown): DecisionCategory {
+  if (typeof value === "string" && DECISION_CATEGORIES.includes(value as DecisionCategory)) return value as DecisionCategory;
+  throw new TypeError("invalid decision explanation category");
+}
+
+function decisionOutcome(value: unknown): DecisionOutcome {
+  if (typeof value === "string" && DECISION_OUTCOMES.includes(value as DecisionOutcome)) return value as DecisionOutcome;
+  throw new TypeError("invalid decision explanation outcome");
+}
+
+function evidenceResult(value: unknown): DecisionEvidence["result"] {
+  if (typeof value === "string" && DECISION_EVIDENCE_RESULTS.includes(value as DecisionEvidence["result"])) return value as DecisionEvidence["result"];
+  throw new TypeError("invalid decision explanation evidence result");
+}
+
+function sanitizeRoute(value: unknown, label: string): DecisionRoute {
+  const input = inputRecord(value, label);
+  const route: DecisionRoute = {};
+  if (typeof input.lane === "string" && input.lane) route.lane = sanitizeDecisionText(input.lane);
+  if (typeof input.agent === "string" && input.agent) route.agent = sanitizeDecisionText(input.agent);
+  if (typeof input.model === "string" && input.model) route.model = sanitizeDecisionText(input.model);
+  return route;
+}
+
+function sanitizeFallback(value: unknown, label: string): DecisionFallbackContext {
+  const input = inputRecord(value, label);
+  const fallback: DecisionFallbackContext = { reason: sanitizeDecisionText(input.reason) };
+  if (input.rejected !== undefined) fallback.rejected = sanitizeRoute(input.rejected, `${label}.rejected`);
+  if (input.selected !== undefined) fallback.selected = sanitizeRoute(input.selected, `${label}.selected`);
+  return fallback;
+}
+
+function sanitizeRecovery(value: unknown): DecisionRecoveryContext {
+  const input = inputRecord(value, "recovery");
+  const recovery: DecisionRecoveryContext = {
+    action: sanitizeDecisionText(input.action),
+    outcome: sanitizeDecisionText(input.outcome),
+  };
+  if (input.route !== undefined) recovery.route = sanitizeRoute(input.route, "recovery.route");
+  if (input.fallback !== undefined) recovery.fallback = sanitizeFallback(input.fallback, "recovery.fallback");
+  return recovery;
+}
+
+/** Project only the canonical, sanitized, bounded decision explanation schema. */
+export function sanitizeDecisionExplanation(explanation: DecisionExplanation): DecisionExplanation {
+  const input = inputRecord(explanation, "object");
+  const sanitized: DecisionExplanation = {
+    category: decisionCategory(input.category),
+    outcome: decisionOutcome(input.outcome),
+    reason: sanitizeDecisionText(input.reason),
+  };
+
+  if (input.selected !== undefined) sanitized.selected = sanitizeRoute(input.selected, "selected");
+  if (input.evidence !== undefined) {
+    if (!Array.isArray(input.evidence)) throw new TypeError("invalid decision explanation evidence");
+    sanitized.evidence = input.evidence
+      .slice(0, DECISION_EXPLANATION_LIMITS.evidenceItems)
+      .map((item, index) => {
+        const evidence = inputRecord(item, `evidence[${index}]`);
+        const projected: DecisionEvidence = {
+          name: sanitizeDecisionText(evidence.name),
+          result: evidenceResult(evidence.result),
+        };
+        if (evidence.detail !== undefined) projected.detail = sanitizeDecisionText(evidence.detail);
+        return projected;
+      });
+  }
+  if (input.fallback !== undefined) sanitized.fallback = sanitizeFallback(input.fallback, "fallback");
+  if (input.recovery !== undefined) sanitized.recovery = sanitizeRecovery(input.recovery);
+  return sanitized;
 }

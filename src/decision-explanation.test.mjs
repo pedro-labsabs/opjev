@@ -52,6 +52,72 @@ describe("structured routing decision explanations", () => {
     assert.equal(explanation.recovery.fallback.reason, "Provider unavailable");
   });
 
+  it("drops extra properties at every explanation and nested context boundary", () => {
+    const marker = "PRIVATE_EXTRA_MARKER_31ca";
+    const explanation = sanitizeDecisionExplanation({
+      category: "recovery",
+      outcome: "continued",
+      reason: "Retry continues",
+      topSecret: marker,
+      selected: { lane: "coding", selectedSecret: marker },
+      evidence: [{ name: "retry-eligible", result: "met", evidenceSecret: marker }],
+      fallback: {
+        reason: "route rejected",
+        fallbackSecret: marker,
+        rejected: { agent: "primary", rejectedSecret: marker },
+        selected: { model: "backup", fallbackRouteSecret: marker },
+      },
+      recovery: {
+        action: "retry",
+        outcome: "continued",
+        recoverySecret: marker,
+        route: { lane: "coding", recoveryRouteSecret: marker },
+        fallback: {
+          reason: "prior route",
+          recoveryFallbackSecret: marker,
+          rejected: { agent: "old", recoveryRejectedSecret: marker },
+          selected: { model: "new", recoverySelectedSecret: marker },
+        },
+      },
+    });
+    const serialized = JSON.stringify(explanation);
+
+    assert.doesNotMatch(serialized, /PRIVATE_EXTRA_MARKER_31ca/);
+    for (const extraKey of [
+      "topSecret", "selectedSecret", "evidenceSecret", "fallbackSecret",
+      "rejectedSecret", "fallbackRouteSecret", "recoverySecret",
+      "recoveryRouteSecret", "recoveryFallbackSecret", "recoveryRejectedSecret",
+      "recoverySelectedSecret",
+    ]) {
+      assert.equal(serialized.includes(extraKey), false, `${extraKey} must not cross the explanation boundary`);
+    }
+  });
+
+  it("caps evidence count, keeps the first items in order, and bounds serialized output", () => {
+    const marker = "PRIVATE_EVIDENCE_EXTRA_MARKER_92ab";
+    const explanation = sanitizeDecisionExplanation({
+      category: "routing",
+      outcome: "selected",
+      reason: "Route selected",
+      evidence: Array.from({ length: 5000 }, (_, index) => ({
+        name: `evidence-${index}`,
+        result: "met",
+        detail: `detail-${index}`,
+        evidenceSecret: marker,
+      })),
+    });
+    const serialized = JSON.stringify(explanation);
+    const serializedBytes = Buffer.byteLength(serialized, "utf8");
+
+    assert.ok(explanation.evidence.length <= 8);
+    assert.deepEqual(explanation.evidence.map((item) => item.name), [
+      "evidence-0", "evidence-1", "evidence-2", "evidence-3",
+      "evidence-4", "evidence-5", "evidence-6", "evidence-7",
+    ]);
+    assert.ok(serializedBytes < 8000, `serialized explanation was ${serializedBytes} bytes`);
+    assert.doesNotMatch(serialized, /PRIVATE_EVIDENCE_EXTRA_MARKER_92ab|evidenceSecret/);
+  });
+
   it("redacts representative credentials throughout explanation metadata and bounds sensitive prompt text", () => {
     const credential = "sk-1234567890abcdefghijklmnop";
     const explanation = sanitizeDecisionExplanation({
