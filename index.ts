@@ -1388,13 +1388,15 @@ export default Plugin.define({
               next = esk.model;
             } else {
               via = "chain";
-              next = failed ? nextFallback(routeKind, failed) : chain[0];
+              // decideEscalation already filters failed and tried routes. A stop
+              // decision is terminal; never restart the chain as a side door.
+              next = undefined;
             }
           }
-          if (!next) return { content: "cadeia de fallback esgotada" };
-          // G3: valida o candidato escolhido (Jev/override/chain) no catalogo.
-          // Se nao estiver disponivel, usa o primeiro da cadeia que estiver.
-          const available = await firstAvailable(ctx, [next, ...chain]);
+          if (!next) return { content: `Fallback encerrado para a rota ${routeKind}: ${failed ? `falha em ${failed}; ` : ""}nenhum modelo elegivel e nao tentado permanece (tentados: ${tried.join(", ") || "nenhum"}). Habilite/configure outro provedor elegivel ou aguarde a cota/indisponibilidade antes de iniciar uma nova tentativa.` };
+          // Validate availability without silently selecting a failed/previously
+          // attempted route.
+          const available = await firstAvailable(ctx, [next, ...chain.filter((m) => !tried.includes(m) && m !== failed)]);
           if (!available) {
             return { content: `nenhum modelo da rota ${routeKind} disponivel no catalogo (${next} indisponivel)` };
           }
@@ -1757,7 +1759,12 @@ export default Plugin.define({
         let reservation = { allowed: false, retries: 0 };
         try { reservation = await reserveThrottleRetry(ctx.storage, Date.now()); } catch { /* failed reservation denies */ }
         retryAllowed = reservation.allowed;
-        event.decision = retryAllowed ? { retry: true, delay: Math.min(5000 * reservation.retries, 15000) } : { retry: false };
+        // The shared reservation budget is the authoritative bounded throttle
+        // retry cap. Do not add a permanent per-session counter here: it would
+        // prevent recovery after the policy window expires.
+        if (!sessionID) retryAllowed = false;
+        const delay = Math.min(15000, Math.max(0, 5000 * (Number.isFinite(reservation.retries) ? Math.max(1, Math.floor(reservation.retries)) : 1)));
+        event.decision = retryAllowed ? { retry: true, delay } : { retry: false };
         await recordRuntimeResource(ctx, {
           ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
           ...(Number.isFinite(status) ? { statusCode: status } : {}),
@@ -1855,8 +1862,10 @@ export default Plugin.define({
         recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         recordRuntimeResource(ctx, { ...resourceBase, kind: "escalation", failureDomain: "provider" });
       } catch {
-        event.decision = { retry: true, delay: 2000 };
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
+        // A failed transition must fail closed: retrying without persisted
+        // attempted-route state could repeat the same provider indefinitely.
+        event.decision = { retry: false };
+        recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", failureDomain: "provider" });
       }
     });
 

@@ -397,11 +397,12 @@ export async function decideEscalation(input: {
 }
 
 // Proximo modelo da cadeia de fallback. Retorna undefined quando esgotada.
-export function nextFallback(route: RouteKind, failedModel: string): FreeModel | undefined {
+export function nextFallback(route: RouteKind, failedModel: string, triedModels: string[] = []): FreeModel | undefined {
   const chain = FALLBACK_CHAIN[route];
   const idx = chain.findIndex((m) => m === failedModel);
-  if (idx < 0) return chain[0];
-  return chain[idx + 1];
+  // Unknown failures must not restart the chain at its first entry.
+  if (idx < 0) return undefined;
+  return chain.slice(idx + 1).find((model) => !triedModels.includes(model) && isFreeModel(model));
 }
 
 export function chainFor(route: RouteKind): FreeModel[] {

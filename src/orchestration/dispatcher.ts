@@ -1426,6 +1426,21 @@ async function executeSchedule(
   let pendingCommands: string[] = [];
 
   for (;;) {
+    // Defense in depth: the state machine normally prevents issuing a round
+    // beyond maxRounds. Keep the dispatcher itself fail-closed as well, so a
+    // future transition change or malformed resumed state cannot dispatch work
+    // after the shared run budget has been consumed.
+    if (state.round > state.contract.maxRounds || rounds.length >= state.contract.maxRounds) {
+      return await failRun(
+        state,
+        contract.runID,
+        new OrchestrationError(
+          "max-rounds-exhausted",
+          `orchestration round budget exhausted (round ${state.round}, maxRounds ${state.contract.maxRounds}); stop or explicitly resume with a larger authorized budget`,
+        ),
+        { rounds },
+      );
+    }
     const out = await runRoundOnce(mode, prev);
     if (out.abort) return out.result;
 

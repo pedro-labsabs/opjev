@@ -447,7 +447,7 @@ describe("retry hook", () => {
     }
   });
 
-  it("8. cadeia esgotada termina sem loop (retry:false)", async () => {
+  it("8. cadeia esgotada após timeouts termina sem chamadas adicionais (retry:false)", async () => {
     const chain = chainFor("fast-coding");
     const lastModel = chain[chain.length - 1];
     const lastId = lastModel.split("/")[1];
@@ -463,10 +463,13 @@ describe("retry hook", () => {
     });
     const stub = stubFetch(() => { throw new Error("nao deveria consultar o Jev"); });
     try {
-      const ev = { sessionID: "s1", agent: "build", model: { providerID: "opencode", id: lastId }, error: { type: "http_error", message: "500", status: 500 }, attempt: 3, decision: {} };
+      const ev = { sessionID: "s1", agent: "build", model: { providerID: "opencode", id: lastId }, error: { type: "timeout", message: "provider request timed out" }, attempt: 3, decision: {} };
       await m.hooks.session.retry(ev);
-      assert.deepEqual(ev.decision, { retry: false });
-      assert.equal(m.calls.switchModel.length, 0, "nada a trocar, sem loop");
+      assert.deepEqual(ev.decision, { retry: false }, "budget exaurido encerra como falha terminal");
+      assert.equal(m.calls.switchModel.length, 0, "nenhuma rota ja tentada pode ser selecionada novamente");
+      assert.equal(stub.calls.length, 0, "timeout sem rota restante nao consulta Jev");
+      assert.deepEqual(storage._map.get("retry/s1").tried, chain, "historico de rotas tentadas permanece intacto");
+      assert.equal(m.getState().model.id, lastId, "estado da sessao nao e alterado ao esgotar fallback");
     } finally {
       stub.restore();
     }
@@ -491,6 +494,9 @@ describe("retry hook", () => {
       const chain = chainFor("fast-coding");
       const expected = chain.find((c) => c !== "opencode/big-pickle");
       assert.equal(m.getState().model.id, expected.split("/")[1]);
+      assert.equal(m.getState().agent, "build", "fallback mantém o agente/contexto da sessão");
+      assert.deepEqual(storage._map.get("retry/s1").tried, ["opencode/big-pickle", expected], "fallback registra cada rota uma única vez");
+      assert.equal(storage._map.get("route/s1").route, "fast-coding", "rota da tarefa permanece preservada");
     } finally {
       stub.restore();
     }
@@ -1253,6 +1259,11 @@ describe("unidades puras (importadas do codigo real)", () => {
     const chain = chainFor("fast-coding");
     assert.equal(nextFallback("fast-coding", chain[0]), chain[1]);
     assert.equal(nextFallback("fast-coding", chain[chain.length - 1]), undefined);
+  });
+
+  it("nextFallback: nao reinicia a cadeia para modelo desconhecido", () => {
+    const chain = chainFor("fast-coding");
+    assert.equal(nextFallback("fast-coding", "stale/unknown-model"), undefined);
   });
 
   it("splitModelRef produz { providerID, id }", () => {

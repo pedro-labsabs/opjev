@@ -6,6 +6,7 @@ import { createBoundedStorageObservationSink, RESOURCE_LEDGER_KEY, RESOURCE_LEDG
 import { decideResourceBudget, RESOURCE_POLICY_WINDOW_MS } from "./resource-governor/budget-policy.ts";
 import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { latchQuotaLimit, QUOTA_ENFORCEMENT_KEY, QUOTA_LATCH_TTL_MS } from "./resource-governor/enforcement-state.ts";
+import { reserveThrottleRetry, THROTTLE_RETRY_BUDGET_KEY, MAX_THROTTLE_RETRIES_PER_WINDOW } from "./resource-governor/throttle-retry-budget.ts";
 
 test("ledger has fixed retention, sanitizes payloads, and does not grow without bound", () => {
   const ledger = new UsageLedger({ capacity: 3 });
@@ -196,6 +197,26 @@ test("durable quota latch denies a later session even when the observation sink 
   assert.equal("model" in budget, false);
   const recovered = await evaluateResourceBudget(state, { stage: "jev-decision", maxRounds: 3, round: 1 }, now + QUOTA_LATCH_TTL_MS + 1);
   assert.equal(recovered.allowed, true, "local latch expires after the documented heuristic TTL");
+});
+
+test("throttle retries are bounded per policy window and reset only after expiry", async () => {
+  const data = new Map();
+  const storage = { get: async key => data.get(key), set: async (key, value) => data.set(key, structuredClone(value)) };
+  const start = 1_000_000;
+  assert.deepEqual(await reserveThrottleRetry(storage, start), { allowed: true, retries: 1 });
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 1), { allowed: true, retries: 2 });
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 2), { allowed: false, retries: MAX_THROTTLE_RETRIES_PER_WINDOW });
+  assert.equal(data.get(THROTTLE_RETRY_BUDGET_KEY).retries, MAX_THROTTLE_RETRIES_PER_WINDOW);
+  assert.deepEqual(await reserveThrottleRetry(storage, start + 900_000), { allowed: true, retries: 1 });
+});
+
+test("throttle retry budget fails closed on invalid state or storage failure", async () => {
+  const invalid = { get: async () => ({ windowStart: 10, retries: 99 }), set: async () => {} };
+  await assert.rejects(reserveThrottleRetry(invalid, 11), /invalid bounded throttle retry/);
+  const failedWrite = { get: async () => undefined, set: async () => { throw new Error("write unavailable"); } };
+  await assert.rejects(reserveThrottleRetry(failedWrite, 11), /write unavailable/);
+  const failedRead = { get: async () => { throw new Error("read unavailable"); }, set: async () => {} };
+  await assert.rejects(reserveThrottleRetry(failedRead, 11), /read unavailable/);
 });
 
 test("quota enforcement storage failures reject policy evaluation instead of granting budget", async () => {
