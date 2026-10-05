@@ -28,6 +28,7 @@ import {
   type OrchestrationResultEvent,
 } from "./src/orchestration/presentation.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
+import { summarizeExecutionRun } from "./src/orchestration/summary.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -86,6 +87,10 @@ export default Plugin.define({
     const inflight = new Set<string>();
     /** Sessoes cuja historia ja foi marcada como vista (evita replay no TUI). */
     const baselined = new Set<string>();
+    // Timers e polls pertencem ao ciclo de vida desta instancia do TUI.
+    let disposed = false;
+    let reconciling = false;
+    const refreshTimers = new Set<ReturnType<typeof setTimeout>>();
     // Cursor temporal da instalação para recuperar notices publicados antes
     // do primeiro poll, sem reapresentar notices históricos da sessão.
     const reconciliationStartedAt = Date.now();
@@ -144,10 +149,17 @@ export default Plugin.define({
       }
       trace("render", { sessionID, status, currentSessionID });
 
+      const outcome = phase === "completed" ? "Completed"
+        : phase === "failed" ? "Failed"
+        : phase === "stopped" ? "Safely stopped"
+        : phase === "limit-reached" ? "Limit reached"
+        : phase === "awaiting-human" ? "Human review required"
+        : "Execution update";
       ctx.ui.toast.show({
-        title: "Orquestracao",
+        title: `Orchestration · ${outcome}`,
         message: String(notice ?? "").slice(0, 2000),
-        variant: phase === "failed" ? "error" : "success",
+        variant: phase === "failed" || phase === "stopped" ? "error"
+          : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
         duration: TOAST_DURATION_MS,
       });
       return "shown";
@@ -165,13 +177,22 @@ export default Plugin.define({
     const refreshToast = (sessionID: string, phase: string, notice: string): void => {
       for (let i = 1; i <= TOAST_REFRESH_MAX; i++) {
         const t = setTimeout(() => {
+          refreshTimers.delete(t);
+          if (disposed) return;
           try {
             const route = ctx.ui.router.current();
             if (route?.type !== "session" || String(route.sessionID) !== sessionID) return;
+            const outcome = phase === "completed" ? "Completed"
+              : phase === "failed" ? "Failed"
+              : phase === "stopped" ? "Safely stopped"
+              : phase === "limit-reached" ? "Limit reached"
+        : phase === "awaiting-human" ? "Human review required"
+              : "Execution update";
             ctx.ui.toast.show({
-              title: "Orquestracao",
+              title: `Orchestration · ${outcome}`,
               message: String(notice ?? "").slice(0, 2000),
-              variant: phase === "failed" ? "error" : "success",
+              variant: phase === "failed" || phase === "stopped" ? "error"
+                : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
               duration: TOAST_DURATION_MS,
             });
             trace("toast-refreshed", { sessionID, attempt: i });
@@ -179,6 +200,7 @@ export default Plugin.define({
             // refresh best-effort: nunca propaga
           }
         }, TOAST_REFRESH_INTERVAL_MS * i);
+        refreshTimers.add(t);
         (t as unknown as { unref?: () => void }).unref?.();
       }
     };
@@ -203,13 +225,33 @@ export default Plugin.define({
       notice: string,
       source: "event" | "reconcile",
     ): Promise<boolean> => {
-      if (runID === "" || sessionID === "") return false;
+      if (disposed || runID === "" || sessionID === "") return false;
       if (seen.has(runID)) return false;
       if (inflight.has(runID)) return false;
       inflight.add(runID);
       try {
+        // Read-only, best-effort projection of the bounded persisted run. Keep
+        // notice delivery working even when storage is unavailable or stale.
+        let displayNotice = notice;
+        try {
+          const record = await ctx.storage?.get(`orchestration/run/${runID}`);
+          const summary = summarizeExecutionRun(record);
+          if (summary.available) {
+            const lines = [
+              summary.taskState ? `Task: ${summary.taskState}` : undefined,
+              summary.route ? `Route: ${summary.route}` : undefined,
+              summary.progress,
+              summary.outcome ? `Outcome: ${summary.outcome}` : undefined,
+              summary.detail,
+              ...(summary.recoveryEvents ?? []).map((event) => `Recovery: ${event}`),
+            ].filter((line): line is string => Boolean(line));
+            if (lines.length) displayNotice = `${lines.join("\\n")}\\n\\n${notice}`;
+          }
+        } catch {
+          // Summary is optional; never interrupt the session or suppress notice.
+        }
         const deadline = Date.now() + ROUTE_RETRY_WINDOW_MS;
-        let outcome = renderOnce(sessionID, phase, notice);
+        let outcome = renderOnce(sessionID, phase, displayNotice);
         while (outcome === "retry" && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, ROUTE_POLL_MS));
           outcome = renderOnce(sessionID, phase, notice);
@@ -265,17 +307,26 @@ export default Plugin.define({
     // baseline por sessao para nunca reapresentar historico.
     const timer = setInterval(() => {
       void (async () => {
+        if (disposed || reconciling) return;
+        reconciling = true;
         try {
           const route = ctx.ui.router.current();
-          if (route?.type !== "session") return;
+          if (disposed || route?.type !== "session") return;
           const sessionID = String(route.sessionID);
-          const items: unknown[] = ctx.data.session.pending.list(sessionID) ?? [];
+          // pending.list may briefly fail or return unusable data during session
+          // transitions; treat it as an empty snapshot and retry next poll.
+          const result: unknown = ctx.data.session.pending.list(sessionID);
+          const items: unknown[] = Array.isArray(result) ? result : [];
           const isBaseline = !baselined.has(sessionID);
           const toPresent = selectUnpresentedNotices({ sessionID, items, seen, baseline: baselined, startedAt: reconciliationStartedAt });
           if (isBaseline) {
             trace("baseline", { sessionID, marked: toPresent.length, recoveredFresh: toPresent.length });
           }
           for (const f of toPresent) {
+            if (disposed) break;
+            // A route change while awaiting must not render into the old session.
+            const current = ctx.ui.router.current();
+            if (current?.type !== "session" || String(current.sessionID) !== sessionID) break;
             await present(f.runID, sessionID, f.phase, f.notice, "reconcile");
           }
           // Trace so quando o reconciliador REALMENTE recupera algo (evidencia
@@ -285,6 +336,8 @@ export default Plugin.define({
           }
         } catch (err) {
           trace("reconcile-error", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+        } finally {
+          reconciling = false;
         }
       })();
     }, RECONCILE_INTERVAL_MS);
@@ -292,6 +345,9 @@ export default Plugin.define({
     (timer as unknown as { unref?: () => void }).unref?.();
 
     return () => {
+      disposed = true;
+      for (const refreshTimer of refreshTimers) clearTimeout(refreshTimer);
+      refreshTimers.clear();
       try {
         unsubscribe?.();
       } catch {
