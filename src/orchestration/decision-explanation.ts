@@ -40,7 +40,7 @@ export function sanitizeDecisionExplanation<T extends DecisionExplanation>(expla
     ...(explanation.recovery ? { recovery: { ...explanation.recovery, action: sanitizeDecisionText(explanation.recovery.action), outcome: sanitizeDecisionText(explanation.recovery.outcome), ...(explanation.recovery.route ? { route: route(explanation.recovery.route) } : {}), ...(explanation.recovery.fallback ? { fallback: fallback(explanation.recovery.fallback) } : {}) } } : {}),
   };
 }
-export type DecisionOutcome = "selected" | "rejected" | "recovered" | "failed" | "continued";
+export type DecisionOutcome = "selected" | "rejected" | "recovered" | "failed" | "continued" | "stopped" | "awaiting-human";
 
 /** Identifiers for the route considered or selected (task lane and executor). */
 export interface DecisionRoute {

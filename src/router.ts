@@ -158,8 +158,10 @@ export async function decideRoute(input: {
     // política/estratégia; nao substitui decisao valida do Jev).
     const risky = noul?.type === "noul" ? noul.noul >= 0.7 : false;
     const complexity = score?.type === "score" ? score.score : 1;
-    const wasUpgraded =
-      confidence < input.confidenceThreshold || risky || complexity >= 1.5;
+    const confidenceLow = confidence < input.confidenceThreshold;
+    const riskTriggered = risky;
+    const complexityTriggered = complexity >= 1.5;
+    const wasUpgraded = confidenceLow || riskTriggered || complexityTriggered;
     if (wasUpgraded && route !== "heavy-reasoning") {
       route = "heavy-reasoning";
       overridden = true;
@@ -221,7 +223,8 @@ export async function decideRoute(input: {
           { name: "agent-eligibility", result: agentChoice && agentChoice.type === "choice" && isAgent(agentChoice.choice, validAgents) ? "eligible" : "ineligible", detail: `available-agents=${validAgents.length}` },
           { name: "model-eligibility", result: modelChoice && modelChoice.type === "choice" && isFreeCandidate(modelChoice.choice, candidates) ? "eligible" : "ineligible", detail: `free-candidates=${candidates.length}` },
           { name: "confidence-threshold", result: confidence >= input.confidenceThreshold ? "met" : "unmet", detail: `threshold=${input.confidenceThreshold}` },
-          { name: "risk-and-complexity-guardrails", result: wasUpgraded ? "unmet" : "met", detail: `risky=${risky}; complexity=${complexity}` },
+          { name: "risk-guardrail", result: riskTriggered ? "unmet" : "met", detail: `risky=${risky}` },
+          { name: "complexity-guardrail", result: complexityTriggered ? "unmet" : "met", detail: `complexity=${complexity}; threshold=1.5` },
         ],
       }),
     };

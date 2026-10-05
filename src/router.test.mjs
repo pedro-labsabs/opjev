@@ -206,6 +206,38 @@ describe("agente elegivel = ctx.agent.list() (sem restricao build|plan)", () => 
 });
 
 describe("guardrails free-only (modelo)", () => {
+  it("low confidence upgrade does not report risk or complexity guardrails as unmet", async () => {
+    const stub = stubFetch(async () => okJev(routeAnswers({
+      route: "fast-coding",
+      agent: "build",
+      model: "opencode/big-pickle",
+      risky: 0,
+      complexity: 1,
+      confidence: 0.2,
+    })));
+    try {
+      const decision = await decideRoute({
+        prompt: "implementar feature",
+        agent: "build",
+        validAgents: ["build", "plan"],
+        freeCandidates: FREE,
+        route: "unknown",
+        jevModel: "jev-1.13-free",
+        jevEndpoint: "https://x",
+        apiKey: undefined,
+        confidenceThreshold: 0.55,
+      });
+
+      assert.equal(decision.route, "heavy-reasoning");
+      const evidence = Object.fromEntries(decision.explanation.evidence.map((item) => [item.name, item.result]));
+      assert.equal(evidence["confidence-threshold"], "unmet");
+      assert.equal(evidence["risk-guardrail"], "met");
+      assert.equal(evidence["complexity-guardrail"], "met");
+    } finally {
+      stub.restore();
+    }
+  });
+
   it("3. Jev so consegue selecionar modelos do FREE_POOL", async () => {
     const d = await decideRoute({
       prompt: "implementar feature",

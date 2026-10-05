@@ -1467,14 +1467,29 @@ async function executeSchedule(
       ...(mode !== "initial" ? {
         explanation: sanitizeDecisionExplanation({
           category: "recovery",
-          outcome: out.worker.outcome === "succeeded" ? "recovered" : "continued",
+          outcome: out.verdict.nextAction === "accept" && out.state.phase === "completed"
+            ? "recovered"
+            : out.state.phase === "stopped"
+              ? "stopped"
+              : out.state.phase === "awaiting-human"
+                ? "awaiting-human"
+                : out.state.phase === "failed"
+                  ? "failed"
+                  : "continued",
           selected: { agent: out.worker.agent, model: out.worker.model },
-          reason: mode === "switch-model" || mode === "switch-agent"
-            ? `Fallback selection ${mode} was made after the prior executor outcome: ${(prev?.evidence.resultSummary ?? "prior executor outcome").slice(0, 240)}`
-            : `Recovery round ${mode} executed after a prior round outcome: ${(prev?.evidence.resultSummary ?? "prior executor outcome").slice(0, 240)}`,
+          reason: `Recovery round ${mode} evaluated; Jev verdict: ${out.verdict.nextAction}.`,
+          evidence: [
+            { name: "failure-class", result: "unknown", detail: out.verdict.failureClass },
+            { name: "jev-next-action", result: out.verdict.nextAction === "accept" ? "met" : "unmet", detail: out.verdict.nextAction },
+            { name: "kernel-phase", result: out.state.phase === "completed" ? "met" : "unmet", detail: out.state.phase },
+            { name: "worker-outcome", result: out.worker.outcome === "succeeded" ? "met" : "unmet", detail: out.worker.outcome },
+            ...out.evidence.deterministicChecks
+              .filter((check) => ["worker-session-outcome", "worker-final-response", "critic-session-outcome"].includes(check.name))
+              .map((check) => ({ name: check.name, result: check.status === "pass" ? "met" as const : "unmet" as const, detail: check.status })),
+          ],
           recovery: {
             action: mode,
-            outcome: out.worker.outcome === "succeeded" ? "Recovery worker succeeded." : "Recovery worker completed; orchestration continues.",
+            outcome: `Jev verdict ${out.verdict.nextAction}; kernel phase ${out.state.phase}.`,
             route: { agent: out.worker.agent, model: out.worker.model },
           },
         }),
