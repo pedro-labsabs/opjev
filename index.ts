@@ -339,10 +339,13 @@ async function switchExecutor(
   route: RouteKind,
   model: string,
   agent: string,
+  eligibleModels?: string[],
 ): Promise<SwitchExecResult> {
   let validModel = model;
   if (!(await isModelAvailable(ctx, validModel))) {
-    const alt = await firstAvailable(ctx, chainFor(route).filter((m) => m !== validModel));
+    // Callers with a tried/failed allowlist keep that boundary through the
+    // final availability check; this helper must not widen it back to a lane.
+    const alt = await firstAvailable(ctx, (eligibleModels ?? chainFor(route)).filter((m) => m !== validModel));
     if (!alt) return { ok: false, model: validModel, agent, reason: "model-unavailable" };
     validModel = alt;
   }
@@ -1074,10 +1077,14 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
       });
       const currentAgent = route?.agent ?? (snapshot.agent === "unknown" ? "build" : snapshot.agent);
       if (esk.model) {
-        const target = await firstAvailable(ctx, [esk.model, ...candidates]);
+        const eligibleModels = [
+          esk.model,
+          ...candidates.filter((model) => model !== failedRef && !tried.includes(model)),
+        ];
+        const target = await firstAvailable(ctx, eligibleModels);
         if (target) {
           // Mesma transacao do switch normal (valida antes, rollback best-effort).
-          const exec = await switchExecutor(ctx, sessionID, routeKind, target, currentAgent);
+          const exec = await switchExecutor(ctx, sessionID, routeKind, target, currentAgent, eligibleModels);
           if (exec.ok) {
             await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: exec.model, agent: exec.agent, chain: candidates });
             await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: exec.model });
@@ -1396,7 +1403,8 @@ export default Plugin.define({
           if (!next) return { content: `Fallback encerrado para a rota ${routeKind}: ${failed ? `falha em ${failed}; ` : ""}nenhum modelo elegivel e nao tentado permanece (tentados: ${tried.join(", ") || "nenhum"}). Habilite/configure outro provedor elegivel ou aguarde a cota/indisponibilidade antes de iniciar uma nova tentativa.` };
           // Validate availability without silently selecting a failed/previously
           // attempted route.
-          const available = await firstAvailable(ctx, [next, ...chain.filter((m) => !tried.includes(m) && m !== failed)]);
+          const eligibleModels = [next, ...chain.filter((m) => !tried.includes(m) && m !== failed)];
+          const available = await firstAvailable(ctx, eligibleModels);
           if (!available) {
             return { content: `nenhum modelo da rota ${routeKind} disponivel no catalogo (${next} indisponivel)` };
           }
@@ -1405,7 +1413,7 @@ export default Plugin.define({
           }
           // Mesma transacao do switch normal (valida antes, rollback best-effort).
           const currentAgent = stored?.agent ?? (snapshot.agent === "unknown" ? "build" : snapshot.agent);
-          const exec = await switchExecutor(ctx, sessionID, routeKind, available, currentAgent);
+          const exec = await switchExecutor(ctx, sessionID, routeKind, available, currentAgent, eligibleModels);
           if (!exec.ok) {
             const reason = exec.reason === "model-unavailable" ? "indisponivel no catalogo" : "switch-failed";
             return {
@@ -1829,7 +1837,13 @@ export default Plugin.define({
         const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
         if (!budget.allowed) { event.decision = { retry: false }; return; }
       } catch { event.decision = { retry: false }; return; }
-      const candidates = [esk.model, ...chain];
+      // Retain the authorization made by decideEscalation through catalog
+      // validation. A listed failed model cannot re-enter as an availability
+      // fallback when Jev's selected model is unavailable.
+      const candidates = [
+        esk.model,
+        ...chain.filter((model) => model !== failedRef && !tried.includes(model)),
+      ];
       const valid = await firstAvailable(ctx, candidates);
       if (!valid) {
         await ctx.storage.set(`retry/${sessionID}`, { tried, at: Date.now() });

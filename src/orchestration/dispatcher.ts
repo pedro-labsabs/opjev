@@ -1439,6 +1439,12 @@ async function executeSchedule(
           `orchestration round budget exhausted (round ${state.round}, maxRounds ${state.contract.maxRounds}); stop or explicitly resume with a larger authorized budget`,
         ),
         { rounds },
+        {
+          deps,
+          kind: "run-failed",
+          workerSessionID: last?.worker.sessionID ?? state.executor?.sessionID,
+          criticSessionID: last?.critic.sessionID,
+        },
       );
     }
     const out = await runRoundOnce(mode, prev);

@@ -501,6 +501,80 @@ describe("retry hook", () => {
       stub.restore();
     }
   });
+
+  it("9. modelo indisponivel nao reabre rota falhada que ainda aparece no catalogo", async () => {
+    const failed = "opencode/nemotron-3.5-lightning-free";
+    const availableAlternative = "opencode/mimo-v2.5-free";
+    const storage = makeStorage({
+      "route/s1": { route: "fast-coding", model: failed, agent: "build", chain: chainFor("fast-coding") },
+    });
+    const m = await bootCtx({
+      // big-pickle (the Jev choice) is absent, while the failed nemotron is
+      // still catalog-visible. The retry may only fall through to untried mimo.
+      models: [failed, availableAlternative],
+      session: { agent: "build", model: { providerID: "opencode", id: "nemotron-3.5-lightning-free" } },
+      storage,
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async () => okJev(escalateAnswers("opencode/big-pickle")));
+    try {
+      const ev = {
+        sessionID: "s1",
+        agent: "build",
+        model: { providerID: "opencode", id: "nemotron-3.5-lightning-free" },
+        error: { type: "http_error", message: "500 internal", status: 500 },
+        attempt: 1,
+        decision: {},
+      };
+      await m.hooks.session.retry(ev);
+      assert.equal(ev.decision.retry, true, "an eligible untried route remains");
+      assert.deepEqual(m.calls.switchModel.map((call) => call.model), [{ providerID: "opencode", id: "mimo-v2.5-free" }]);
+      assert.equal(m.getState().model.id, "mimo-v2.5-free");
+      assert.deepEqual(storage._map.get("retry/s1").tried, [failed, availableAlternative]);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("10. switchExecutor nao usa rota falhada se o modelo fica indisponivel durante a troca", async () => {
+    const failed = "opencode/nemotron-3.5-lightning-free";
+    const storage = makeStorage({
+      "route/s1": { route: "fast-coding", model: failed, agent: "build", chain: chainFor("fast-coding") },
+      "retry/s1": { tried: [failed] },
+    });
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      session: { agent: "build", model: { providerID: "opencode", id: "nemotron-3.5-lightning-free" } },
+      storage,
+      options: PLUGIN_OPTS,
+    });
+    const originalModelList = m.ctx.model.list.bind(m.ctx.model);
+    let jevResponded = false;
+    let postDecisionCatalogReads = 0;
+    m.ctx.model.list = async () => {
+      if (!jevResponded) return originalModelList();
+      postDecisionCatalogReads += 1;
+      // The selected big-pickle remains unavailable through its duplicate
+      // chain entry. Mimo is then available for selection, but disappears
+      // before switchExecutor validates it while failed nemotron remains listed.
+      // The allowlist must make the transaction fail closed.
+      return postDecisionCatalogReads === 4
+        ? [failed, "opencode/mimo-v2.5-free"]
+        : [failed];
+    };
+    const stub = stubFetch(async () => {
+      jevResponded = true;
+      return okJev(escalateAnswers("opencode/big-pickle"));
+    });
+    try {
+      const result = await m.tools.escalate.execute({ sessionID: "s1" });
+      assert.match(result.content, /falha ao trocar|nenhum modelo da rota/);
+      assert.equal(m.calls.switchModel.length, 0, "rota falhada nao pode ser selecionada pelo helper");
+      assert.equal(storage._map.get("route/s1").model, failed, "estado de rota nao e sobrescrito");
+    } finally {
+      stub.restore();
+    }
+  });
 });
 
 describe("retry hook: snapshot completo ao Jev", () => {
