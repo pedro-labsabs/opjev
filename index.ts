@@ -1100,12 +1100,21 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
       // Qualquer agente que o runtime expose (ctx.agent.list) e elegivel.
       const next = agents.find((a) => a !== current);
       if (next) {
-        const currentModel = route?.model ?? (snapshot.model === "unknown" ? candidates[0] : snapshot.model);
-        const exec = await switchExecutor(ctx, sessionID, routeKind, currentModel, next);
-        if (exec.ok) {
-          await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: exec.model, agent: exec.agent, chain: candidates });
-          await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: exec.agent });
-          await ctx.storage.set(decidedKey, { at: Date.now(), action: `switch-agent:${exec.agent}` });
+        const currentModel = snapshot.model !== "unknown" ? snapshot.model : route?.model;
+        // switch-agent has authority over the agent only. Confirm the exact
+        // current model can be retained, then switch only the agent; never let
+        // switchExecutor widen this action into a model fallback.
+        let switched = false;
+        if (currentModel && await isModelAvailable(ctx, currentModel)) {
+          try {
+            await switchToAgent(ctx, sessionID, next);
+            switched = true;
+          } catch { /* failed agent switch leaves the recorded route unchanged */ }
+        }
+        if (switched) {
+          await ctx.storage.set(`route/${sessionID}`, { route: routeKind, model: currentModel, agent: next, chain: candidates });
+          await ctx.storage.set(`last-tool-switch/${sessionID}`, { at: Date.now(), tool, target: next });
+          await ctx.storage.set(decidedKey, { at: Date.now(), action: `switch-agent:${next}` });
         } else {
           await ctx.storage.set(decidedKey, { at: Date.now(), action: "switch-agent-failed" });
         }

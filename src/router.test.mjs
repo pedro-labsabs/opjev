@@ -695,6 +695,80 @@ describe("tool execute.after (erros materiais de tools)", () => {
       stub.restore();
     }
   });
+
+  it("switch-agent falha fechado se o modelo atual sumiu do catalogo, sem escolher outro modelo", async () => {
+    const storage = makeStorage({
+      "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: chainFor("fast-coding") },
+    });
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: ["build", "plan"],
+      session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
+      storage,
+      options: PLUGIN_OPTS,
+    });
+    const originalModelList = m.ctx.model.list.bind(m.ctx.model);
+    let currentModelDisappeared = false;
+    m.ctx.model.list = async () => {
+      const models = await originalModelList();
+      return currentModelDisappeared ? models.filter((model) => model.id !== "big-pickle") : models;
+    };
+    const stub = stubFetch(async () => {
+      currentModelDisappeared = true;
+      return okJev(recoverAnswers("switch-agent", 0.9));
+    });
+    try {
+      const raiseError = (id) => m.hooks.tool["execute.after"]({
+        tool: "edit", sessionID: "s1", agent: "build", messageID: "m1", id,
+        input: { filePath: "a.ts" }, status: "error", error: { message: "permission denied writing a.ts" },
+      });
+      await raiseError("agent-switch-1");
+      await raiseError("agent-switch-2");
+
+      assert.equal(stub.calls.length, 1, "a repetição material consulta a decisão do Jev uma vez");
+      assert.equal(m.calls.switchAgent.length, 0, "modelo indisponível impede a troca acoplada");
+      assert.equal(m.calls.switchModel.length, 0, "switch-agent não ganha autoridade de troca de modelo");
+      assert.equal(m.getState().agent, "build");
+      assert.equal(m.getState().model.id, "big-pickle");
+      assert.equal(storage._map.get("route/s1").model, "opencode/big-pickle");
+      const decided = [...storage._map.entries()].find(([key]) => key.startsWith("tool-decided/s1/edit/"))?.[1];
+      assert.equal(decided?.action, "switch-agent-failed");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("switch-agent troca somente o agente quando o modelo atual continua disponivel", async () => {
+    const storage = makeStorage({
+      "route/s1": { route: "fast-coding", model: "opencode/big-pickle", agent: "build", chain: chainFor("fast-coding") },
+    });
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: ["build", "plan"],
+      session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
+      storage,
+      options: PLUGIN_OPTS,
+    });
+    const stub = stubFetch(async () => okJev(recoverAnswers("switch-agent", 0.9)));
+    try {
+      const raiseError = (id) => m.hooks.tool["execute.after"]({
+        tool: "edit", sessionID: "s1", agent: "build", messageID: "m1", id,
+        input: { filePath: "a.ts" }, status: "error", error: { message: "permission denied writing a.ts" },
+      });
+      await raiseError("agent-switch-1");
+      await raiseError("agent-switch-2");
+
+      assert.equal(m.calls.switchAgent.length, 1);
+      assert.deepEqual(m.calls.switchAgent[0].agent, "plan");
+      assert.equal(m.calls.switchModel.length, 0, "switch-agent nunca chama switchModel, nem para o modelo atual");
+      assert.equal(m.getState().agent, "plan");
+      assert.equal(m.getState().model.id, "big-pickle");
+      assert.equal(storage._map.get("route/s1").model, "opencode/big-pickle");
+      assert.equal(storage._map.get("route/s1").agent, "plan");
+    } finally {
+      stub.restore();
+    }
+  });
 });
 
 describe("pending recovery: recomendacao one-shot no proximo context", () => {
