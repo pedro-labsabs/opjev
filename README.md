@@ -149,7 +149,8 @@ Novas garantias desta rodada:
 
 O kernel/state machine permanece puro e deterministico; o runtime ativo está
 integrado pelo dispatcher em `src/orchestration/dispatcher.ts` e pelos hooks
-em `index.ts` (estabilizado pela PR #32). Vive em
+em `src/hooks.ts`; `index.ts` compoe o plugin e registra as dependencias
+(estabilizado pela PR #32). Vive em
 `src/orchestration/` (`types.ts`, `judgement.ts`, `state-machine.ts`):
 
 - `ExecutionContract` (intencao, escopo, restricoes, acceptance criteria,
