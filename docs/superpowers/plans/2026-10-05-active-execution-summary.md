@@ -72,8 +72,9 @@
 ### Task 3: Preserve the composed notice across route retries and toast refreshes
 
 **Files:**
+- Create: `src/orchestration/summary-presentation.ts`
+- Create: `src/summary-presentation.test.mjs`
 - Modify: `tui.ts`
-- Modify: focused TUI presentation tests from Task 1 or create `src/tui-summary-presentation.test.mjs`
 
 **Interfaces:**
 - Consumes: one computed `displayNotice` containing the optional summary plus original notice.
@@ -90,5 +91,5 @@
 - [ ] Run `npm run typecheck`; expect exit code 0.
 - [ ] Run `npm test`; expect all tests to pass.
 - [ ] Run `git diff --check origin/main...HEAD`; expect no whitespace errors.
-- [ ] Run the relevant real TUI E2E with the pinned OpenCode 2.0.11 runtime if available; report unavailable runtime as a limitation, never as a passing gate.
+- [ ] Run the relevant real TUI E2E with pinned OpenCode 2.0.11 only if it avoids live provider calls; otherwise report that limitation and rely on the focused read-query, poller, and notice-delivery tests.
 - [ ] Review the complete branch diff against the acceptance criteria and update PR #37 with the verified branch.

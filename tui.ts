@@ -31,6 +31,7 @@ import { ExecutionSummaryRpc } from "./src/orchestration/execution-summary-rpc.t
 import { createActiveSummaryPoller } from "./src/orchestration/active-summary-poller.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
 import { summarizeExecutionRun, type ExecutionSummary } from "./src/orchestration/summary.ts";
+import { composeExecutionNotice, deliverExecutionNoticeWithRetry } from "./src/orchestration/summary-presentation.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -294,33 +295,26 @@ export default Plugin.define({
         try {
           const record = await ctx.storage?.get(`orchestration/run/${runID}`);
           const summary = summarizeExecutionRun(record);
-          if (summary.available) {
-            const lines = [
-              summary.taskState ? `Task: ${summary.taskState}` : undefined,
-              summary.route ? `Route: ${summary.route}` : undefined,
-              summary.progress,
-              summary.outcome ? `Outcome: ${summary.outcome}` : undefined,
-              summary.detail,
-              ...(summary.recoveryEvents ?? []).map((event) => `Recovery: ${event}`),
-            ].filter((line): line is string => Boolean(line));
-            if (lines.length) displayNotice = `${lines.join("\\n")}\\n\\n${notice}`;
-          }
+          displayNotice = composeExecutionNotice(notice, summary);
         } catch {
           // Summary is optional; never interrupt the session or suppress notice.
         }
         const deadline = Date.now() + ROUTE_RETRY_WINDOW_MS;
-        let outcome = renderOnce(sessionID, phase, displayNotice);
-        while (outcome === "retry" && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, ROUTE_POLL_MS));
-          outcome = renderOnce(sessionID, phase, notice);
-        }
+        const outcome = await deliverExecutionNoticeWithRetry({
+          displayNotice,
+          render: (text) => renderOnce(sessionID, phase, text),
+          refresh: (text) => refreshToast(sessionID, phase, text),
+          deadline,
+          now: Date.now,
+          retryIntervalMs: ROUTE_POLL_MS,
+          wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        });
         if (outcome !== "shown") {
           trace("not-shown", { runID, outcome, source });
           return false;
         }
         trace("shown", { runID, sessionID, source });
         markSeen(runID);
-        refreshToast(sessionID, phase, notice);
         return true;
       } catch {
         return false; // falha de apresentacao isolada: nunca propaga
