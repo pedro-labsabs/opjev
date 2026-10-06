@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { AdmissionRpc, createAdmissionOrchestrateHandler } from "./src/orchestration/admission-rpc.ts";
+import { ExecutionSummaryRpc, createExecutionSummaryHandler } from "./src/orchestration/execution-summary-rpc.ts";
 import { FREE_POOL, isFreeModel, resolveOptions, splitModelRef, type FreeModel, type RouteKind, type RouterOptions } from "./src/config.ts";
 import { resolveApiKey } from "./src/auth.ts";
 import {
@@ -1269,6 +1270,18 @@ export default Plugin.define({
             },
           }),
         });
+        try {
+          await ctx.rpc.register(ExecutionSummaryRpc, {
+            getActiveSummary: createExecutionSummaryHandler({
+              storage: {
+                get: async (key: string) => await ctx.storage.get(key),
+              },
+            }),
+          });
+        } catch (err) {
+          const msg = String(err instanceof Error ? err.message : err).split("\n")[0] ?? "erro";
+          console.error(`[opjev] rpc de execution summary indisponivel nesta superficie: ${msg.slice(0, 200)}`);
+        }
       } catch (err) {
         const msg = String(err instanceof Error ? err.message : err).split("\n")[0] ?? "erro";
         console.error(`[opjev] rpc de admission indisponivel nesta superficie: ${msg.slice(0, 200)}`);

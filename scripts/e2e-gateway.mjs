@@ -80,6 +80,7 @@ async function waitFor(fn, timeoutMs, label) {
 }
 
 const results = [];
+const summaryRpcEvidence = { probeStatus: null, probeAvailable: null, tuiRequests: 0, tuiResponses200: 0, tuiResponses400: 0, preterminal: false, matchingRunProjection: false };
 function assert(name, pass, detail = "", required = true) {
   results.push({ name, pass: Boolean(pass), required, detail: String(detail).slice(0, 600) });
   log(`${pass ? "PASS" : required ? "FAIL" : "note"} ${name}${detail ? ` — ${detail}` : ""}`);
@@ -92,6 +93,40 @@ function tryParse(text) {
   } catch {
     return null;
   }
+}
+
+const SUMMARY_RPC_PATH = "/api/rpc/opjev.execution-summary.v1/getActiveSummary";
+const SUMMARY_FIELDS = new Set([
+  "available", "taskState", "route", "round", "maxRounds", "progress", "recoveryEvents", "outcome", "detail",
+]);
+
+function unwrapRpcResult(value) {
+  let current = value;
+  for (let i = 0; i < 4 && current && typeof current === "object"; i++) {
+    if (Object.hasOwn(current, "summary")) return current;
+    if (current.result && typeof current.result === "object") current = current.result;
+    else if (current.output && typeof current.output === "object") current = current.output;
+    else if (current.data && typeof current.data === "object") current = current.data;
+    else break;
+  }
+  return null;
+}
+
+function boundedSummaryResponse(text, expectedRunID) {
+  const result = unwrapRpcResult(tryParse(text));
+  const summary = result?.summary;
+  if (!result || result.runID !== expectedRunID || !summary || summary.available !== true) return false;
+  if (Object.keys(summary).some((key) => !SUMMARY_FIELDS.has(key))) return false;
+  const phases = new Set(["planning", "ready", "running", "evaluating", "repairing", "awaiting-human", "completed", "stopped", "failed"]);
+  return typeof summary.taskState === "string" && summary.taskState.length <= 40 && phases.has(summary.taskState) &&
+    (summary.route === undefined || (typeof summary.route === "string" && summary.route.length <= 200)) &&
+    (summary.round === undefined || (Number.isSafeInteger(summary.round) && summary.round >= 0 && summary.round <= 1000)) &&
+    (summary.maxRounds === undefined || (Number.isSafeInteger(summary.maxRounds) && summary.maxRounds >= 1 && summary.maxRounds <= 1000)) &&
+    (summary.progress === undefined || (typeof summary.progress === "string" && summary.progress.length <= 80)) &&
+    (summary.detail === undefined || (typeof summary.detail === "string" && summary.detail.length <= 200)) &&
+    (summary.outcome === undefined || ["completed", "failed", "stopped", "limit-reached"].includes(summary.outcome)) &&
+    (summary.recoveryEvents === undefined || (Array.isArray(summary.recoveryEvents) && summary.recoveryEvents.length <= 5 &&
+      summary.recoveryEvents.every((event) => typeof event === "string" && event.length <= 120)));
 }
 
 const children = [];
@@ -557,6 +592,23 @@ async function main() {
     "RPC opjev.admission.v1 registrada no plugin (pre-flight differential)",
     registered,
     `ctl=${ctl.status}/${ctlType} probe=${probe.status}/${probeType} regError=${regError}`,
+  );
+
+  const summaryProbeSessionResponse = await api("POST", "/api/session", {});
+  const summaryProbeSessionID = parseDataId(summaryProbeSessionResponse.text);
+  const summaryProbe = summaryProbeSessionID === null
+    ? { status: summaryProbeSessionResponse.status, text: "session creation failed" }
+    : await api("POST", SUMMARY_RPC_PATH, { input: { sessionID: summaryProbeSessionID } });
+  const summaryProbeResult = unwrapRpcResult(tryParse(summaryProbe.text));
+  summaryRpcEvidence.probeStatus = summaryProbe.status;
+  summaryRpcEvidence.probeAvailable = summaryProbeResult?.summary?.available;
+  const summaryRpcRegistered =
+    ctlType === "rpc.method_not_found" && summaryProbe.status === 200 &&
+    summaryProbeResult?.summary?.available === false;
+  assert(
+    "RPC opjev.execution-summary.v1 registrada; sessao sem binding responde 200/unavailable",
+    summaryRpcRegistered,
+    `status=${summaryProbe.status} summary.available=${summaryProbeResult?.summary?.available}`,
   );
 
   const info = await api("GET", "/api/info");
@@ -1109,6 +1161,7 @@ async function main() {
     const normalBaseline = countFileMatches(gwLogPath, NORMAL_RE);
     const rpcBaseline = countFileMatches(gwLogPath, RPC_RE);
     const tuiNoticeBaseline = countFileMatches(tuiCanaryPath, "ORCH_TUI_NOTICE");
+    const summaryTuiMark = sniffEvents.length;
     // Ordem ESTRUTURAL: ORCH primeiro (composer livre — nada executando),
     // ping normal depois. Isso elimina a corrida em que o submit do ORCH se
     // perdia com o composer ocupado pela execucao do ping.
@@ -1126,7 +1179,11 @@ async function main() {
       },
       boot_ms: 20000,
       steps: [
-        { type: "ORCH: responda apenas com a palavra PRONTO (via tui)", enter: true, after_enter_ms: 500 },
+        {
+          type: "ORCH: inspecione README.md e package.json e resuma tres fatos concretos do projeto (via tui)",
+          enter: true,
+          after_enter_ms: 500,
+        },
         {
           wait_log: {
             file: gwLogPath,
@@ -1304,6 +1361,43 @@ async function main() {
       `tuiRunID=${tuiRunID}`,
     );
 
+    await sleep(1200);
+    pollSniffer(sniffLogPath);
+    const tuiWire = sniffEvents.slice(summaryTuiMark);
+    const tuiSummaryRequests = tuiWire.filter((event) => {
+      if (event.dir !== "req" || event.method !== "POST" || event.path !== SUMMARY_RPC_PATH) return false;
+      const body = tryParse(String(event.body ?? ""));
+      return body?.input?.sessionID === tuiSid;
+    });
+    const tuiSummaryResponses = tuiWire.filter((event) => event.dir === "res" && event.path === SUMMARY_RPC_PATH);
+    const tuiSummary200 = tuiSummaryResponses.filter((event) => event.status === 200);
+    const tuiSummary400 = tuiSummaryResponses.filter((event) => event.status === 400);
+    const validRunResponses = tuiSummary200.filter((event) => boundedSummaryResponse(event.body ?? "", tuiRunID));
+    const preterminalResponses = validRunResponses.filter((event) => {
+      const summary = unwrapRpcResult(tryParse(String(event.body ?? "")))?.summary;
+      return summary && !["completed", "failed", "stopped"].includes(summary.taskState);
+    });
+    summaryRpcEvidence.tuiRequests = tuiSummaryRequests.length;
+    summaryRpcEvidence.tuiResponses200 = tuiSummary200.length;
+    summaryRpcEvidence.tuiResponses400 = tuiSummary400.length;
+    summaryRpcEvidence.preterminal = preterminalResponses.length > 0;
+    summaryRpcEvidence.matchingRunProjection = validRunResponses.length > 0;
+    assert(
+      "summary RPC no fluxo TUI real: requests observados e zero HTTP 400/schema error",
+      tuiSummaryRequests.length > 0 && tuiSummary400.length === 0,
+      `requests=${tuiSummaryRequests.length} http200=${tuiSummary200.length} http400=${tuiSummary400.length}`,
+    );
+    assert(
+      "summary RPC real: HTTP 200 para runID bound com projeção bounded",
+      tuiRunID !== null && validRunResponses.length > 0,
+      `runID=${tuiRunID} matching200=${validRunResponses.length}`,
+    );
+    assert(
+      "summary RPC/TUI real: atualização preterminal observada",
+      preterminalResponses.length > 0,
+      `preterminal=${preterminalResponses.length}`,
+    );
+
     const tuiNoticeText = watchOut.tuiNoticeFull;
     assert(
       "TUI: notice daquele run contem o tuiRunID",
@@ -1344,6 +1438,18 @@ async function main() {
   try {
     await sleep(1500);
     pollSniffer(sniffLogPath);
+    const allSummaryRequests = sniffCount((e) => e.dir === "req" && e.method === "POST" && e.path === SUMMARY_RPC_PATH);
+    const allSummaryResponses = sniffEvents.filter((e) => e.dir === "res" && e.path === SUMMARY_RPC_PATH);
+    const summaryHttp200 = allSummaryResponses.filter((e) => e.status === 200).length;
+    const summaryHttp400 = allSummaryResponses.filter((e) => e.status === 400).length;
+    const summarySchemaErrors = allSummaryResponses.filter((e) =>
+      e.status === 400 && /rpc\.invalid_input|Pattern encountered|schema/i.test(String(e.body ?? "")),
+    ).length;
+    assert(
+      "summary RPC wire global: zero HTTP 400/schema errors no runtime autoritativo",
+      allSummaryRequests > 0 && summaryHttp400 === 0 && summarySchemaErrors === 0,
+      `requests=${allSummaryRequests} http200=${summaryHttp200} http400=${summaryHttp400} schemaErrors=${summarySchemaErrors}`,
+    );
     const patchInbox = sniffCount(
       (e) => e.dir === "req" && e.method === "PATCH" && String(e.path).includes("/inbox"),
     );
@@ -1434,6 +1540,19 @@ async function main() {
           (e) => e.dir === "req" && e.method === "PATCH" && String(e.path).includes("/inbox"),
         ),
         rpc: sniffCount((e) => e.dir === "req" && String(e.path).includes("/api/rpc/")),
+      },
+      executionSummaryRpc: {
+        requests: sniffCount((e) => e.dir === "req" && e.method === "POST" && e.path === SUMMARY_RPC_PATH),
+        http200: sniffCount((e) => e.dir === "res" && e.path === SUMMARY_RPC_PATH && e.status === 200),
+        http400: sniffCount((e) => e.dir === "res" && e.path === SUMMARY_RPC_PATH && e.status === 400),
+        schemaErrors: sniffCount((e) => e.dir === "res" && e.path === SUMMARY_RPC_PATH && e.status === 400 && /rpc\.invalid_input|Pattern encountered|schema/i.test(String(e.body ?? ""))),
+        unboundProbeHttpStatus: summaryRpcEvidence.probeStatus,
+        unboundProbeAvailable: summaryRpcEvidence.probeAvailable,
+        tuiRequests: summaryRpcEvidence.tuiRequests,
+        tuiResponses200: summaryRpcEvidence.tuiResponses200,
+        tuiResponses400: summaryRpcEvidence.tuiResponses400,
+        matchingRunBoundedProjection: summaryRpcEvidence.matchingRunProjection,
+        preterminal: summaryRpcEvidence.preterminal,
       },
     },
     runIDs: gwEvents.filter((e) => e.type === "rpc-dispatched").map((e) => e.runID),

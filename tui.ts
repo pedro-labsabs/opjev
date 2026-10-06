@@ -27,7 +27,11 @@ import {
   isPresentableSession,
   type OrchestrationResultEvent,
 } from "./src/orchestration/presentation.ts";
+import { ExecutionSummaryRpc } from "./src/orchestration/execution-summary-rpc.ts";
+import { createActiveSummaryPoller } from "./src/orchestration/active-summary-poller.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
+import type { ExecutionSummary } from "./src/orchestration/summary.ts";
+import { composeExecutionNoticeFromLookup, deliverExecutionNoticeWithRetry, formatActiveExecutionSummary } from "./src/orchestration/summary-presentation.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -86,9 +90,68 @@ export default Plugin.define({
     const inflight = new Set<string>();
     /** Sessoes cuja historia ja foi marcada como vista (evita replay no TUI). */
     const baselined = new Set<string>();
+    // Timers e polls pertencem ao ciclo de vida desta instancia do TUI.
+    let disposed = false;
+    let reconciling = false;
+    const refreshTimers = new Set<ReturnType<typeof setTimeout>>();
     // Cursor temporal da instalação para recuperar notices publicados antes
     // do primeiro poll, sem reapresentar notices históricos da sessão.
     const reconciliationStartedAt = Date.now();
+
+    let activeSummarySessionID: string | undefined;
+    let activeSummaryPoller: ReturnType<typeof createActiveSummaryPoller> | undefined;
+    let summaryClient: any;
+    try {
+      summaryClient = (ctx.client as any).rpc(ExecutionSummaryRpc);
+      activeSummaryPoller = createActiveSummaryPoller({
+        getSummary: async (sessionID) => {
+          try {
+            const response = await summaryClient.getActiveSummary({ sessionID });
+            return {
+              runID: typeof response?.runID === "string" ? response.runID : undefined,
+              summary: response?.summary && typeof response.summary === "object"
+                ? response.summary as ExecutionSummary
+                : { available: false },
+            };
+          } catch {
+            return { summary: { available: false } };
+          }
+        },
+        currentSessionID: () => {
+          const route = ctx.ui.router.current();
+          if (route?.type !== "session") return undefined;
+          const sessionID = String(route.sessionID);
+          const info = ctx.data.session.get(sessionID);
+          if (!isPresentableSession({
+            currentSessionID: sessionID,
+            eventSessionID: sessionID,
+            metadata: info?.metadata as Record<string, unknown> | undefined,
+            parentID: typeof info?.parentID === "string" ? info.parentID : undefined,
+          })) return undefined;
+          return sessionID;
+        },
+        present: (sessionID, summary) => {
+          if (disposed) return;
+          const message = formatActiveExecutionSummary(summary);
+          if (message.length === 0) return;
+          const recovering = summary.taskState === "repairing" || (summary.recoveryEvents?.length ?? 0) > 0;
+          ctx.ui.toast.show({
+            title: `Orchestration · ${recovering ? "Recovering" : "Progressing"}`,
+            message,
+            variant: summary.taskState === "awaiting-human" ? "warning" : "success",
+            duration: TOAST_DURATION_MS,
+          });
+          trace("active-summary-shown", { sessionID, taskState: summary.taskState, recovering });
+        },
+      });
+      const route = ctx.ui.router.current();
+      if (route?.type === "session") {
+        activeSummarySessionID = String(route.sessionID);
+        activeSummaryPoller.start(activeSummarySessionID);
+      }
+    } catch (err) {
+      trace("active-summary-unavailable", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+    }
 
     /**
      * Uma tentativa de render.
@@ -99,6 +162,7 @@ export default Plugin.define({
      *    interna/subagente). Nunca re-tenta.
      */
     const renderOnce = (sessionID: string, phase: string, notice: string): "shown" | "retry" | "skip" => {
+      if (disposed) return "skip";
       // Filtro de papel (fail-closed): sessao corrente do TUI deve ser a
       // parent do run; sessoes internas/subagentes nunca apresentam.
       let currentSessionID: string | undefined;
@@ -144,10 +208,17 @@ export default Plugin.define({
       }
       trace("render", { sessionID, status, currentSessionID });
 
+      const outcome = phase === "completed" ? "Completed"
+        : phase === "failed" ? "Failed"
+        : phase === "stopped" ? "Safely stopped"
+        : phase === "limit-reached" ? "Limit reached"
+        : phase === "awaiting-human" ? "Human review required"
+        : "Execution update";
       ctx.ui.toast.show({
-        title: "Orquestracao",
+        title: `Orchestration · ${outcome}`,
         message: String(notice ?? "").slice(0, 2000),
-        variant: phase === "failed" ? "error" : "success",
+        variant: phase === "failed" || phase === "stopped" ? "error"
+          : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
         duration: TOAST_DURATION_MS,
       });
       return "shown";
@@ -165,13 +236,22 @@ export default Plugin.define({
     const refreshToast = (sessionID: string, phase: string, notice: string): void => {
       for (let i = 1; i <= TOAST_REFRESH_MAX; i++) {
         const t = setTimeout(() => {
+          refreshTimers.delete(t);
+          if (disposed) return;
           try {
             const route = ctx.ui.router.current();
             if (route?.type !== "session" || String(route.sessionID) !== sessionID) return;
+            const outcome = phase === "completed" ? "Completed"
+              : phase === "failed" ? "Failed"
+              : phase === "stopped" ? "Safely stopped"
+              : phase === "limit-reached" ? "Limit reached"
+        : phase === "awaiting-human" ? "Human review required"
+              : "Execution update";
             ctx.ui.toast.show({
-              title: "Orquestracao",
+              title: `Orchestration · ${outcome}`,
               message: String(notice ?? "").slice(0, 2000),
-              variant: phase === "failed" ? "error" : "success",
+              variant: phase === "failed" || phase === "stopped" ? "error"
+                : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
               duration: TOAST_DURATION_MS,
             });
             trace("toast-refreshed", { sessionID, attempt: i });
@@ -179,6 +259,7 @@ export default Plugin.define({
             // refresh best-effort: nunca propaga
           }
         }, TOAST_REFRESH_INTERVAL_MS * i);
+        refreshTimers.add(t);
         (t as unknown as { unref?: () => void }).unref?.();
       }
     };
@@ -203,24 +284,38 @@ export default Plugin.define({
       notice: string,
       source: "event" | "reconcile",
     ): Promise<boolean> => {
-      if (runID === "" || sessionID === "") return false;
+      if (disposed || runID === "" || sessionID === "") return false;
       if (seen.has(runID)) return false;
       if (inflight.has(runID)) return false;
       inflight.add(runID);
       try {
+        // Read-only, best-effort projection of the bounded persisted run. Keep
+        // notice delivery working even when storage is unavailable or stale.
+        const displayNotice = await composeExecutionNoticeFromLookup(notice, runID, () => {
+          if (!summaryClient) return Promise.reject(new Error("summary RPC unavailable"));
+          return summaryClient.getActiveSummary({ sessionID, runID }) as Promise<{
+            runID?: string;
+            summary?: ExecutionSummary;
+          }>;
+        });
+        if (disposed) return false;
         const deadline = Date.now() + ROUTE_RETRY_WINDOW_MS;
-        let outcome = renderOnce(sessionID, phase, notice);
-        while (outcome === "retry" && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, ROUTE_POLL_MS));
-          outcome = renderOnce(sessionID, phase, notice);
-        }
+        const outcome = await deliverExecutionNoticeWithRetry({
+          displayNotice,
+          render: (text) => renderOnce(sessionID, phase, text),
+          refresh: (text) => refreshToast(sessionID, phase, text),
+          deadline,
+          now: Date.now,
+          retryIntervalMs: ROUTE_POLL_MS,
+          wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        });
+        if (disposed) return false;
         if (outcome !== "shown") {
           trace("not-shown", { runID, outcome, source });
           return false;
         }
         trace("shown", { runID, sessionID, source });
         markSeen(runID);
-        refreshToast(sessionID, phase, notice);
         return true;
       } catch {
         return false; // falha de apresentacao isolada: nunca propaga
@@ -265,17 +360,33 @@ export default Plugin.define({
     // baseline por sessao para nunca reapresentar historico.
     const timer = setInterval(() => {
       void (async () => {
+        if (disposed || reconciling) return;
+        reconciling = true;
         try {
           const route = ctx.ui.router.current();
+          if (disposed) return;
+          const routedSessionID = route?.type === "session" ? String(route.sessionID) : undefined;
+          if (routedSessionID !== activeSummarySessionID) {
+            activeSummarySessionID = routedSessionID;
+            if (routedSessionID) activeSummaryPoller?.start(routedSessionID);
+            else activeSummaryPoller?.stop();
+          }
           if (route?.type !== "session") return;
           const sessionID = String(route.sessionID);
-          const items: unknown[] = ctx.data.session.pending.list(sessionID) ?? [];
+          // pending.list may briefly fail or return unusable data during session
+          // transitions; treat it as an empty snapshot and retry next poll.
+          const result: unknown = ctx.data.session.pending.list(sessionID);
+          const items: unknown[] = Array.isArray(result) ? result : [];
           const isBaseline = !baselined.has(sessionID);
           const toPresent = selectUnpresentedNotices({ sessionID, items, seen, baseline: baselined, startedAt: reconciliationStartedAt });
           if (isBaseline) {
             trace("baseline", { sessionID, marked: toPresent.length, recoveredFresh: toPresent.length });
           }
           for (const f of toPresent) {
+            if (disposed) break;
+            // A route change while awaiting must not render into the old session.
+            const current = ctx.ui.router.current();
+            if (current?.type !== "session" || String(current.sessionID) !== sessionID) break;
             await present(f.runID, sessionID, f.phase, f.notice, "reconcile");
           }
           // Trace so quando o reconciliador REALMENTE recupera algo (evidencia
@@ -285,6 +396,8 @@ export default Plugin.define({
           }
         } catch (err) {
           trace("reconcile-error", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+        } finally {
+          reconciling = false;
         }
       })();
     }, RECONCILE_INTERVAL_MS);
@@ -292,6 +405,10 @@ export default Plugin.define({
     (timer as unknown as { unref?: () => void }).unref?.();
 
     return () => {
+      disposed = true;
+      activeSummaryPoller?.stop();
+      for (const refreshTimer of refreshTimers) clearTimeout(refreshTimer);
+      refreshTimers.clear();
       try {
         unsubscribe?.();
       } catch {
