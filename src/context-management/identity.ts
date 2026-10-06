@@ -15,13 +15,20 @@ export function createPayloadFingerprintKey(): Uint8Array {
 export function fingerprintPayload(value: unknown, key: Uint8Array): string | undefined {
   if (!(key instanceof Uint8Array) || key.byteLength < 32 || value === undefined) return undefined;
   let serialized: string;
+  let typeTag: string;
   try {
-    serialized = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+    typeTag = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    if (typeof value === "string") serialized = value;
+    else {
+      const encoded = JSON.stringify(value);
+      if (encoded === undefined) return undefined;
+      serialized = encoded;
+    }
   } catch {
     return undefined;
   }
   try {
-    return createHmac("sha256", key).update(serialized, "utf8").digest("hex");
+    return createHmac("sha256", key).update(typeTag, "utf8").update("\u0000", "utf8").update(serialized, "utf8").digest("hex");
   } catch {
     return undefined;
   }

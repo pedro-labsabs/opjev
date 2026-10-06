@@ -106,6 +106,7 @@ it("hashes stable references and fingerprints payloads with a process key", () =
   assert.notDeepEqual(key1, key2);
   assert.equal(fingerprintPayload({ value: "private canary" }, key1), fingerprintPayload({ value: "private canary" }, key1));
   assert.notEqual(fingerprintPayload({ value: "private canary" }, key1), fingerprintPayload({ value: "private canary" }, key2));
+  assert.notEqual(fingerprintPayload("{}", key1), fingerprintPayload({}, key1), "payload type must be part of the fingerprint input");
   assert.equal(fingerprintPayload(undefined, key1), undefined);
   assert.equal(fingerprintPayload({ circular: (() => { const x = {}; x.self = x; return x; })() }, key1), undefined);
   const serialized = JSON.stringify(asset({ fingerprint: fingerprintPayload("private canary", key1) }));
