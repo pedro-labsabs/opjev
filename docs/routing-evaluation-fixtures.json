@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "description": "Representative deterministic route/agent selections. Offline Jev-path answers derive from prompt text using the router deterministic classifier, never fixture IDs or expected selections.",
+  "cases": [
+    {
+      "id": "lane-fast-coding-small-change",
+      "description": "A straightforward implementation request should select the fast coding lane.",
+      "category": "lane",
+      "input": {
+        "prompt": "Add a small input validation check to the signup form.",
+        "validAgents": [
+          "build",
+          "plan"
+        ],
+        "freeCandidates": [
+          "opencode/nemotron-3.5-lightning-free",
+          "opencode/muse-spark-1.3-contributor-free"
+        ]
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "via": "jev",
+        "overridden": false
+      }
+    },
+    {
+      "id": "lane-heavy-architecture",
+      "description": "Architecture and multi-file design work exercises heavy reasoning selection.",
+      "category": "lane",
+      "input": {
+        "prompt": "Design the architecture for a multi-file migration with concurrency trade-offs.",
+        "validAgents": [
+          "build",
+          "plan"
+        ],
+        "freeCandidates": [
+          "opencode/muse-spark-1.3-contributor-free",
+          "opencode/nemotron-3-ultra-free"
+        ]
+      },
+      "expected": {
+        "route": "heavy-reasoning",
+        "agent": "plan",
+        "model": "opencode/muse-spark-1.3-contributor-free",
+        "via": "jev",
+        "overridden": false
+      }
+    },
+    {
+      "id": "lane-research-documentation",
+      "description": "An explanatory investigation exercises research and documentation selection.",
+      "category": "lane",
+      "input": {
+        "prompt": "Research how the caching library works and explain the relevant documentation.",
+        "validAgents": [
+          "build",
+          "plan"
+        ],
+        "freeCandidates": [
+          "opencode/ling-3.0-flash-fin-free",
+          "opencode/muse-spark-1.3-contributor-free"
+        ]
+      },
+      "expected": {
+        "route": "research-docs",
+        "agent": "plan",
+        "model": "opencode/ling-3.0-flash-fin-free",
+        "via": "jev",
+        "overridden": false
+      }
+    },
+    {
+      "id": "boundary-simple-debug-remains-fast",
+      "description": "A routine debugging request without complexity signals remains in fast coding.",
+      "category": "boundary",
+      "input": {
+        "prompt": "Fix the typo in the button label.",
+        "validAgents": [
+          "build",
+          "plan"
+        ],
+        "freeCandidates": [
+          "opencode/nemotron-3.5-lightning-free"
+        ]
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "via": "jev",
+        "overridden": false
+      }
+    },
+    {
+      "id": "boundary-ambiguous-confidence-escalates",
+      "description": "Low confidence on a non-heavy Jev route must trigger the heavy-reasoning guardrail.",
+      "category": "boundary",
+      "input": {
+        "prompt": "Update the settings page.",
+        "stubConfidence": 0.2,
+        "validAgents": [
+          "build",
+          "plan"
+        ],
+        "freeCandidates": [
+          "opencode/muse-spark-1.3-contributor-free"
+        ]
+      },
+      "expected": {
+        "route": "heavy-reasoning",
+        "agent": "build",
+        "model": "opencode/muse-spark-1.3-contributor-free",
+        "via": "jev",
+        "overridden": true
+      }
+    },
+    {
+      "id": "fallback-network-error-uses-heuristic",
+      "description": "A simulated transport failure must use deterministic local routing without contacting a provider.",
+      "category": "fallback",
+      "input": {
+        "prompt": "Research how the caching library works and explain the documentation.",
+        "failure": "network"
+      },
+      "expected": {
+        "route": "research-docs",
+        "agent": "plan",
+        "via": "heuristic",
+        "fallbackReason": "simulated network failure"
+      }
+    },
+    {
+      "id": "fallback-timeout-heavy-prompt",
+      "description": "A simulated timeout on an architecture task must select the local heavy-reasoning fallback.",
+      "category": "fallback",
+      "input": {
+        "prompt": "Design architecture for a multi-file concurrency migration.",
+        "failure": "timeout"
+      },
+      "expected": {
+        "route": "heavy-reasoning",
+        "agent": "plan",
+        "via": "heuristic",
+        "fallbackReason": "jev systemone: timeout simulated offline"
+      }
+    },
+    {
+      "id": "fallback-invalid-response-fast-prompt",
+      "description": "An invalid response failure must safely route a simple implementation task locally.",
+      "category": "fallback",
+      "input": {
+        "prompt": "Add a small validation check to a form.",
+        "failure": "invalid-response"
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "via": "heuristic",
+        "fallbackReason": "jev systemone: resposta sem campo answers"
+      }
+    }
+  ]
+}
