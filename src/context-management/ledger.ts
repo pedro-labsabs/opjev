@@ -24,6 +24,12 @@ const ASSET_FIELDS = [
   "messageRef", "entityRef", "payloadBytes", "fingerprint", "createdAt", "lastReferencedAt", "supersededBy",
   "evidenceRoles", "protection", "retention", "confidence",
 ] as const;
+const ROLE_VALUES = ["user-session", "worker", "critic", "orchestrator", "unknown"] as const;
+const SOURCE_VALUES = ["tool-call", "tool-result", "tool-failure", "tool-artifact"] as const;
+const PROTECTION_VALUES = ["protected", "clear", "unknown"] as const;
+const RETENTION_VALUES = ["KEEP", "KEEP_IDENTITY_TRUNCATE_PAYLOAD", "DROP"] as const;
+const CONFIDENCE_VALUES = ["high", "medium", "low"] as const;
+const EVIDENCE_VALUES = ["none", "required-evidence", "deterministic-check", "evidence-packet", "critic-finding", "binding-decision", "unknown"] as const;
 
 const HEX_64 = /^[a-f0-9]{64}$/;
 const ROLES = new Set(["user-session", "worker", "critic", "orchestrator", "unknown"]);
@@ -102,14 +108,32 @@ export function sanitizeContextAsset(value: unknown): ContextAssetV1 | undefined
 
 /** Compact positional wire form keeps complete SHA-256 references within the asset byte ceiling. */
 export function serializeContextAsset(asset: ContextAssetV1): readonly unknown[] {
-  return ASSET_FIELDS.map((key) => asset[key] === undefined ? null : asset[key]);
+  return ASSET_FIELDS.map((key) => {
+    const value = asset[key];
+    if (value === undefined) return null;
+    if (key === "role") return ROLE_VALUES.indexOf(value as typeof ROLE_VALUES[number]);
+    if (key === "source") return SOURCE_VALUES.indexOf(value as typeof SOURCE_VALUES[number]);
+    if (key === "protection") return PROTECTION_VALUES.indexOf(value as typeof PROTECTION_VALUES[number]);
+    if (key === "retention") return RETENTION_VALUES.indexOf(value as typeof RETENTION_VALUES[number]);
+    if (key === "confidence") return CONFIDENCE_VALUES.indexOf(value as typeof CONFIDENCE_VALUES[number]);
+    if (key === "evidenceRoles") return (value as EvidenceRole[]).map((role) => EVIDENCE_VALUES.indexOf(role));
+    return value;
+  });
 }
 
 export function deserializeContextAsset(value: unknown): ContextAssetV1 | undefined {
   if (!Array.isArray(value) || value.length !== ASSET_FIELDS.length) return sanitizeContextAsset(value);
   const expanded: Record<string, unknown> = {};
   ASSET_FIELDS.forEach((key, index) => {
-    if (value[index] !== null) expanded[key] = value[index];
+    const item = value[index];
+    if (item === null) return;
+    if (key === "role") expanded[key] = ROLE_VALUES[item as number];
+    else if (key === "source") expanded[key] = SOURCE_VALUES[item as number];
+    else if (key === "protection") expanded[key] = PROTECTION_VALUES[item as number];
+    else if (key === "retention") expanded[key] = RETENTION_VALUES[item as number];
+    else if (key === "confidence") expanded[key] = CONFIDENCE_VALUES[item as number];
+    else if (key === "evidenceRoles") expanded[key] = Array.isArray(item) ? item.map((n) => EVIDENCE_VALUES[n as number]) : item;
+    else expanded[key] = item;
   });
   return sanitizeContextAsset(expanded);
 }

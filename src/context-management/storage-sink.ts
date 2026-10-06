@@ -14,6 +14,10 @@ type ContextStorage = {
 const writesByOwner = new WeakMap<object, Promise<void>>();
 const queuedByOwner = new WeakMap<object, number>();
 
+export function isContextAssetSinkAtCapacity(owner: object): boolean {
+  return (queuedByOwner.get(owner) ?? 0) >= CONTEXT_LEDGER_PENDING_LIMIT;
+}
+
 /** Serialized bounded metadata writes; saturation and storage failures lose observation only. */
 export function createContextAssetSink(
   owner: object,
