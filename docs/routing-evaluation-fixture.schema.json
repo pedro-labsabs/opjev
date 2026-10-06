@@ -8,10 +8,11 @@
   "required": ["version", "cases"],
   "properties": {
     "version": { "const": 1 },
-    "description": { "type": "string" },
+    "description": { "type": "string", "maxLength": 1000 },
     "cases": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 100,
       "items": { "$ref": "#/$defs/case" }
     }
   },
@@ -22,16 +23,17 @@
       "required": ["id", "category", "input", "expected"],
       "properties": {
         "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-        "description": { "type": "string" },
+        "description": { "type": "string", "maxLength": 1000 },
         "category": { "enum": ["lane", "boundary", "fallback"] },
         "input": {
           "type": "object",
           "additionalProperties": false,
           "required": ["prompt"],
           "properties": {
-            "prompt": { "type": "string", "minLength": 1 },
-            "validAgents": { "type": "array", "items": { "type": "string" } },
-            "freeCandidates": { "type": "array", "items": { "type": "string" } },
+            "prompt": { "type": "string", "minLength": 1, "maxLength": 4000 },
+            "stubConfidence": { "type": "number", "minimum": 0, "maximum": 1 },
+            "validAgents": { "type": "array", "maxItems": 100, "items": { "type": "string", "maxLength": 128 } },
+            "freeCandidates": { "type": "array", "maxItems": 100, "items": { "type": "string", "maxLength": 256 } },
             "failure": { "enum": ["network", "timeout", "invalid-response", "invalid-route", "invalid-agent", "invalid-model"] }
           }
         },
@@ -41,11 +43,12 @@
           "required": ["route", "agent", "via"],
           "properties": {
             "route": { "enum": ["fast-coding", "heavy-reasoning", "research-docs"] },
-            "agent": { "type": "string", "minLength": 1 },
-            "model": { "type": "string", "minLength": 1 },
+            "agent": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "model": { "type": "string", "minLength": 1, "maxLength": 256 },
             "via": { "enum": ["jev", "heuristic"] },
             "overridden": { "type": "boolean" },
-            "fallbackReason": { "type": "string" }
+            "fallbackReason": { "type": "string", "maxLength": 512 },
+            "attemptedAgent": { "type": "string", "minLength": 1, "maxLength": 128 }
           }
         }
       }

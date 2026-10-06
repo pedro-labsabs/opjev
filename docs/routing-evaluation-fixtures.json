@@ -160,6 +160,60 @@
         "via": "heuristic",
         "fallbackReason": "jev systemone: resposta sem campo answers"
       }
+    },
+    {
+      "id": "fallback-invalid-route",
+      "description": "An invalid Jev route is rejected and the deterministic heuristic route is used.",
+      "category": "fallback",
+      "input": {
+        "prompt": "Add a small validation check to a form.",
+        "failure": "invalid-route",
+        "validAgents": ["build", "plan"],
+        "freeCandidates": ["opencode/nemotron-3.5-lightning-free"]
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "via": "heuristic",
+        "fallbackReason": "jev systemone: resposta choice invalida para route"
+      }
+    },
+    {
+      "id": "guardrail-invalid-agent",
+      "description": "An agent outside the runtime catalog is audited and replaced by the lane default.",
+      "category": "boundary",
+      "input": {
+        "prompt": "Add a small validation check to a form.",
+        "failure": "invalid-agent",
+        "validAgents": ["build", "plan"],
+        "freeCandidates": ["opencode/nemotron-3.5-lightning-free"]
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "via": "jev",
+        "overridden": true,
+        "attemptedAgent": "unlisted-agent"
+      }
+    },
+    {
+      "id": "guardrail-invalid-model",
+      "description": "An arbitrary paid model is rejected and replaced by the deterministic lane fallback.",
+      "category": "boundary",
+      "input": {
+        "prompt": "Add a small validation check to a form.",
+        "failure": "invalid-model",
+        "validAgents": ["build", "plan"],
+        "freeCandidates": ["opencode/nemotron-3.5-lightning-free"]
+      },
+      "expected": {
+        "route": "fast-coding",
+        "agent": "build",
+        "model": "opencode/nemotron-3.5-lightning-free",
+        "via": "jev",
+        "overridden": true
+      }
     }
   ]
 }

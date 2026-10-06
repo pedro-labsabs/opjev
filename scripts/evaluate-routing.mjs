@@ -1,10 +1,22 @@
 #!/usr/bin/env node
 /** Deterministic offline routing evaluation. All Jev traffic is intercepted locally. */
-import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
+import {
+  assertFailureModeParity,
+  FAILURE_MODE_HANDLERS,
+  jsonResponse,
+  readAndValidateFixtureDocument,
+} from './routing-evaluation-fixtures.mjs';
 
-const fixturePath = new URL('../docs/routing-evaluation-fixtures.json', import.meta.url);
-const fixtures = JSON.parse(await readFile(fixturePath, 'utf8'));
+const fixtureArgument = process.argv.indexOf('--fixtures');
+if (fixtureArgument >= 0 && !process.argv[fixtureArgument + 1]) {
+  throw new Error('--fixtures requires a JSON file path');
+}
+const fixturePath = fixtureArgument >= 0
+  ? process.argv[fixtureArgument + 1]
+  : new URL('../docs/routing-evaluation-fixtures.json', import.meta.url);
+assertFailureModeParity();
+const fixtures = await readAndValidateFixtureDocument(fixturePath);
 const routerUrl = pathToFileURL(new URL('../src/router.ts', import.meta.url).pathname);
 const { decideRoute, heuristicRoute } = await import(routerUrl.href);
 
@@ -16,7 +28,7 @@ function response(testCase) {
   // router's deterministic prompt classifier, never fixture IDs/expectations.
   const inferred = heuristicRoute(testCase.input.prompt);
   const { route, agent } = inferred;
-  const model = testCase.input.freeCandidates[0];
+  const model = testCase.input.freeCandidates?.[0] ?? inferred.model;
   return {
     model: 'offline-fixture-stub',
     answers: {
@@ -33,10 +45,11 @@ const results = [];
 try {
   for (const testCase of fixtures.cases) {
     globalThis.fetch = async () => {
-      if (testCase.input.failure === 'network') throw new Error('simulated network failure');
-      if (testCase.input.failure === 'timeout') throw new Error('jev systemone: timeout simulated offline');
-      if (testCase.input.failure === 'invalid-response') return new Response('{"unexpected":true}', { status: 200 });
-      return new Response(JSON.stringify(response(testCase)), { status: 200, headers: { 'content-type': 'application/json' } });
+      const failureHandler = testCase.input.failure
+        ? FAILURE_MODE_HANDLERS[testCase.input.failure]
+        : undefined;
+      const body = response(testCase);
+      return failureHandler ? failureHandler(body) : jsonResponse(body);
     };
     // Measure only the routing decision, excluding fixture setup and reporting.
     const startedAt = performance.now();
@@ -53,7 +66,10 @@ try {
     if (expected.model !== undefined) actual.model = result.model;
     if (expected.overridden !== undefined) actual.overridden = Boolean(result.overridden);
     if (expected.fallbackReason !== undefined) actual.fallbackReason = result.error;
-    const fields = ['route', 'agent', 'model', 'via', 'overridden', 'fallbackReason'].filter((field) => expected[field] !== undefined);
+    if (expected.attemptedAgent !== undefined || result.attemptedAgent !== undefined) {
+      actual.attemptedAgent = result.attemptedAgent;
+    }
+    const fields = ['route', 'agent', 'model', 'via', 'overridden', 'fallbackReason', 'attemptedAgent'].filter((field) => expected[field] !== undefined);
     const mismatches = fields.filter((field) => actual[field] !== expected[field]);
     results.push({ id: testCase.id, expected, actual, correct: mismatches.length === 0, mismatches, elapsedMs });
   }
