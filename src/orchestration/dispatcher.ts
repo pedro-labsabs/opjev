@@ -837,12 +837,12 @@ async function executeSchedule(
         // recoverySessionID (reuso); demais, sessao nova.
         executor: { agent: roundAgent, model: roundModel, sessionID: workerSessionID },
       }).state;
-      await observeResource(deps, { at: now(), kind: "round", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+      await observeResource(deps, { at: now(), kind: "round", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
       if (mode === "repair-same" || mode === "fresh-same" || mode === "human-resume") {
-        await observeResource(deps, { at: now(), kind: "recovery", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+        await observeResource(deps, { at: now(), kind: "recovery", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, recoveryAction: mode, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
       }
       if (mode === "switch-model" || mode === "switch-agent" || mode === "replan") {
-        await observeResource(deps, { at: now(), kind: "escalation", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+        await observeResource(deps, { at: now(), kind: "escalation", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, recoveryAction: mode, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
       }
       // worker-created apos STARTED (phase running): o store nunca mostra
       // ready quando a rodada ja comecou a executar (RESUME4/RESUME6).
@@ -903,7 +903,7 @@ async function executeSchedule(
       }
       let promptDelivered = false;
       try {
-        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
+        await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
         await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
         promptDelivered = true;
         if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
@@ -937,7 +937,7 @@ async function executeSchedule(
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
-      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
+      await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
       // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed.
       // Persiste run-failed: storage nunca fica em ready quando a API falha.
       let interrupted = false;
@@ -970,7 +970,7 @@ async function executeSchedule(
     const agent = view.agent?.trim() || roundAgent;
     const model = view.model?.trim() || roundModel;
     const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
-    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
+    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
 
     // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
     // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
@@ -1411,6 +1411,14 @@ async function executeSchedule(
       break;
     }
     await persist(deps, { kind: "verdict-applied", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
+    await observeResource(deps, {
+      at: now(), kind: "outcome", runID: contract.runID, sessionID: workerSessionID,
+      route: selection?.route, model, agent, role: "worker", round: evidence.round,
+      acceptance: verdict.nextAction === "accept" && state.phase === "completed",
+      verificationPassed: criticCheck.status === "pass",
+      failureClass: verdict.failureClass,
+      ...(mode !== "initial" ? { recoveryAction: mode } : {}),
+    });
 
     return {
       abort: false,

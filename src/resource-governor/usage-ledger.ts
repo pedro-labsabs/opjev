@@ -1,7 +1,7 @@
 /** Shared, factual telemetry for resource governance and future model intelligence. */
 export type ObservationKind =
   | "unknown"
-  | "request" | "round" | "retry" | "recovery" | "escalation" | "fanout"
+  | "request" | "round" | "retry" | "recovery" | "escalation" | "outcome" | "fanout"
   | "compaction" | "token-usage" | "throttle" | "quota-limit" | "context-overflow"
   | "provider-error" | "operational-failure";
 
@@ -12,7 +12,12 @@ export interface UsageObservation {
   sessionID?: string;
   model?: string;
   agent?: string;
+  route?: "fast-coding" | "heavy-reasoning" | "research-docs";
   role?: "worker" | "critic" | "orchestrator" | "jev" | "provider" | "unknown";
+  acceptance?: boolean;
+  verificationPassed?: boolean;
+  failureClass?: "none" | "implementation" | "reasoning" | "missing-context" | "wrong-agent" | "wrong-model" | "environment" | "bad-contract";
+  recoveryAction?: "repair-same" | "fresh-same" | "switch-model" | "switch-agent" | "replan" | "human-resume";
   round?: number;
   retry?: number;
   statusCode?: number;
@@ -24,13 +29,16 @@ export interface UsageObservation {
 
 const KINDS = new Set<ObservationKind>([
   "unknown",
-  "request", "round", "retry", "recovery", "escalation", "fanout", "compaction",
+  "request", "round", "retry", "recovery", "escalation", "outcome", "fanout", "compaction",
   "token-usage", "throttle", "quota-limit", "context-overflow", "provider-error", "operational-failure",
 ]);
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
 const SAFE_ERROR_CODES = new Set(["FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "429", "529"]);
 const TOKEN_KEYS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
+const ROUTES = new Set(["fast-coding", "heavy-reasoning", "research-docs"]);
+const FAILURE_CLASSES = new Set(["none", "implementation", "reasoning", "missing-context", "wrong-agent", "wrong-model", "environment", "bad-contract"]);
+const RECOVERY_ACTIONS = new Set(["repair-same", "fresh-same", "switch-model", "switch-agent", "replan", "human-resume"]);
 
 /** Strict whitelist: prompts, messages, stack traces, and arbitrary payloads are discarded. */
 export function sanitizeObservation(value: unknown): UsageObservation {
@@ -44,7 +52,12 @@ export function sanitizeObservation(value: unknown): UsageObservation {
     if (key === "errorCode" && !SAFE_ERROR_CODES.has(x[key] as string)) continue;
     (out as any)[key] = (x[key] as string).slice(0, MAX_TEXT);
   }
+  if (ROUTES.has(String(x.route))) out.route = x.route as UsageObservation["route"];
   if (["worker", "critic", "orchestrator", "jev", "provider", "unknown"].includes(String(x.role))) out.role = x.role as UsageObservation["role"];
+  if (typeof x.acceptance === "boolean") out.acceptance = x.acceptance;
+  if (typeof x.verificationPassed === "boolean") out.verificationPassed = x.verificationPassed;
+  if (FAILURE_CLASSES.has(String(x.failureClass))) out.failureClass = x.failureClass as UsageObservation["failureClass"];
+  if (RECOVERY_ACTIONS.has(String(x.recoveryAction))) out.recoveryAction = x.recoveryAction as UsageObservation["recoveryAction"];
   if (["provider", "quota", "context", "execution", "operational", "unknown"].includes(String(x.failureDomain))) out.failureDomain = x.failureDomain as UsageObservation["failureDomain"];
   if (["rate-limit", "throttle", "overload", "unknown"].includes(String(x.signal))) out.signal = x.signal as UsageObservation["signal"];
   for (const key of ["round", "retry", "statusCode"] as const) if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
