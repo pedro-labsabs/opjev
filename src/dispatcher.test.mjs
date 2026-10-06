@@ -1172,6 +1172,7 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
       assert.equal(t.effects.includes("select-model"), false);
       assert.equal(t.effects.includes("select-agent"), false);
       assert.equal(observations.some(x => x.kind === expectedKind && x.failureDomain === (expectedKind === "quota-limit" ? "quota" : "provider")), true);
+      assert.equal(observations.some(x => x.kind === "outcome"), false, "provider failures do not create a capability outcome");
       assert.equal(JSON.stringify(observations).includes(error.message), false);
     }
   });
@@ -1202,6 +1203,28 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.equal(observations.some(x => x.kind === "operational-failure"), true);
     assert.equal(observations.some(x => x.kind === "provider-error"), false);
     assert.equal(JSON.stringify(observations).includes("unexpected local error"), false);
+  });
+
+  it("O0g: accepted outcomes are observed after the verdict without adding Jev calls", async () => {
+    const t = fakeDeps();
+    const observations = [];
+    const judgeRound = t.decisions.judgeRound;
+    t.decisions.judgeRound = async input => {
+      assert.equal(observations.some(x => x.kind === "outcome"), false, "outcome is unavailable before the verdict");
+      return judgeRound(input);
+    };
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      observeResource: event => observations.push(event),
+    });
+    const outcome = observations.find(x => x.kind === "outcome");
+    assert.equal(result.phase, "completed");
+    assert.deepEqual({ route: outcome.route, model: outcome.model, agent: outcome.agent, acceptance: outcome.acceptance, verificationPassed: outcome.verificationPassed, failureClass: outcome.failureClass }, {
+      route: "fast-coding", model: "opencode/big-pickle", agent: "build", acceptance: true, verificationPassed: true, failureClass: "none",
+    });
+    assert.equal(t.effects.filter(x => x === "judge").length, 1);
   });
 
   it("O1: happy path -> completed, round 1, worker criado UMA vez, judge UMA vez", async () => {
