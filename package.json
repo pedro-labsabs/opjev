@@ -14,7 +14,8 @@
     "evaluate:routing": "node ./scripts/evaluate-routing.mjs",
     "e2e:gateway": "node scripts/e2e-gateway.mjs",
     "e2e:matrix": "node scripts/e2e-multiround-matrix.mjs",
-    "e2e:multiround-real": "node scripts/e2e-multiround-real.mjs"
+    "e2e:multiround-real": "node scripts/e2e-multiround-real.mjs",
+    "e2e:context": "node scripts/e2e-context-management.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.7"
