@@ -3,11 +3,18 @@ import assert from "node:assert/strict";
 import { EXECUTION_SUMMARY_MAX_AGE_MS, summarizeExecutionRun } from "./orchestration/summary.ts";
 
 describe("execution summary", () => {
+  const state = (phase, overrides = {}) => ({
+    phase,
+    round: 1,
+    contract: { maxRounds: 4 },
+    history: [],
+    ...overrides,
+  });
+
   it("projects current task, route, progress, and bounded recovery events", () => {
     const result = summarizeExecutionRun({
       updatedAt: 1000,
-      state: {
-        phase: "executing",
+      state: state("running", {
         round: 2,
         contract: { maxRounds: 4 },
         executor: { agent: "build-agent", model: "free-model" },
@@ -16,11 +23,11 @@ describe("execution summary", () => {
           { round: 2, verdict: { nextAction: "switch-model" } },
           { round: 3, verdict: { nextAction: "ignore-this" } },
         ],
-      },
+      }),
     }, 1000);
 
     assert.equal(result.available, true);
-    assert.equal(result.taskState, "executing");
+    assert.equal(result.taskState, "running");
     assert.equal(result.route, "build-agent / free-model");
     assert.equal(result.round, 2);
     assert.equal(result.maxRounds, 4);
@@ -31,10 +38,10 @@ describe("execution summary", () => {
   it("includes resume and stop recovery events when present", () => {
     const result = summarizeExecutionRun({
       updatedAt: 1000,
-      state: { phase: "executing", history: [
+      state: state("running", { history: [
         { humanDecision: { action: "resume" } },
         { humanDecision: { action: "stop" } },
-      ] },
+      ] }),
     }, 1000);
     assert.deepEqual(result.recoveryEvents, ["Execution resumed after human review", "Stopped by human decision"]);
   });
@@ -42,14 +49,20 @@ describe("execution summary", () => {
   it("distinguishes completed, failed, and exhausted-limit outcomes", () => {
     const summarize = (state) => summarizeExecutionRun({ updatedAt: 1000, state }, 1000);
 
-    const completed = summarize({ phase: "completed" });
-    const failed = summarize({ phase: "failed", lastError: "worker crashed" });
-    const limited = summarize({
-      phase: "awaiting-human",
+    const completed = summarize(state("completed"));
+    const failed = summarize(state("failed", { lastError: "worker crashed" }));
+    const limited = summarize(state("awaiting-human", {
       round: 4,
-      contract: { maxRounds: 4 },
-      pendingHuman: { reason: "Review the final attempt" },
-    });
+      pendingHuman: {
+        requestID: "human:4:4:max-rounds",
+        kind: "max-rounds",
+        round: 4,
+        reason: "Review the final attempt",
+        requiredAuthority: "increase-budget-or-stop",
+        currentMaxRounds: 4,
+        minimumMaxRounds: 5,
+      },
+    }));
 
     assert.equal(completed.outcome, "completed");
     assert.equal(completed.taskState, "completed");
@@ -74,9 +87,9 @@ describe("execution summary", () => {
     };
     assert.deepEqual(summarize(undefined), { available: false });
     assert.deepEqual(summarize({ updatedAt: 1000, state: null }), { available: false });
-    assert.deepEqual(summarize({ updatedAt: 1000, state: { phase: "  " } }), { available: false });
-    assert.deepEqual(summarize({ updatedAt: 0, state: { phase: "executing" } }, EXECUTION_SUMMARY_MAX_AGE_MS + 1), { available: false });
-    assert.deepEqual(summarize({ updatedAt: 1001, state: { phase: "executing" } }, 1000), { available: false });
+    assert.deepEqual(summarize({ updatedAt: 1000, state: state("  ") }), { available: false });
+    assert.deepEqual(summarize({ updatedAt: 0, state: state("running") }, EXECUTION_SUMMARY_MAX_AGE_MS + 1), { available: false });
+    assert.deepEqual(summarize({ updatedAt: 1001, state: state("running") }, 1000), { available: false });
 
     const changing = { updatedAt: 1000, get state() { throw new Error("state disappeared"); } };
     assert.deepEqual(summarize(changing), { available: false });
@@ -85,8 +98,72 @@ describe("execution summary", () => {
   it("does not label a non-exhausted human-review state as limit reached", () => {
     const result = summarizeExecutionRun({
       updatedAt: 1000,
-      state: { phase: "awaiting-human", round: 2, contract: { maxRounds: 4 } },
+      state: state("awaiting-human", {
+        round: 2,
+        pendingHuman: {
+          requestID: "human:2:1:jev-human",
+          kind: "jev-human",
+          round: 2,
+          reason: "Review needed",
+          requiredAuthority: "resume-or-stop",
+          currentMaxRounds: 4,
+          minimumMaxRounds: 3,
+        },
+      }),
     }, 1000);
     assert.equal(result.outcome, undefined);
+  });
+
+  it("keeps stopped distinct from failed", () => {
+    const result = summarizeExecutionRun({ updatedAt: 1000, state: state("stopped") }, 1000);
+    assert.equal(result.available, true);
+    assert.equal(result.taskState, "stopped");
+    assert.equal(result.outcome, "stopped");
+    assert.equal(result.detail, "Execution safely stopped");
+    assert.notEqual(result.outcome, "failed");
+  });
+
+  it("rejects unknown and invented persisted phases", () => {
+    for (const phase of ["executing", "limit-reached", "unknown"]) {
+      assert.deepEqual(
+        summarizeExecutionRun({ updatedAt: 1000, state: state(phase) }, 1000),
+        { available: false },
+      );
+    }
+  });
+
+  it("derives limit reached only from a matching exhausted max-rounds human request", () => {
+    const exhausted = summarizeExecutionRun({
+      updatedAt: 1000,
+      state: state("awaiting-human", {
+        round: 4,
+        pendingHuman: {
+          requestID: "human:4:4:max-rounds",
+          kind: "max-rounds",
+          round: 4,
+          reason: "Budget exhausted",
+          requiredAuthority: "increase-budget-or-stop",
+          currentMaxRounds: 4,
+          minimumMaxRounds: 5,
+        },
+      }),
+    }, 1000);
+    const forgedBudget = summarizeExecutionRun({
+      updatedAt: 1000,
+      state: state("awaiting-human", {
+        round: 4,
+        pendingHuman: {
+          requestID: "human:4:4:jev-human",
+          kind: "jev-human",
+          round: 4,
+          reason: "Human review",
+          requiredAuthority: "resume-or-stop",
+          currentMaxRounds: 4,
+          minimumMaxRounds: 5,
+        },
+      }),
+    }, 1000);
+    assert.equal(exhausted.outcome, "limit-reached");
+    assert.equal(forgedBudget.outcome, undefined);
   });
 });
