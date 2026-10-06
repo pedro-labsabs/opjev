@@ -45,6 +45,7 @@ test("active summary RPC reads only the current session binding and bounded run 
   assert.equal(result.summary.route, "builder / free-model");
   assert.deepEqual(reads, [sessionBindingKey(SESSION_ID), `orchestration/run/${RUN_ID}`]);
   assert.deepEqual(Object.keys(ExecutionSummaryRpc.methods), ["getActiveSummary"]);
+  assert.equal(ExecutionSummaryRpc.methods.getActiveSummary.input.properties.sessionID.pattern, "^[A-Za-z0-9._:-]+$");
 });
 
 test("active summary RPC fails closed for missing or malformed bindings", async () => {
