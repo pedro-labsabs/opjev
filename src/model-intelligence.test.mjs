@@ -38,6 +38,33 @@ test("profiles keep capability, efficiency, availability, and recovery independe
   assert.deepEqual(profile.freshness, { newestAt: 9_000, stale: false });
 });
 
+for (const [action, kind] of [
+  ["repair-same", "recovery"],
+  ["switch-model", "escalation"],
+  ["switch-agent", "escalation"],
+  ["replan", "escalation"],
+]) {
+  test(`${action} contributes one coherent recovery attempt and accepted outcome`, () => {
+    const profile = buildObserveProfiles([
+      { ...base, at: 1, kind, model: "zen/model-r", runID: "run-r", round: 2, recoveryAction: action },
+      { ...base, at: 2, kind: "outcome", model: "zen/model-r", runID: "run-r", round: 2, recoveryAction: action, acceptance: true, verificationPassed: true, failureClass: "none" },
+    ], { from: 0, to: 3, now: 3 })[0];
+    assert.equal(profile.recovery.samples, 1);
+    assert.equal(profile.recovery.attempts, 1);
+    assert.equal(profile.recovery.actions[action], 1);
+    assert.equal(profile.recovery.acceptedAfterRecovery, 1);
+  });
+}
+
+test("an escalation without an explicit recovery action is not reclassified as recovery", () => {
+  const profile = buildObserveProfiles([
+    { ...base, at: 1, kind: "escalation", model: "zen/model-r", runID: "run-r", round: 2 },
+  ], { from: 0, to: 3, now: 3 })[0];
+  assert.equal(profile.recovery.samples, 0);
+  assert.equal(profile.recovery.attempts, 0);
+  assert.deepEqual(profile.recovery.actions, {});
+});
+
 test("provider failures affect availability but never capability samples", () => {
   const profiles = buildObserveProfiles([
     { ...base, at: 4, kind: "provider-error", model: "zen/model-a", failureDomain: "provider" },

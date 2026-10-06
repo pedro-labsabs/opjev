@@ -107,7 +107,9 @@ function buildProfile(bucket: Bucket, now: number, staleAfterMs: number, minSamp
   const providerFailures = availabilityFacts.filter(x => x.kind === "provider-error").length;
   const throttles = availabilityFacts.filter(x => x.kind === "throttle").length;
   const quotaLimits = availabilityFacts.filter(x => x.kind === "quota-limit").length;
-  const recoveryFacts = workerFacts.filter(x => x.kind === "recovery");
+  const recoveryFacts = workerFacts.filter(x =>
+    (x.kind === "recovery" || x.kind === "escalation") && x.recoveryAction !== undefined,
+  );
   const actions: ModelObserveProfile["recovery"]["actions"] = {};
   for (const fact of recoveryFacts) if (fact.recoveryAction) actions[fact.recoveryAction] = (actions[fact.recoveryAction] ?? 0) + 1;
   const acceptedAfterRecovery = capabilityFacts.filter(x => x.acceptance && x.recoveryAction).length;

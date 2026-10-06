@@ -1413,7 +1413,7 @@ async function executeSchedule(
     await persist(deps, { kind: "verdict-applied", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
     await observeResource(deps, {
       at: now(), kind: "outcome", runID: contract.runID, sessionID: workerSessionID,
-      route: selection?.route, model, agent, role: "worker", round: state.round,
+      route: selection?.route, model, agent, role: "worker", round: evidence.round,
       acceptance: verdict.nextAction === "accept" && state.phase === "completed",
       verificationPassed: criticCheck.status === "pass",
       failureClass: verdict.failureClass,

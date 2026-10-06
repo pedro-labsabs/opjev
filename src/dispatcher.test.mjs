@@ -1227,6 +1227,24 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.equal(t.effects.filter(x => x === "judge").length, 1);
   });
 
+  it("O0h: each outcome keeps the completed round number across a recovery transition", async () => {
+    const t = fakeDeps({ judgeAnswersSeq: [repairAnswers(), acceptAnswers()] });
+    const observations = [];
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      observeResource: event => observations.push(event),
+    });
+    const outcomes = observations.filter(x => x.kind === "outcome");
+    assert.equal(result.phase, "completed");
+    assert.equal(result.round, 2, "scheduler advanced to and accepted round 2");
+    assert.deepEqual(outcomes.map(x => ({ round: x.round, acceptance: x.acceptance, recoveryAction: x.recoveryAction })), [
+      { round: 1, acceptance: false, recoveryAction: undefined },
+      { round: 2, acceptance: true, recoveryAction: "repair-same" },
+    ]);
+  });
+
   it("O1: happy path -> completed, round 1, worker criado UMA vez, judge UMA vez", async () => {
     const t = fakeDeps();
     const result = await runOrchestrationOnce(contract(), {
