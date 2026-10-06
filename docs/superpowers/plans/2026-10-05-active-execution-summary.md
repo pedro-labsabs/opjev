@@ -32,11 +32,11 @@
 
 **Files:**
 - Create: `src/orchestration/execution-summary-rpc.ts`
+- Create: `src/orchestration/active-summary-poller.ts`
 - Create: `src/execution-summary-rpc.test.mjs`
+- Create: `src/active-summary-poller.test.mjs`
 - Modify: `index.ts`
 - Modify: `tui.ts`
-- Modify: `src/orchestration/types.ts`
-- Modify: `src/presentation.test.mjs` or a focused active-summary test file
 
 **Interfaces:**
 - Produces: `ExecutionSummaryRpc`, `createExecutionSummaryHandler({ storage })`, and `getActiveSummary({ sessionID }) -> { summary: ExecutionSummary }`.
@@ -45,11 +45,11 @@
 - Poll interval is 1500 ms and maximum active polling lifetime is 5 minutes per route; cleanup stops it sooner on route change, terminal state, or disposal.
 
 - [ ] **Step 1: Write the failing RPC tests.** Verify a valid binding returns the persisted running summary, storage access consists only of `get`, missing/malformed binding is unavailable, and storage errors return unavailable.
-- [ ] **Step 2: Run `node --test src/execution-summary-rpc.test.mjs` and confirm these tests fail because the RPC module is not implemented.**
+- [ ] **Step 2: Run `node --test src/execution-summary-rpc.test.mjs src/active-summary-poller.test.mjs` and confirm these tests fail because the production modules are not implemented.**
 - [ ] **Step 3: Implement the bounded read-only RPC schema and handler.** Validate `sessionID` and binding identity; never expose the persisted record or unrecognized fields.
 - [ ] **Step 4: Register the query in `index.ts` and add the TUI client polling loop.** Poll the current session at a fixed interval for a bounded window; present changed valid nonterminal summaries only, stop on route change, terminal state, timeout, or disposal, and clear timers during cleanup.
 - [ ] **Step 5: Add a deterministic polling test with successive `running` and `repairing` snapshots.** Assert the repair/recovery summary is rendered before any terminal snapshot, unchanged snapshots are deduplicated, and polling stops at its bound.
-- [ ] **Step 6: Run `node --test src/execution-summary-rpc.test.mjs` and the focused active-summary test; expect all assertions to pass.**
+- [ ] **Step 6: Run `node --test src/execution-summary-rpc.test.mjs src/active-summary-poller.test.mjs`; expect all assertions to pass.**
 - [ ] **Step 7: Commit the RPC, registration, polling, and focused tests.**
 
 ### Task 2: Canonical phase and terminal outcome projection
@@ -61,11 +61,11 @@
 
 **Interfaces:**
 - Consumes: canonical `RunPhase` from `src/orchestration/types.ts`.
-- Produces: `ExecutionSummary.outcome` includes `stopped`; only canonical persisted phases are accepted.
+- Produces: `ExecutionSummary.outcome` in `src/orchestration/summary.ts` includes `stopped`; only canonical persisted phases are accepted.
 
 - [ ] **Step 1: Add failing tests for `stopped`, invalid `limit-reached`, unknown phase, and exhausted/non-exhausted `awaiting-human`.** Assert stopped has outcome `stopped`, unknown/invented phases are unavailable, and the derived limit is only emitted for exhausted canonical state.
 - [ ] **Step 2: Run `node --test src/orchestration-summary.test.mjs` and confirm the new assertions fail on the current projection.**
-- [ ] **Step 3: Extend `ExecutionSummary.outcome` with `stopped`; validate phase against canonical `RunPhase`; derive `limit-reached` from valid `awaiting-human` budget fields; preserve separate stopped outcome/detail.**
+- [ ] **Step 3: Extend `ExecutionSummary.outcome` in `src/orchestration/summary.ts` with `stopped`; validate phase against canonical `RunPhase`; derive `limit-reached` from valid `awaiting-human` budget fields; preserve separate stopped outcome/detail.**
 - [ ] **Step 4: Run `node --test src/orchestration-summary.test.mjs src/execution-summary-rpc.test.mjs`; expect all tests to pass.**
 - [ ] **Step 5: Commit the phase projection and tests.**
 

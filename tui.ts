@@ -27,8 +27,10 @@ import {
   isPresentableSession,
   type OrchestrationResultEvent,
 } from "./src/orchestration/presentation.ts";
+import { ExecutionSummaryRpc } from "./src/orchestration/execution-summary-rpc.ts";
+import { createActiveSummaryPoller } from "./src/orchestration/active-summary-poller.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
-import { summarizeExecutionRun } from "./src/orchestration/summary.ts";
+import { summarizeExecutionRun, type ExecutionSummary } from "./src/orchestration/summary.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -94,6 +96,62 @@ export default Plugin.define({
     // Cursor temporal da instalação para recuperar notices publicados antes
     // do primeiro poll, sem reapresentar notices históricos da sessão.
     const reconciliationStartedAt = Date.now();
+
+    let activeSummarySessionID: string | undefined;
+    let activeSummaryPoller: ReturnType<typeof createActiveSummaryPoller> | undefined;
+    try {
+      const summaryClient = (ctx.client as any).rpc(ExecutionSummaryRpc);
+      activeSummaryPoller = createActiveSummaryPoller({
+        getSummary: async (sessionID) => {
+          try {
+            const response = await summaryClient.getActiveSummary({ sessionID });
+            return response?.summary && typeof response.summary === "object"
+              ? response.summary as ExecutionSummary
+              : { available: false };
+          } catch {
+            return { available: false };
+          }
+        },
+        currentSessionID: () => {
+          const route = ctx.ui.router.current();
+          if (route?.type !== "session") return undefined;
+          const sessionID = String(route.sessionID);
+          const info = ctx.data.session.get(sessionID);
+          if (!isPresentableSession({
+            currentSessionID: sessionID,
+            eventSessionID: sessionID,
+            metadata: info?.metadata as Record<string, unknown> | undefined,
+            parentID: typeof info?.parentID === "string" ? info.parentID : undefined,
+          })) return undefined;
+          return sessionID;
+        },
+        present: (sessionID, summary) => {
+          if (disposed) return;
+          const lines = [
+            summary.route ? `Route: ${summary.route}` : undefined,
+            summary.progress,
+            summary.detail,
+            ...(summary.recoveryEvents ?? []).map((event) => `Recovery: ${event}`),
+          ].filter((line): line is string => Boolean(line));
+          if (lines.length === 0) return;
+          const recovering = summary.taskState === "repairing" || (summary.recoveryEvents?.length ?? 0) > 0;
+          ctx.ui.toast.show({
+            title: `Orchestration · ${recovering ? "Recovering" : "Progressing"}`,
+            message: lines.join("\n").slice(0, 2000),
+            variant: summary.taskState === "awaiting-human" ? "warning" : "success",
+            duration: TOAST_DURATION_MS,
+          });
+          trace("active-summary-shown", { sessionID, taskState: summary.taskState, recovering });
+        },
+      });
+      const route = ctx.ui.router.current();
+      if (route?.type === "session") {
+        activeSummarySessionID = String(route.sessionID);
+        activeSummaryPoller.start(activeSummarySessionID);
+      }
+    } catch (err) {
+      trace("active-summary-unavailable", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+    }
 
     /**
      * Uma tentativa de render.
@@ -311,7 +369,14 @@ export default Plugin.define({
         reconciling = true;
         try {
           const route = ctx.ui.router.current();
-          if (disposed || route?.type !== "session") return;
+          if (disposed) return;
+          const routedSessionID = route?.type === "session" ? String(route.sessionID) : undefined;
+          if (routedSessionID !== activeSummarySessionID) {
+            activeSummarySessionID = routedSessionID;
+            if (routedSessionID) activeSummaryPoller?.start(routedSessionID);
+            else activeSummaryPoller?.stop();
+          }
+          if (route?.type !== "session") return;
           const sessionID = String(route.sessionID);
           // pending.list may briefly fail or return unusable data during session
           // transitions; treat it as an empty snapshot and retry next poll.
@@ -346,6 +411,7 @@ export default Plugin.define({
 
     return () => {
       disposed = true;
+      activeSummaryPoller?.stop();
       for (const refreshTimer of refreshTimers) clearTimeout(refreshTimer);
       refreshTimers.clear();
       try {
