@@ -46,7 +46,8 @@ test("active summary RPC reads only the current session binding and bounded run 
   assert.equal(result.runID, RUN_ID);
   assert.deepEqual(reads, [sessionBindingKey(SESSION_ID), `orchestration/run/${RUN_ID}`]);
   assert.deepEqual(Object.keys(ExecutionSummaryRpc.methods), ["getActiveSummary"]);
-  assert.equal(ExecutionSummaryRpc.methods.getActiveSummary.input.properties.sessionID.pattern, "^[A-Za-z0-9._:-]+$");
+  assert.equal("pattern" in ExecutionSummaryRpc.methods.getActiveSummary.input.properties.sessionID, false);
+  assert.equal("pattern" in ExecutionSummaryRpc.methods.getActiveSummary.input.properties.runID, false);
 });
 
 test("active summary RPC fails closed for missing or malformed bindings", async () => {
@@ -72,6 +73,15 @@ test("active summary RPC rejects unsafe identifiers before constructing storage 
   const result = await createExecutionSummaryHandler({
     storage: { get: async () => { reads += 1; return undefined; } },
   })({ sessionID: "ses/../../other" });
+  assert.deepEqual(result, { summary: { available: false } });
+  assert.equal(reads, 0);
+});
+
+test("active summary RPC rejects unsafe expected run IDs before storage reads", async () => {
+  let reads = 0;
+  const result = await createExecutionSummaryHandler({
+    storage: { get: async () => { reads += 1; return { runID: RUN_ID }; } },
+  })({ sessionID: SESSION_ID, runID: "../run-other" });
   assert.deepEqual(result, { summary: { available: false } });
   assert.equal(reads, 0);
 });

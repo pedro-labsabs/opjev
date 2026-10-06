@@ -32,8 +32,8 @@ export const ExecutionSummaryRpc = {
         additionalProperties: false,
         required: ["sessionID"],
         properties: {
-          sessionID: { type: "string", minLength: 4, maxLength: 200, pattern: "^[A-Za-z0-9._:-]+$" },
-          runID: { type: "string", minLength: 1, maxLength: 200, pattern: "^[A-Za-z0-9._:-]+$" },
+          sessionID: { type: "string", minLength: 4, maxLength: 200 },
+          runID: { type: "string", minLength: 1, maxLength: 200 },
         },
       },
       output: {

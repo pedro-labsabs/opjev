@@ -4,7 +4,7 @@
 
 **Goal:** Show bounded live orchestration progress and recovery in the TUI, accurately summarize terminal phases, and preserve summaries through presentation retries.
 
-**Architecture:** Add a read-only RPC that resolves a session's current run binding and returns a fail-closed summary projection of its persisted RunState. The TUI polls this surface with fixed bounds and presents only changed nonterminal snapshots; existing terminal delivery remains authoritative.
+**Architecture:** Add a read-only RPC that resolves a session's current run binding and returns a fail-closed summary projection of its persisted RunState. The TUI polls this surface with a fixed interval and a five-minute maximum per route window. It presents only changed nonterminal snapshots; after observing a terminal snapshot it keeps polling within that same bounded window so a later run in the same session can be observed. Existing terminal delivery remains authoritative.
 
 **Tech Stack:** TypeScript, Node.js test runner, OpenCode plugin RPC/TUI.
 
@@ -39,16 +39,16 @@
 - Modify: `tui.ts`
 
 **Interfaces:**
-- Produces: `ExecutionSummaryRpc`, `createExecutionSummaryHandler({ storage })`, and `getActiveSummary({ sessionID }) -> { summary: ExecutionSummary }`.
+- Produces: `ExecutionSummaryRpc`, `createExecutionSummaryHandler({ storage })`, and `getActiveSummary({ sessionID, runID? }) -> { summary: ExecutionSummary, runID? }`. The optional expected `runID` is checked against the current binding; invalid IDs fail closed before storage access.
 - The handler resolves `sessionBindingKey(sessionID)`, validates the bound `runID`, reads only `orchestration/run/<runID>`, and calls `summarizeExecutionRun`.
 - Consumes: `summarizeExecutionRun` and the existing `ExecutionSummary` shape.
-- Poll interval is 1500 ms and maximum active polling lifetime is 5 minutes per route; cleanup stops it sooner on route change, terminal state, or disposal.
+- Poll interval is 1500 ms and maximum polling lifetime is 5 minutes per route window; cleanup stops it sooner on route change or disposal. Terminal phases suppress interim presentation but do not end polling before the bound, allowing a later run binding in the same session to be observed.
 
 - [ ] **Step 1: Write the failing RPC tests.** Verify a valid binding returns the persisted running summary, storage access consists only of `get`, missing/malformed binding is unavailable, and storage errors return unavailable.
 - [ ] **Step 2: Run `node --test src/execution-summary-rpc.test.mjs src/active-summary-poller.test.mjs` and confirm these tests fail because the production modules are not implemented.**
 - [ ] **Step 3: Implement the bounded read-only RPC schema and handler.** Validate `sessionID` and binding identity; never expose the persisted record or unrecognized fields.
-- [ ] **Step 4: Register the query in `index.ts` and add the TUI client polling loop.** Poll the current session at a fixed interval for a bounded window; present changed valid nonterminal summaries only, stop on route change, terminal state, timeout, or disposal, and clear timers during cleanup.
-- [ ] **Step 5: Add a deterministic polling test with successive `running` and `repairing` snapshots.** Assert the repair/recovery summary is rendered before any terminal snapshot, unchanged snapshots are deduplicated, and polling stops at its bound.
+- [ ] **Step 4: Register the query in `index.ts` and add the TUI client polling loop.** Poll the current session at a fixed interval for a bounded window; present changed valid nonterminal summaries only, stop on route change, timeout, or disposal, and clear timers during cleanup. A terminal snapshot suppresses presentation while polling continues within the existing window.
+- [ ] **Step 5: Add a deterministic polling test with successive `running` and `repairing` snapshots, a terminal snapshot, and a later run binding.** Assert recovery appears before terminal, unchanged snapshots are deduplicated, the later run is observed within the window, and polling stops at its bound.
 - [ ] **Step 6: Run `node --test src/execution-summary-rpc.test.mjs src/active-summary-poller.test.mjs`; expect all assertions to pass.**
 - [ ] **Step 7: Commit the RPC, registration, polling, and focused tests.**
 
@@ -91,5 +91,6 @@
 - [ ] Run `npm run typecheck`; expect exit code 0.
 - [ ] Run `npm test`; expect all tests to pass.
 - [ ] Run `git diff --check origin/main...HEAD`; expect no whitespace errors.
-- [ ] Run the relevant real TUI E2E with pinned OpenCode 2.0.11 only if it avoids live provider calls; otherwise report that limitation and rely on the focused read-query, poller, and notice-delivery tests.
+- [ ] Run `npm run e2e:matrix` and the real `e2e:gateway` with pinned OpenCode 2.0.11. The gateway E2E must assert that the summary RPC is registered, a safe unbound session returns HTTP 200 with an unavailable summary, real TUI polling has zero schema-error/HTTP 400 responses, and a valid bound run returns HTTP 200 with matching run identity and only bounded projection fields.
+- [ ] Inspect the summary RPC wire evidence explicitly; an aggregate E2E pass count is insufficient.
 - [ ] Review the complete branch diff against the acceptance criteria and update PR #37 with the verified branch.
