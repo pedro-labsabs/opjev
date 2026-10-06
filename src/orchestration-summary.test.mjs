@@ -123,6 +123,24 @@ describe("execution summary", () => {
     assert.notEqual(result.outcome, "failed");
   });
 
+  it("keeps a kernel failure visible when human notification left its request on the state", () => {
+    const result = summarizeExecutionRun({ updatedAt: 1000, state: state("failed", {
+      lastError: "human notification failed",
+      pendingHuman: {
+        requestID: "human:1:1:jev-human",
+        kind: "jev-human",
+        round: 1,
+        reason: "Review needed",
+        requiredAuthority: "resume-or-stop",
+        currentMaxRounds: 4,
+        minimumMaxRounds: 2,
+      },
+    }) }, 1000);
+    assert.equal(result.available, true);
+    assert.equal(result.outcome, "failed");
+    assert.equal(result.detail, "human notification failed");
+  });
+
   it("rejects unknown and invented persisted phases", () => {
     for (const phase of ["executing", "limit-reached", "unknown"]) {
       assert.deepEqual(

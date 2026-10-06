@@ -84,8 +84,6 @@ export function summarizeExecutionRun(record: unknown, now = Date.now()): Execut
       limitReached = kind === "max-rounds" && round >= maxRounds &&
         requiredAuthority === "increase-budget-or-stop";
       if (kind === "max-rounds" && !limitReached) return { available: false };
-    } else if (pendingHuman !== undefined) {
-      return { available: false };
     }
     const outcome: ExecutionSummary["outcome"] = phase === "completed" ? "completed"
       : phase === "failed" ? "failed"
