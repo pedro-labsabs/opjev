@@ -10,6 +10,11 @@ export interface ActiveSummaryPollerScheduler {
   clearTimeout(id: ReturnType<typeof setTimeout>): void;
 }
 
+export interface ActiveSummarySnapshot {
+  runID?: string;
+  summary: ExecutionSummary;
+}
+
 const defaultScheduler: ActiveSummaryPollerScheduler = {
   setInterval: (callback, ms) => setInterval(callback, ms),
   clearInterval: (id) => clearInterval(id),
@@ -29,7 +34,7 @@ const TERMINAL_PHASES = new Set(["completed", "stopped", "failed"]);
 
 /** Polls a session's read-only summary surface and presents changed active snapshots only. */
 export function createActiveSummaryPoller(deps: {
-  getSummary(sessionID: string): Promise<ExecutionSummary>;
+  getSummary(sessionID: string): Promise<ActiveSummarySnapshot>;
   currentSessionID(): string | undefined;
   present(sessionID: string, summary: ExecutionSummary): void;
   scheduler?: ActiveSummaryPollerScheduler;
@@ -74,7 +79,6 @@ export function createActiveSummaryPoller(deps: {
       try {
         current = deps.currentSessionID();
       } catch {
-        stop();
         return;
       }
       if (current !== normalized) {
@@ -84,15 +88,27 @@ export function createActiveSummaryPoller(deps: {
 
       pollingGeneration = ownGeneration;
       try {
-        const summary = await deps.getSummary(normalized);
+        const result = await deps.getSummary(normalized);
         if (ownGeneration !== generation || sessionID !== normalized) return;
-        if (!summary?.available) return; // transient or unavailable state stays fail-closed; bounded polling may observe recovery
-        const phase = summary.taskState;
-        if (typeof phase !== "string" || !ACTIVE_PHASES.has(phase)) {
-          if (typeof phase === "string" && TERMINAL_PHASES.has(phase)) stop();
+        // Navigation can happen while the read-only RPC is in flight.
+        try {
+          current = deps.currentSessionID();
+        } catch {
           return;
         }
-        const snapshot = JSON.stringify(summary);
+        if (current !== normalized) {
+          stop();
+          return;
+        }
+        const summary = result?.summary;
+        if (!summary?.available) return; // transient or unavailable state stays fail-closed; bounded polling may observe recovery
+        const runID = typeof result.runID === "string" ? result.runID : "";
+        const phase = summary.taskState;
+        if (typeof phase !== "string" || !ACTIVE_PHASES.has(phase)) {
+          if (typeof phase === "string" && TERMINAL_PHASES.has(phase)) lastSnapshot = `${runID}:${JSON.stringify(summary)}`;
+          return;
+        }
+        const snapshot = `${runID}:${JSON.stringify(summary)}`;
         if (snapshot === lastSnapshot) return;
         deps.present(normalized, summary);
         lastSnapshot = snapshot;

@@ -30,8 +30,8 @@ import {
 import { ExecutionSummaryRpc } from "./src/orchestration/execution-summary-rpc.ts";
 import { createActiveSummaryPoller } from "./src/orchestration/active-summary-poller.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
-import { summarizeExecutionRun, type ExecutionSummary } from "./src/orchestration/summary.ts";
-import { composeExecutionNotice, deliverExecutionNoticeWithRetry } from "./src/orchestration/summary-presentation.ts";
+import type { ExecutionSummary } from "./src/orchestration/summary.ts";
+import { composeExecutionNoticeFromLookup, deliverExecutionNoticeWithRetry, formatActiveExecutionSummary } from "./src/orchestration/summary-presentation.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -100,17 +100,21 @@ export default Plugin.define({
 
     let activeSummarySessionID: string | undefined;
     let activeSummaryPoller: ReturnType<typeof createActiveSummaryPoller> | undefined;
+    let summaryClient: any;
     try {
-      const summaryClient = (ctx.client as any).rpc(ExecutionSummaryRpc);
+      summaryClient = (ctx.client as any).rpc(ExecutionSummaryRpc);
       activeSummaryPoller = createActiveSummaryPoller({
         getSummary: async (sessionID) => {
           try {
             const response = await summaryClient.getActiveSummary({ sessionID });
-            return response?.summary && typeof response.summary === "object"
-              ? response.summary as ExecutionSummary
-              : { available: false };
+            return {
+              runID: typeof response?.runID === "string" ? response.runID : undefined,
+              summary: response?.summary && typeof response.summary === "object"
+                ? response.summary as ExecutionSummary
+                : { available: false },
+            };
           } catch {
-            return { available: false };
+            return { summary: { available: false } };
           }
         },
         currentSessionID: () => {
@@ -128,17 +132,12 @@ export default Plugin.define({
         },
         present: (sessionID, summary) => {
           if (disposed) return;
-          const lines = [
-            summary.route ? `Route: ${summary.route}` : undefined,
-            summary.progress,
-            summary.detail,
-            ...(summary.recoveryEvents ?? []).map((event) => `Recovery: ${event}`),
-          ].filter((line): line is string => Boolean(line));
-          if (lines.length === 0) return;
+          const message = formatActiveExecutionSummary(summary);
+          if (message.length === 0) return;
           const recovering = summary.taskState === "repairing" || (summary.recoveryEvents?.length ?? 0) > 0;
           ctx.ui.toast.show({
             title: `Orchestration · ${recovering ? "Recovering" : "Progressing"}`,
-            message: lines.join("\n").slice(0, 2000),
+            message,
             variant: summary.taskState === "awaiting-human" ? "warning" : "success",
             duration: TOAST_DURATION_MS,
           });
@@ -163,6 +162,7 @@ export default Plugin.define({
      *    interna/subagente). Nunca re-tenta.
      */
     const renderOnce = (sessionID: string, phase: string, notice: string): "shown" | "retry" | "skip" => {
+      if (disposed) return "skip";
       // Filtro de papel (fail-closed): sessao corrente do TUI deve ser a
       // parent do run; sessoes internas/subagentes nunca apresentam.
       let currentSessionID: string | undefined;
@@ -291,14 +291,14 @@ export default Plugin.define({
       try {
         // Read-only, best-effort projection of the bounded persisted run. Keep
         // notice delivery working even when storage is unavailable or stale.
-        let displayNotice = notice;
-        try {
-          const record = await ctx.storage?.get(`orchestration/run/${runID}`);
-          const summary = summarizeExecutionRun(record);
-          displayNotice = composeExecutionNotice(notice, summary);
-        } catch {
-          // Summary is optional; never interrupt the session or suppress notice.
-        }
+        const displayNotice = await composeExecutionNoticeFromLookup(notice, runID, () => {
+          if (!summaryClient) return Promise.reject(new Error("summary RPC unavailable"));
+          return summaryClient.getActiveSummary({ sessionID, runID }) as Promise<{
+            runID?: string;
+            summary?: ExecutionSummary;
+          }>;
+        });
+        if (disposed) return false;
         const deadline = Date.now() + ROUTE_RETRY_WINDOW_MS;
         const outcome = await deliverExecutionNoticeWithRetry({
           displayNotice,
@@ -309,6 +309,7 @@ export default Plugin.define({
           retryIntervalMs: ROUTE_POLL_MS,
           wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         });
+        if (disposed) return false;
         if (outcome !== "shown") {
           trace("not-shown", { runID, outcome, source });
           return false;

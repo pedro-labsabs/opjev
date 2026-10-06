@@ -33,13 +33,14 @@ export const ExecutionSummaryRpc = {
         required: ["sessionID"],
         properties: {
           sessionID: { type: "string", minLength: 4, maxLength: 200, pattern: "^[A-Za-z0-9._:-]+$" },
+          runID: { type: "string", minLength: 1, maxLength: 200, pattern: "^[A-Za-z0-9._:-]+$" },
         },
       },
       output: {
         type: "object",
         additionalProperties: false,
         required: ["summary"],
-        properties: { summary: summarySchema },
+        properties: { summary: summarySchema, runID: { type: "string", maxLength: 200 } },
       },
     },
   },
@@ -69,16 +70,19 @@ function safeSessionID(value: unknown): string | undefined {
 /** Resolves only the currently bound run and returns its bounded summary. */
 export function createExecutionSummaryHandler(deps: {
   storage: SummaryStorage;
-}): (input: unknown) => Promise<{ summary: ExecutionSummary }> {
+}): (input: unknown) => Promise<{ summary: ExecutionSummary; runID?: string }> {
   return async (input) => {
     try {
-      const sessionID = safeSessionID(record(input)?.sessionID);
+      const request = record(input);
+      const sessionID = safeSessionID(request?.sessionID);
+      const expectedRunID = request?.runID === undefined ? undefined : safeRunID(request.runID);
+      if (request?.runID !== undefined && !expectedRunID) return { summary: { available: false } };
       if (!sessionID) return { summary: { available: false } };
       const binding = record(await deps.storage.get(sessionBindingKey(sessionID)));
       const runID = safeRunID(binding?.runID);
-      if (!runID) return { summary: { available: false } };
+      if (!runID || (expectedRunID && expectedRunID !== runID)) return { summary: { available: false } };
       const persisted = await deps.storage.get(`orchestration/run/${runID}`);
-      return { summary: summarizeExecutionRun(persisted) };
+      return { summary: summarizeExecutionRun(persisted), runID };
     } catch {
       return { summary: { available: false } };
     }

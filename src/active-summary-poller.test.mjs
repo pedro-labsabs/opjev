@@ -43,7 +43,7 @@ test("active summary polling renders changed recovery before terminal and dedupl
   const getActiveSummary = createExecutionSummaryHandler({ storage: { get: async (key) => records.get(key) } });
   let route = "ses_summary_1";
   const poller = createActiveSummaryPoller({
-    async getSummary(id) { return (await getActiveSummary({ sessionID: id })).summary; },
+    async getSummary(id) { return await getActiveSummary({ sessionID: id }); },
     currentSessionID: () => route,
     present: (sessionID, summary) => shown.push({ sessionID, summary }),
     scheduler,
@@ -80,16 +80,27 @@ test("active summary polling renders changed recovery before terminal and dedupl
   [...scheduler.intervals.values()][0].fn();
   await tick();
   assert.equal(shown.length, 2, "terminal result stays on the existing result-delivery path");
-  assert.equal(scheduler.intervals.size, 0, "polling stops after terminal phase");
+  assert.equal(scheduler.intervals.size, 1, "bounded polling remains available to observe a later run in this session");
+
+  const nextRunID = "run-summary-2";
+  records.set(sessionBindingKey(sessionID), { runID: nextRunID, phase: "running" });
+  records.set(`orchestration/run/${nextRunID}`, {
+    updatedAt: Date.now(),
+    state: { phase: "running", round: 1, contract: { maxRounds: 3 }, history: [] },
+  });
+  [...scheduler.intervals.values()][0].fn();
+  await tick();
+  assert.equal(shown.length, 3);
+  assert.equal(shown[2].summary.taskState, "running");
 });
 
 test("active summary polling is bounded and stops when the current route changes", async () => {
   const scheduler = fakeScheduler();
   let route = "ses_summary_1";
   const poller = createActiveSummaryPoller({
-    async getSummary() { return { available: true, taskState: "running" }; },
+    async getSummary() { return { runID: "run-1", summary: { available: true, taskState: "running" } }; },
     currentSessionID: () => route,
-    present() { assert.fail("must not present into a different route"); },
+    present() {},
     scheduler,
   });
   poller.start("ses_summary_1");
@@ -105,7 +116,7 @@ test("active summary polling is bounded and stops when the current route changes
 test("active summary polling stops at its maximum lifetime", async () => {
   const scheduler = fakeScheduler();
   const poller = createActiveSummaryPoller({
-    async getSummary() { return { available: false }; },
+    async getSummary() { return { summary: { available: false } }; },
     currentSessionID: () => "ses_summary_1",
     present() { assert.fail("unavailable state must not be presented"); },
     scheduler,
@@ -115,4 +126,23 @@ test("active summary polling stops at its maximum lifetime", async () => {
   [...scheduler.timeouts.values()][0].fn();
   assert.equal(scheduler.intervals.size, 0);
   assert.equal(scheduler.timeouts.size, 0);
+});
+
+test("active summary polling rechecks the route after an in-flight query", async () => {
+  const scheduler = fakeScheduler();
+  let route = "ses_summary_1";
+  let resolveSummary;
+  const shown = [];
+  const poller = createActiveSummaryPoller({
+    getSummary: () => new Promise((resolve) => { resolveSummary = resolve; }),
+    currentSessionID: () => route,
+    present: (...args) => shown.push(args),
+    scheduler,
+  });
+  poller.start(route);
+  route = "ses_other";
+  resolveSummary({ runID: "run-1", summary: { available: true, taskState: "running" } });
+  await tick();
+  assert.deepEqual(shown, []);
+  assert.equal(scheduler.intervals.size, 0);
 });

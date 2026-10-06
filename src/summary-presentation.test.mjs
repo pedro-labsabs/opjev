@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   composeExecutionNotice,
+  composeExecutionNoticeFromLookup,
   deliverExecutionNoticeWithRetry,
+  formatActiveExecutionSummary,
 } from "./orchestration/summary-presentation.ts";
 
 test("route retry then shown preserves the composed summary and refresh notice", async () => {
@@ -62,6 +64,26 @@ test("unavailable summary preserves the original notice through rendering and re
   assert.equal(refreshed, notice);
 });
 
+test("terminal summary lookup requires the matching bound run and falls back on RPC failure", async () => {
+  const notice = "Original terminal notice";
+  const summary = {
+    available: true,
+    taskState: "completed",
+    progress: "Round 1 of 2",
+  };
+  assert.equal(await composeExecutionNoticeFromLookup(notice, "run-1", async () => ({
+    runID: "run-1",
+    summary,
+  })), "Task: completed\nRound 1 of 2\n\nOriginal terminal notice");
+  assert.equal(await composeExecutionNoticeFromLookup(notice, "run-1", async () => ({
+    runID: "run-2",
+    summary,
+  })), notice);
+  assert.equal(await composeExecutionNoticeFromLookup(notice, "run-1", async () => {
+    throw new Error("storage unavailable");
+  }), notice);
+});
+
 test("composed notices stay within the TUI message bound while retaining the original notice", () => {
   const notice = "N".repeat(1900);
   const result = composeExecutionNotice(notice, {
@@ -76,4 +98,15 @@ test("composed notices stay within the TUI message bound while retaining the ori
   const originalPart = result.slice(result.lastIndexOf("\n\n") + 2);
   assert.ok(originalPart.length > 0);
   assert.ok(notice.startsWith(originalPart));
+});
+
+test("active summary text makes its canonical task phase visible", () => {
+  const result = formatActiveExecutionSummary({
+    available: true,
+    taskState: "repairing",
+    route: "builder / free-model",
+    progress: "Round 2 of 4",
+    recoveryEvents: ["Round 1: repair-same"],
+  });
+  assert.equal(result, "Task: repairing\nRoute: builder / free-model\nRound 2 of 4\nRecovery: Round 1: repair-same");
 });
