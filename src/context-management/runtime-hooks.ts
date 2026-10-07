@@ -1,7 +1,7 @@
 import { ContextLedger } from "./ledger.ts";
 import { recordContextMetrics } from "./metrics.ts";
 import { CONTEXT_LEDGER_KEY } from "./types.ts";
-import { isCurrentContextFingerprint, observeContextRequest, observeToolAfter, resolveContextManagementStage, IMPLEMENTED_CONTEXT_STAGES } from "./observer.ts";
+import { observeContextRequest, observeToolAfter, resolveContextManagementStage, IMPLEMENTED_CONTEXT_STAGES } from "./observer.ts";
 import { projectContextProtection } from "./protection.ts";
 import { applyProjectionPlan, buildRequestProjectionPlan, requestFingerprint } from "./request-projection.ts";
 import type { DeterministicDecision } from "./deterministic-pruner.ts";
@@ -78,7 +78,6 @@ async function planShadowRequest(ctx: ContextRuntime, event: unknown, snapshot: 
     const protection = await projectContextProtection({
       getSessionMetadata: async () => metadata,
       getRun: async (runID) => await ctx.storage.get(`orchestration/run/${runID}`),
-      isFingerprintCurrent: isCurrentContextFingerprint,
     }, sessionID, ledger.snapshot());
     if (!requestSnapshotIsCurrent(event, snapshot)) {
       await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } });

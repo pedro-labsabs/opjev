@@ -330,12 +330,11 @@ try {
   const workerProtection = await projectContextProtection({
     getSessionMetadata: async () => workerSession.metadata,
     getRun: async key => key === runID ? dbEvidence.checkpoint.value : undefined,
-    isFingerprintCurrent: () => true,
   }, sessionID, groups);
   assert.equal(workerProtection.role, "worker");
-  assert.ok(workerProtection.groups.every(item => item.state === "protected"), "linked worker groups were not protected by canonical checkpoint");
+  assert.ok(workerProtection.groups.every(item => item.state === "unknown"), "cross-process fingerprints did not fail closed");
   const actualDecisions = classifyContextGroups({ groups, protection: workerProtection });
-  assert.ok(actualDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), "protected worker groups were proposed for pruning");
+  assert.ok(actualDecisions.every(item => item.action === "KEEP" && item.reason === "unknown-protection"), "unknown worker groups were proposed for pruning");
   const eligibleRecentGroups = groups.map(group => ({
     ...group,
     call: { ...group.call, protection: "clear" },
@@ -349,7 +348,6 @@ try {
     const protectedSnapshot = await projectContextProtection({
       getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": role }),
       getRun: async () => undefined,
-      isFingerprintCurrent: () => false,
     }, sessionID, groups);
     const roleDecisions = classifyContextGroups({ groups, protection: protectedSnapshot });
     assert.ok(roleDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), `${role} group was not protected`);
@@ -357,7 +355,6 @@ try {
   const unknownSnapshot = await projectContextProtection({
     getSessionMetadata: async () => sessionMetadata,
     getRun: async () => ({ checkpoint: "worker-created", state: {}, workerSessionID: sessionID, updatedAt: Date.now() }),
-    isFingerprintCurrent: () => false,
   }, sessionID, groups);
   assert.ok(unknownSnapshot.groups.every(item => item.state === "unknown"), "malformed checkpoint linkage did not fail closed");
   assert.ok(classifyContextGroups({ groups, protection: unknownSnapshot }).every(item => item.action === "KEEP"), "unknown protection proposed pruning");
