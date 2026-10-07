@@ -1,5 +1,6 @@
 export const CONTEXT_METRICS_KEY = "context/metrics/v1";
 export const CONTEXT_METRICS_WINDOW_MS = 86_400_000;
+export const CONTEXT_METRICS_PENDING_LIMIT = 128;
 const MAX_COUNTER = Number.MAX_SAFE_INTEGER;
 
 export interface ContextMetricsV1 {
@@ -33,6 +34,7 @@ export type ContextMetricIncrement = {
 
 type Storage = { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> };
 const queues = new WeakMap<object, Promise<void>>();
+const pendingByStorage = new WeakMap<object, number>();
 
 /** Persist only fixed counters and byte estimates; no IDs, labels, or content. */
 export async function recordContextMetrics(
@@ -40,6 +42,9 @@ export async function recordContextMetrics(
   increment: ContextMetricIncrement,
   now = Date.now(),
 ): Promise<boolean> {
+  const pending = pendingByStorage.get(storage) ?? 0;
+  if (pending >= CONTEXT_METRICS_PENDING_LIMIT) return false;
+  pendingByStorage.set(storage, pending + 1);
   const prior = queues.get(storage) ?? Promise.resolve();
   let success = false;
   const write = prior.catch(() => {}).then(async () => {
@@ -68,6 +73,8 @@ export async function recordContextMetrics(
   } catch {
     return false;
   } finally {
+    pendingByStorage.set(storage, Math.max(0, (pendingByStorage.get(storage) ?? 1) - 1));
+    if (pendingByStorage.get(storage) === 0) pendingByStorage.delete(storage);
     if (queues.get(storage) === write) queues.delete(storage);
   }
 }

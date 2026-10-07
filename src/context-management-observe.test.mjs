@@ -5,7 +5,7 @@ import { resolveOptions } from "./config.ts";
 import { ContextLedger } from "./context-management/ledger.ts";
 import { observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
 import { CONTEXT_LEDGER_KEY } from "./context-management/types.ts";
-import { CONTEXT_METRICS_KEY } from "./context-management/metrics.ts";
+import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
 import { makeStorage } from "./harness.mjs";
 
 const rawCanaries = ["HUMAN-CANARY-8e8d", "INPUT-CANARY-1bc3", "RESULT-CANARY-b119", "ERROR-CANARY-99f4", "sk-test-context-secret-74c2"];
@@ -138,4 +138,46 @@ it("treats storage and session lookup failures as lost observations", async () =
   assert.equal(unavailable.ledger().length, 1);
   assert.equal(unavailable.ledger()[0].call.role, "unknown");
   assert.equal(unavailable.ledger()[0].call.protection, "unknown");
+});
+it("bounds pending metrics writes, drops overflow, drains, and accepts later observations", async () => {
+  let releaseGet;
+  const blockedGet = new Promise((resolve) => { releaseGet = resolve; });
+  let blockStorage = true;
+  let gets = 0;
+  let sets = 0;
+  const storage = {
+    async get(key) {
+      assert.equal(key, CONTEXT_METRICS_KEY);
+      gets++;
+      if (blockStorage) await blockedGet;
+      return storage.persisted;
+    },
+    async set(key, value) {
+      assert.equal(key, CONTEXT_METRICS_KEY);
+      sets++;
+      storage.persisted = value;
+    },
+  };
+  const submissions = Array.from({ length: 300 }, (_, index) =>
+    recordContextMetrics(storage, { tool: { completed: 1 } }, 2_000 + index));
+  await new Promise((resolve) => setImmediate(resolve));
+  const overflowSettled = await Promise.race([
+    Promise.all(submissions.slice(128)).then((results) => results),
+    new Promise((resolve) => setImmediate(() => resolve("still-pending"))),
+  ]);
+  blockStorage = false;
+  releaseGet();
+  const results = await Promise.all(submissions);
+  assert.deepEqual(overflowSettled, Array(172).fill(false));
+  assert.equal(results.filter(Boolean).length, 128);
+  assert.equal(results.filter((result) => !result).length, 172);
+  assert.equal(gets, 128);
+  assert.equal(sets, 128);
+  assert.deepEqual(Object.keys(storage.persisted).sort(), ["context", "schema", "tool", "updatedAt", "windowStartedAt"]);
+  assert.equal(storage.persisted.tool.completed, 128);
+  const persisted = JSON.stringify(storage.persisted);
+  for (const canary of rawCanaries) assert.equal(persisted.includes(canary), false);
+  assert.equal(await recordContextMetrics(storage, { tool: { completed: 1 } }, 2_400), true);
+  assert.equal(gets, 129);
+  assert.equal(sets, 129);
 });
