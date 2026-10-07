@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { resolveOptions } from "./config.ts";
 import { ContextLedger } from "./context-management/ledger.ts";
 import { observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
-import { CONTEXT_LEDGER_KEY } from "./context-management/types.ts";
+import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
 import { makeStorage } from "./harness.mjs";
 
@@ -99,6 +99,20 @@ it("upserts duplicate terminal deliveries and rejects missing identity", async (
   assert.equal(deps.ledger().length, 1);
   assert.equal(deps.storage._map.get(CONTEXT_METRICS_KEY).tool.identityLoss, 1);
 });
+it("deduplicates concurrent deliveries before any async storage work", async () => {
+  const deps = fixture();
+  await Promise.all(Array.from({ length: 12 }, () => observeToolAfter(event(), deps)));
+  assert.equal(deps.ledger().length, 1);
+  const metrics = deps.storage._map.get(CONTEXT_METRICS_KEY);
+  assert.equal(metrics.tool.completed, 1);
+  assert.equal(metrics.tool.pairedGroups, 1);
+  assert.equal(metrics.tool.duplicateDeliveries, 11);
+  const persisted = JSON.stringify([
+    deps.storage._map.get(CONTEXT_LEDGER_KEY),
+    deps.storage._map.get(CONTEXT_METRICS_KEY),
+  ]);
+  for (const canary of rawCanaries) assert.equal(persisted.includes(canary), false);
+});
 
 it("records request bytes and paired tool-part coverage without changing the request", async () => {
   const deps = fixture();
@@ -138,6 +152,80 @@ it("treats storage and session lookup failures as lost observations", async () =
   assert.equal(unavailable.ledger().length, 1);
   assert.equal(unavailable.ledger()[0].call.role, "unknown");
   assert.equal(unavailable.ledger()[0].call.protection, "unknown");
+});
+it("releases a failed event reservation so a later delivery can persist", async () => {
+  const base = makeStorage();
+  let failFirstLedgerRead = true;
+  const storage = {
+    ...base,
+    async get(key) {
+      if (key === CONTEXT_LEDGER_KEY && failFirstLedgerRead) {
+        failFirstLedgerRead = false;
+        throw new Error("temporary storage failure");
+      }
+      return base.get(key);
+    },
+  };
+  const deps = fixture({ storage });
+  await observeToolAfter(event(), deps);
+  assert.equal(deps.ledger().length, 0);
+  assert.equal(storage._map.get(CONTEXT_METRICS_KEY).tool.storageFailures, 1);
+  await observeToolAfter(event(), deps);
+  assert.equal(deps.ledger().length, 1);
+  assert.equal(storage._map.get(CONTEXT_METRICS_KEY).tool.completed, 1);
+});
+
+it("bounds pending event reservations and accepts a dropped event after drain", async () => {
+  const base = makeStorage();
+  let releaseLedgerRead;
+  let ledgerReadStarted;
+  const blockedLedgerRead = new Promise((resolve) => { releaseLedgerRead = resolve; });
+  const started = new Promise((resolve) => { ledgerReadStarted = resolve; });
+  let ledgerReads = 0;
+  const storage = {
+    ...base,
+    async get(key) {
+      if (key === CONTEXT_LEDGER_KEY) {
+        ledgerReads++;
+        ledgerReadStarted();
+        await blockedLedgerRead;
+      }
+      return base.get(key);
+    },
+  };
+  const deps = fixture({ storage });
+  const deliveries = Array.from({ length: CONTEXT_LEDGER_PENDING_LIMIT + 1 }, (_, index) =>
+    observeToolAfter(event({
+      id: `call-${index}`,
+      messageID: `message-${index}`,
+      input: { command: `input-${index}` },
+      result: { output: `result-${index}` },
+    }), deps));
+  await started;
+  const overflowFinished = await Promise.race([
+    deliveries.at(-1).then(() => true),
+    new Promise((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  assert.equal(overflowFinished, true);
+  assert.equal(ledgerReads, 1);
+  releaseLedgerRead();
+  await Promise.all(deliveries);
+  assert.equal(deps.ledger().length, CONTEXT_LEDGER_PENDING_LIMIT);
+  assert.equal(storage._map.get(CONTEXT_METRICS_KEY).tool.completed, CONTEXT_LEDGER_PENDING_LIMIT);
+  assert.equal(storage._map.get(CONTEXT_METRICS_KEY).tool.queueOverflow, 1);
+  await observeToolAfter(event({
+    id: `call-${CONTEXT_LEDGER_PENDING_LIMIT}`,
+    messageID: `message-${CONTEXT_LEDGER_PENDING_LIMIT}`,
+    input: { command: `input-${CONTEXT_LEDGER_PENDING_LIMIT}` },
+    result: { output: `result-${CONTEXT_LEDGER_PENDING_LIMIT}` },
+  }), deps);
+  assert.equal(deps.ledger().length, CONTEXT_LEDGER_PENDING_LIMIT + 1);
+  assert.equal(storage._map.get(CONTEXT_METRICS_KEY).tool.completed, CONTEXT_LEDGER_PENDING_LIMIT + 1);
+  const persisted = JSON.stringify([
+    storage._map.get(CONTEXT_LEDGER_KEY),
+    storage._map.get(CONTEXT_METRICS_KEY),
+  ]);
+  for (const canary of rawCanaries) assert.equal(persisted.includes(canary), false);
 });
 it("bounds pending metrics writes, drops overflow, drains, and accepts later observations", async () => {
   let releaseGet;

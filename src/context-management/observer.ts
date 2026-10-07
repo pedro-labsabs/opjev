@@ -2,7 +2,7 @@ import { ContextLedger } from "./ledger.ts";
 import { createPayloadFingerprintKey, fingerprintPayload, hashStableRef } from "./identity.ts";
 import { recordContextMetrics, type ContextMetricIncrement } from "./metrics.ts";
 import { createContextAssetSink, isContextAssetSinkAtCapacity } from "./storage-sink.ts";
-import { CONTEXT_LEDGER_KEY, type ContextAssetRole, type ContextAssetSource, type ContextAssetV1, type ContextToolGroupV1, type ContextRolloutStage } from "./types.ts";
+import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT, type ContextAssetRole, type ContextAssetSource, type ContextAssetV1, type ContextToolGroupV1, type ContextRolloutStage } from "./types.ts";
 
 export const IMPLEMENTED_CONTEXT_STAGES = ["disabled", "observe"] as const;
 const FINGERPRINT_KEY = createPayloadFingerprintKey();
@@ -10,6 +10,7 @@ const VALID_ROLES = new Set<ContextAssetRole>(["worker", "critic", "orchestrator
 const SAFE_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
 const ID_MAX_LENGTH = 256;
 const EVENT_SEEN_LIMIT = 4096;
+const EVENT_PENDING_LIMIT = CONTEXT_LEDGER_PENDING_LIMIT;
 
 type Storage = { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> };
 type ObservationDeps = {
@@ -20,6 +21,7 @@ type ObservationDeps = {
   sink?: (group: ContextToolGroupV1) => Promise<boolean>;
 };
 const seenByOwner = new WeakMap<object, Map<string, number>>();
+const pendingByOwner = new WeakMap<object, Set<string>>();
 
 export function resolveContextManagementStage(value: unknown): ContextRolloutStage {
   if (value === "disabled") return "disabled";
@@ -49,47 +51,59 @@ export async function observeToolAfter(event: any, deps: ObservationDeps): Promi
   const terminalFingerprint = fingerprintPayload(terminalValue, FINGERPRINT_KEY);
   const callBytes = payloadBytes(event.input);
   const terminalBytes = payloadBytes(terminalValue);
-  const session = await readSession(deps, sessionID);
-  const metadata = metadataOf(session.value);
-  const role = roleOf(metadata, session.ok);
-  const runID = role !== "user-session" && typeof metadata?.["jev-run-id"] === "string"
-    ? opaqueID(metadata["jev-run-id"]) : undefined;
-  const metadataRound = metadata?.["jev-round"];
-  const round = role !== "user-session" && typeof metadataRound === "number" && Number.isSafeInteger(metadataRound) && metadataRound > 0
-    ? metadataRound : undefined;
-  const createdAt = safeTime(now);
-  const call = makeAsset({
-    source: "tool-call", assetID: hashStableRef(`${groupID}\u0000${messageRef}\u0000tool-call`), groupID, sessionRef,
-    runRef: runID ? hashStableRef(runID) : undefined, round, role, tool, callRef,
-    payloadBytes: callBytes, fingerprint: callFingerprint, createdAt,
-  });
-  const terminal = makeAsset({
-    source: terminalSource, assetID: hashStableRef(`${groupID}\u0000${messageRef}\u0000${terminalSource}`), groupID, sessionRef,
-    runRef: runID ? hashStableRef(runID) : undefined, round, role, tool, callRef,
-    payloadBytes: terminalBytes, fingerprint: terminalFingerprint, createdAt,
-  });
-  const group: ContextToolGroupV1 = { groupID, sessionRef, call, terminal, createdAt, updatedAt: createdAt };
   const eventKey = `${groupID}:${callFingerprint ?? "?"}:${terminalFingerprint ?? "?"}`;
   const seen = seenMap(deps.owner);
-  if (seen.has(eventKey)) {
+  const pending = pendingSet(deps.owner);
+  if (seen.has(eventKey) || pending.has(eventKey)) {
     await metric(deps.storage, { tool: { duplicateDeliveries: 1 } }, now);
     return;
   }
-  const sink = deps.sink ?? createContextAssetSink(deps.owner, deps.storage, { now: deps.now });
-  const wasFull = isContextAssetSinkAtCapacity(deps.owner);
-  const persisted = await sink(group);
-  if (!persisted) {
-    await metric(deps.storage, wasFull ? { tool: { queueOverflow: 1 } } : { tool: { storageFailures: 1 } }, now);
+  if (pending.size >= EVENT_PENDING_LIMIT) {
+    await metric(deps.storage, { tool: { queueOverflow: 1 } }, now);
     return;
   }
-  remember(seen, eventKey, now);
-  await metric(deps.storage, {
-    tool: {
-      ...(terminalSource === "tool-result" ? { completed: 1 } : { failed: 1 }),
-      pairedGroups: 1,
-      ...(role === "unknown" ? { unknownRoles: 1 } : {}),
-    },
-  }, now);
+  pending.add(eventKey);
+  try {
+    const session = await readSession(deps, sessionID);
+    const metadata = metadataOf(session.value);
+    const role = roleOf(metadata, session.ok);
+    const runID = role !== "user-session" && typeof metadata?.["jev-run-id"] === "string"
+      ? opaqueID(metadata["jev-run-id"]) : undefined;
+    const metadataRound = metadata?.["jev-round"];
+    const round = role !== "user-session" && typeof metadataRound === "number" && Number.isSafeInteger(metadataRound) && metadataRound > 0
+      ? metadataRound : undefined;
+    const createdAt = safeTime(now);
+    const call = makeAsset({
+      source: "tool-call", assetID: hashStableRef(`${groupID}\u0000${messageRef}\u0000tool-call`), groupID, sessionRef,
+      runRef: runID ? hashStableRef(runID) : undefined, round, role, tool, callRef,
+      payloadBytes: callBytes, fingerprint: callFingerprint, createdAt,
+    });
+    const terminal = makeAsset({
+      source: terminalSource, assetID: hashStableRef(`${groupID}\u0000${messageRef}\u0000${terminalSource}`), groupID, sessionRef,
+      runRef: runID ? hashStableRef(runID) : undefined, round, role, tool, callRef,
+      payloadBytes: terminalBytes, fingerprint: terminalFingerprint, createdAt,
+    });
+    const group: ContextToolGroupV1 = { groupID, sessionRef, call, terminal, createdAt, updatedAt: createdAt };
+    const sink = deps.sink ?? createContextAssetSink(deps.owner, deps.storage, { now: deps.now });
+    const wasFull = isContextAssetSinkAtCapacity(deps.owner);
+    let persisted = false;
+    try { persisted = await sink(group); } catch { /* failed OBSERVE storage loses this observation */ }
+    if (!persisted) {
+      await metric(deps.storage, wasFull ? { tool: { queueOverflow: 1 } } : { tool: { storageFailures: 1 } }, now);
+      return;
+    }
+    remember(seen, eventKey, now);
+    await metric(deps.storage, {
+      tool: {
+        ...(terminalSource === "tool-result" ? { completed: 1 } : { failed: 1 }),
+        pairedGroups: 1,
+        ...(role === "unknown" ? { unknownRoles: 1 } : {}),
+      },
+    }, now);
+  } finally {
+    pending.delete(eventKey);
+    if (pending.size === 0) pendingByOwner.delete(deps.owner);
+  }
 }
 
 /** Measure the request hook's final observed shape. This function never writes to event. */
@@ -222,6 +236,11 @@ function safeTime(value: number): number {
 function seenMap(owner: object): Map<string, number> {
   let value = seenByOwner.get(owner);
   if (!value) { value = new Map(); seenByOwner.set(owner, value); }
+  return value;
+}
+function pendingSet(owner: object): Set<string> {
+  let value = pendingByOwner.get(owner);
+  if (!value) { value = new Set(); pendingByOwner.set(owner, value); }
   return value;
 }
 function remember(seen: Map<string, number>, key: string, at: number): void {
