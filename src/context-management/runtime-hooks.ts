@@ -1,9 +1,9 @@
 import { ContextLedger } from "./ledger.ts";
 import { recordContextMetrics } from "./metrics.ts";
 import { CONTEXT_LEDGER_KEY } from "./types.ts";
-import { observeContextRequest, observeToolAfter, resolveContextManagementStage, IMPLEMENTED_CONTEXT_STAGES } from "./observer.ts";
+import { isCurrentContextFingerprint, observeContextRequest, observeToolAfter, resolveContextManagementStage, IMPLEMENTED_CONTEXT_STAGES } from "./observer.ts";
 import { projectContextProtection } from "./protection.ts";
-import { applyProjectionPlan, buildRequestProjectionPlan } from "./request-projection.ts";
+import { applyProjectionPlan, buildRequestProjectionPlan, requestFingerprint } from "./request-projection.ts";
 import type { DeterministicDecision } from "./deterministic-pruner.ts";
 import type { RouterOptions } from "../config.ts";
 
@@ -18,6 +18,7 @@ type ContextRuntime = {
   };
   tool: { hook(name: string, callback: (event: unknown) => void): Promise<void> };
 };
+type RequestSnapshot = { sessionID: string; messages: unknown[]; system: unknown; fingerprint?: string };
 
 /** Register context hooks independently from routing; deterministic-shadow is read-only. */
 export async function registerContextManagementHooks(ctx: ContextRuntime, opts: RouterOptions): Promise<void> {
@@ -32,20 +33,40 @@ export async function registerContextManagementHooks(ctx: ContextRuntime, opts: 
     void observeToolAfter(event, deps);
   });
   await ctx.session.hook("context", async (event) => {
+    const snapshot = stage === "deterministic-shadow" ? captureRequestSnapshot(event) : undefined;
     await observeContextRequest(event, deps);
-    if (stage === "deterministic-shadow") await planShadowRequest(ctx, event);
+    if (stage === "deterministic-shadow") await planShadowRequest(ctx, event, snapshot);
   });
 }
 
-async function planShadowRequest(ctx: ContextRuntime, event: unknown): Promise<void> {
-  if (!event || typeof event !== "object" || Array.isArray(event)) return;
-  if (!("sessionID" in event) || typeof event.sessionID !== "string" || !("messages" in event) || !Array.isArray(event.messages)) return;
-  const sessionID = event.sessionID;
-  const messages = event.messages;
-  const system = "system" in event ? event.system : undefined;
+function captureRequestSnapshot(event: unknown): RequestSnapshot | undefined {
+  try {
+    if (!event || typeof event !== "object" || Array.isArray(event)) return undefined;
+    const value = event as Record<string, unknown>;
+    if (typeof value.sessionID !== "string" || !Array.isArray(value.messages)) return undefined;
+    const system = "system" in value ? value.system : undefined;
+    return { sessionID: value.sessionID, messages: value.messages, system, fingerprint: requestFingerprint(value.messages, system) };
+  } catch { return undefined; }
+}
+
+function requestSnapshotIsCurrent(event: unknown, snapshot: RequestSnapshot): boolean {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  const value = event as Record<string, unknown>;
+  return value.sessionID === snapshot.sessionID && value.messages === snapshot.messages
+    && ("system" in value ? value.system : undefined) === snapshot.system
+    && snapshot.fingerprint !== undefined && requestFingerprint(snapshot.messages, snapshot.system) === snapshot.fingerprint;
+}
+
+async function planShadowRequest(ctx: ContextRuntime, event: unknown, snapshot: RequestSnapshot | undefined): Promise<void> {
+  if (!snapshot) return;
+  const { sessionID, messages, system, fingerprint: requestFingerprintAtStart } = snapshot;
   let decisions: DeterministicDecision[] = [];
   let valid = false;
   try {
+    if (requestFingerprintAtStart === undefined || !requestSnapshotIsCurrent(event, snapshot)) {
+      await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } });
+      return;
+    }
     const stored = await ctx.storage.get(CONTEXT_LEDGER_KEY);
     const ledger = new ContextLedger();
     if (stored && typeof stored === "object" && !Array.isArray(stored) && "schema" in stored && stored.schema === 1 && "groups" in stored && Array.isArray(stored.groups)) {
@@ -57,22 +78,31 @@ async function planShadowRequest(ctx: ContextRuntime, event: unknown): Promise<v
     const protection = await projectContextProtection({
       getSessionMetadata: async () => metadata,
       getRun: async (runID) => await ctx.storage.get(`orchestration/run/${runID}`),
+      isFingerprintCurrent: isCurrentContextFingerprint,
     }, sessionID, ledger.snapshot());
-    const plan = buildRequestProjectionPlan({ sessionID, messages, system, ledger: ledger.snapshot(), protection });
+    if (!requestSnapshotIsCurrent(event, snapshot)) {
+      await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } });
+      return;
+    }
+    const plan = buildRequestProjectionPlan({
+      sessionID, messages, system, ledger: ledger.snapshot(), protection, requestFingerprintAtStart,
+    });
     const result = applyProjectionPlan(plan, messages, system);
     decisions = result.decisions;
     valid = result.valid;
     await recordContextMetrics(ctx.storage, {
       context: {
-        bytePreservedRequests: valid ? 1 : 0,
         plannedGroups: decisions.length,
         proposedKeep: decisions.filter((item) => item.action === "KEEP").length,
         proposedTruncate: decisions.filter((item) => item.action === "KEEP_IDENTITY_TRUNCATE_PAYLOAD").length,
         proposedDrop: decisions.filter((item) => item.action === "DROP").length,
         invalidatedPlans: valid ? 0 : 1,
-        unknownGroups: decisions.filter((item) => item.reason === "unknown-protection" || item.reason === "request-shape-unknown" || item.reason === "request-pair-mismatch").length,
+        unknownGroups: decisions.filter((item) => item.reason === "unknown-protection" || item.reason === "request-shape-unknown" || item.reason === "request-pair-mismatch" || item.reason === "request-payload-mismatch").length,
       },
     });
+    if (valid && !requestSnapshotIsCurrent(event, snapshot)) {
+      await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } });
+    }
   } catch {
     try { await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } }); } catch { /* fail closed */ }
   }

@@ -10,7 +10,8 @@ export type DeterministicReason =
   | "malformed-group"
   | "relation-unproven"
   | "request-shape-unknown"
-  | "request-pair-mismatch";
+  | "request-pair-mismatch"
+  | "request-payload-mismatch";
 export interface DeterministicDecision {
   groupID: string;
   action: RetentionAction;

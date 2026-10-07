@@ -15,9 +15,10 @@ const group = (overrides = {}) => ({
 });
 const metadata = { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-run-id": "run-1", "jev-round": 2 };
 const state = { contract: { runID: "run-1", objective: "x", acceptanceCriteria: ["x"], constraints: [], requiredEvidence: ["test"], maxRounds: 3 }, phase: "running", round: 2, history: [] };
-const deps = (meta = metadata, checkpoint = { checkpoint: "worker-created", state, workerSessionID: "session-1", updatedAt: 20 }) => ({
+const deps = (meta = metadata, checkpoint = { checkpoint: "worker-created", state, workerSessionID: "session-1", updatedAt: 20 }, isFingerprintCurrent = () => true) => ({
   getSessionMetadata: async () => meta,
   getRun: async () => checkpoint,
+  isFingerprintCurrent,
 });
 
 it("projects worker round as protected when canonical state has evidence and no per-group provenance", async () => {
@@ -26,6 +27,8 @@ it("projects worker round as protected when canonical state has evidence and no 
   assert.equal(result.groups[0].reason, "worker-round-evidence");
   assert.equal(result.round, 2);
   assert.equal(result.checkpointIdentity, "run-1");
+  const restored = await projectContextProtection(deps(metadata, undefined, () => false), "session-1", [group()]);
+  assert.equal(restored.groups[0].state, "unknown");
 });
 
 it("keeps critic and orchestrator sessions protected without relying on worker linkage", async () => {
@@ -45,6 +48,8 @@ it("marks complete verified non-orchestration groups clear and partial metadata 
   assert.equal(result.groups[0].state, "clear");
   const partial = await projectContextProtection(deps({ "jev-run-id": "run-1" }), "session-1", [userGroup]);
   assert.equal(partial.groups[0].state, "unknown");
+  const restored = await projectContextProtection(deps({}, undefined, () => false), "session-1", [userGroup]);
+  assert.equal(restored.groups[0].state, "unknown");
   const incorrectlyLinked = {
     ...userGroup,
     call: { ...userGroup.call, runRef, round: 2 },

@@ -24,8 +24,8 @@ export interface ContextProtectionSnapshot {
 export interface ContextProtectionDeps {
   getSessionMetadata(sessionID: string): Promise<unknown>;
   getRun(runID: string): Promise<unknown>;
+  isFingerprintCurrent(fingerprint: string): boolean;
 }
-
 const INTERNAL_ROLES = new Set(["worker", "critic", "orchestrator"]);
 const GROUP_ID = /^[a-f0-9]{64}$/;
 const CHECKPOINTS = new Set([
@@ -64,7 +64,7 @@ export async function projectContextProtection(
     const sessionRef = hashStableRef(sessionID);
     return {
       role,
-      groups: groups.map((group) => matchesGroupIdentity(group, role, sessionRef)
+      groups: groups.map((group) => matchesGroupIdentity(group, role, sessionRef, undefined, undefined, deps.isFingerprintCurrent)
         ? { groupID: group.groupID, state: "clear", reason: "user-session-unlinked" }
         : { groupID: group.groupID, state: "unknown", reason: "group-identity-unknown" }),
     };
@@ -91,7 +91,7 @@ export async function projectContextProtection(
   const sessionRef = hashStableRef(sessionID);
   const runRef = hashStableRef(runID);
   const projected = groups.map((group) => {
-    if (!matchesGroupIdentity(group, role, sessionRef, runRef, Number(round)) || group.updatedAt > checkpointUpdatedAt) {
+    if (!matchesGroupIdentity(group, role, sessionRef, runRef, Number(round), deps.isFingerprintCurrent) || group.updatedAt > checkpointUpdatedAt) {
       return { groupID: group.groupID, state: "unknown" as const, reason: "group-identity-unknown" as const };
     }
     // The checkpoint has no part-to-evidence provenance, so protect this complete round.
@@ -107,8 +107,9 @@ function matchesGroupIdentity(
   group: ContextToolGroupV1,
   role: ContextAssetRole,
   sessionRef: string,
-  runRef?: string,
-  round?: number,
+  runRef: string | undefined,
+  round: number | undefined,
+  isFingerprintCurrent: (fingerprint: string) => boolean,
 ): boolean {
   const terminal = group.terminal;
   if (!terminal || !GROUP_ID.test(group.groupID) || group.sessionRef !== sessionRef
@@ -120,8 +121,13 @@ function matchesGroupIdentity(
       && asset.sessionRef === sessionRef && asset.callRef === group.call.callRef && asset.role === role
       && (runRef === undefined ? asset.runRef === undefined : asset.runRef === runRef)
       && (round === undefined ? asset.round === undefined : asset.round === round)
-      && GROUP_ID.test(asset.fingerprint ?? "") && positiveTime(asset.createdAt))
+      && GROUP_ID.test(asset.fingerprint ?? "") && currentFingerprint(asset.fingerprint, isFingerprintCurrent) && positiveTime(asset.createdAt))
     && terminal.createdAt >= group.call.createdAt;
+}
+
+function currentFingerprint(fingerprint: string | undefined, verify: (fingerprint: string) => boolean): boolean {
+  if (!fingerprint) return false;
+  try { return verify(fingerprint) === true; } catch { return false; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

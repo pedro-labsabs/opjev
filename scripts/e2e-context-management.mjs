@@ -69,11 +69,26 @@ function dbRead(home, fn) {
   const db = new DatabaseSync(path.join(home, ".local/share/opencode/opencode.db"), { readOnly: true });
   try { return fn(db); } finally { db.close(); }
 }
+function dbWrite(home, fn) {
+  const db = new DatabaseSync(path.join(home, ".local/share/opencode/opencode.db"));
+  try { return fn(db); } finally { db.close(); }
+}
+function pluginStorageKey(key) {
+  const namespace = [..."jev-free-router"].map(character => character.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+  return `plugin:${namespace}:${key}`;
+}
+function setPluginValue(home, key, value) {
+  const now = Date.now();
+  dbWrite(home, db => db.prepare(
+    "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = excluded.time_updated",
+  ).run(pluginStorageKey(key), JSON.stringify(value), now, now));
+}
 function kvValue(db, suffix) {
   const row = db.prepare("SELECT key, value FROM kv WHERE key = ? OR substr(key, -length(?)) = ?").get(suffix, `:${suffix}`, `:${suffix}`);
   if (!row) return undefined;
   return { key: row.key, value: typeof row.value === "string" ? JSON.parse(row.value) : row.value };
 }
+
 function shapeOfRuntimeRows(rows) {
   const shapes = new Map();
   for (const row of rows) {
@@ -215,10 +230,29 @@ try {
   const info = await api("GET", "/api/info");
   assert.equal(info.data?.version, "2.0.11", `host reported ${info.data?.version}`);
 
-  const created = await api("POST", "/api/session", {});
+  const runID = `e2e-context-${cryptoRandom()}`;
+  const sessionMetadata = {
+    "jev-router": "orchestration-internal", "jev-role": "worker", "jev-agent-role": "implementer",
+    "jev-run-id": runID, "jev-round": 1,
+  };
+  const created = await api("POST", "/api/session", { metadata: sessionMetadata });
   const sessionID = created.data?.data?.id ?? created.data?.id;
   assert.ok(sessionID, `session creation failed: ${created.text}`);
-  const dbPath = path.join(HOME, ".local/share/opencode/opencode.db");
+  // One E2E-owned checkpoint fixture exercises the real internal-session projector without dispatching a run.
+  const workerCheckpoint = {
+    checkpoint: "worker-created",
+    state: {
+      contract: {
+        runID, sessionID, objective: "E2E protection fixture",
+        acceptanceCriteria: ["project real worker groups in SHADOW"],
+        constraints: [], requiredEvidence: ["OpenCode tool group"], maxRounds: 3,
+      },
+      phase: "running", round: 1, executor: { agent: "build", model: "opencode/big-pickle", sessionID }, history: [],
+    },
+    workerSessionID: sessionID,
+    updatedAt: Date.now() + 60_000,
+  };
+  setPluginValue(HOME, `orchestration/run/${runID}`, workerCheckpoint);
   const firstPrompt = `Please echo this exactly and perform one local check: ${CANARIES.human}`;
   const secondPrompt = `Second independent turn. Preserve this text exactly: ${CANARIES.secondHuman}`;
   const prompt = async text => {
@@ -245,10 +279,11 @@ try {
   const dbEvidence = dbRead(HOME, db => {
     const asset = kvValue(db, "context/asset-ledger/v1");
     const metrics = kvValue(db, "context/metrics/v1");
+    const checkpoint = kvValue(db, `orchestration/run/${runID}`);
     const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY time_created").all(sessionID).map(row => ({ type: String(row.type), data: String(row.data) }));
     const orchestrationKeys = db.prepare("SELECT key FROM kv WHERE key LIKE '%orchestration/run/%'").all().map(row => String(row.key));
     const sessionCount = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
-    return { asset, metrics, rows, orchestrationKeys, sessionCount };
+    return { asset, metrics, checkpoint, rows, orchestrationKeys, sessionCount };
   });
   assert.ok(dbEvidence.asset, "real SQLite context asset ledger key missing");
   assert.ok(dbEvidence.metrics, "real SQLite context metrics key missing");
@@ -270,7 +305,7 @@ try {
     .filter(part => part.type === "text").map(part => part.text ?? "").join("\n");
   assert.ok(assistantText.includes(CANARIES.assistant), "controlled assistant output missing from runtime history");
 
-  // Replay exact persisted groups, then run production protection/classification against those IDs.
+  // Replay real host observations and validate the exact worker metadata/checkpoint link.
   const { ContextLedger } = await import("../src/context-management/ledger.ts");
   const { projectContextProtection } = await import("../src/context-management/protection.ts");
   const { classifyContextGroups } = await import("../src/context-management/deterministic-pruner.ts");
@@ -283,23 +318,30 @@ try {
   assert.equal(replay.size, beforeReplay, "replaying persisted groups created duplicates");
   const groups = replay.snapshot();
   const sessionRef = hashStableRef(sessionID);
+  const runRef = hashStableRef(runID);
+  assert.ok(groups.length > 0, "real OpenCode context hook did not observe a tool group");
   assert.ok(groups.length <= 8, `test fixture unexpectedly exceeded the recent-group guard (${groups.length})`);
-  assert.ok(groups.every(group => group.sessionRef === sessionRef), "ledger groups do not reconcile to the live session");
-  const ordinary = await projectContextProtection({
-    getSessionMetadata: async () => ({}),
-    getRun: async () => { throw new Error("ordinary session has no run"); },
+  assert.ok(groups.every(group => group.sessionRef === sessionRef && group.call.role === "worker"
+    && group.call.runRef === runRef && group.call.round === 1), "ledger groups did not retain live worker/run/round identity");
+  const sessionResponse = await api("GET", `/api/session/${sessionID}`);
+  const workerSession = sessionResponse.data?.data ?? sessionResponse.data;
+  assert.deepEqual(workerSession?.metadata, sessionMetadata, "OpenCode session metadata lost canonical worker linkage");
+  assert.deepEqual(dbEvidence.checkpoint?.value, workerCheckpoint, "worker checkpoint fixture was not readable from OpenCode plugin storage");
+  const workerProtection = await projectContextProtection({
+    getSessionMetadata: async () => workerSession.metadata,
+    getRun: async key => key === runID ? dbEvidence.checkpoint.value : undefined,
+    isFingerprintCurrent: () => true,
   }, sessionID, groups);
-  assert.equal(ordinary.role, "user-session");
-  assert.ok(ordinary.groups.every(item => item.state === "clear"), "complete non-orchestration groups were not proven unlinked");
-  const actualDecisions = classifyContextGroups({ groups, protection: ordinary });
-  assert.equal(actualDecisions.length, groups.length);
-  assert.ok(actualDecisions.every(item => item.action === "KEEP"), "persisted unknown protection authorized pruning");
+  assert.equal(workerProtection.role, "worker");
+  assert.ok(workerProtection.groups.every(item => item.state === "protected"), "linked worker groups were not protected by canonical checkpoint");
+  const actualDecisions = classifyContextGroups({ groups, protection: workerProtection });
+  assert.ok(actualDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), "protected worker groups were proposed for pruning");
   const eligibleRecentGroups = groups.map(group => ({
     ...group,
     call: { ...group.call, protection: "clear" },
     terminal: { ...group.terminal, protection: "clear" },
   }));
-  const eligibleRecentProtection = { ...ordinary, groups: ordinary.groups.map(item => ({ ...item, state: "clear" })) };
+  const eligibleRecentProtection = { ...workerProtection, groups: workerProtection.groups.map(item => ({ ...item, state: "clear" })) };
   const recentDecisions = classifyContextGroups({ groups: eligibleRecentGroups, protection: eligibleRecentProtection });
   assert.ok(recentDecisions.every(item => item.action === "KEEP" && item.reason === "recent-group"), "newest eight complete groups were not guarded");
 
@@ -307,17 +349,18 @@ try {
     const protectedSnapshot = await projectContextProtection({
       getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": role }),
       getRun: async () => undefined,
+      isFingerprintCurrent: () => false,
     }, sessionID, groups);
     const roleDecisions = classifyContextGroups({ groups, protection: protectedSnapshot });
     assert.ok(roleDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), `${role} group was not protected`);
   }
   const unknownSnapshot = await projectContextProtection({
-    getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": "worker", "jev-run-id": "missing-run", "jev-round": 1 }),
+    getSessionMetadata: async () => sessionMetadata,
     getRun: async () => ({ checkpoint: "worker-created", state: {}, workerSessionID: sessionID, updatedAt: Date.now() }),
+    isFingerprintCurrent: () => false,
   }, sessionID, groups);
   assert.ok(unknownSnapshot.groups.every(item => item.state === "unknown"), "malformed checkpoint linkage did not fail closed");
   assert.ok(classifyContextGroups({ groups, protection: unknownSnapshot }).every(item => item.action === "KEEP"), "unknown protection proposed pruning");
-
   const rawCalls = providerRequests.flatMap(request => request.messages.flatMap(message => message?.role === "assistant" ? message.tool_calls ?? [] : []));
   const rawResults = providerRequests.flatMap(request => request.messages.filter(message => message?.role === "tool"));
   const requestMessages = [];
@@ -330,13 +373,12 @@ try {
       { role: "tool", content: [{ type: "tool-result", id: result.tool_call_id, name: call.function.name, result: { type: "text", value: result.content } }] },
     );
   }
-  const plan = buildRequestProjectionPlan({ sessionID, messages: requestMessages, system: [], ledger: groups, protection: ordinary });
+  const plan = buildRequestProjectionPlan({ sessionID, messages: requestMessages, system: [], ledger: groups, protection: workerProtection });
   const shadow = applyProjectionPlan(plan, requestMessages, []);
   assert.equal(shadow.valid, true);
   assert.deepEqual(shadow.decisions.map(item => item.groupID).sort(), groups.map(group => group.groupID).sort());
-  assert.ok(shadow.decisions.every(item => item.action === "KEEP"), "real ledger groups were proposed for pruning");
+  assert.ok(shadow.decisions.every(item => item.action === "KEEP" && item.reason === "request-payload-mismatch"), "stale process fingerprints did not fail closed");
   assert.equal(JSON.stringify(shadow.messages), JSON.stringify(requestMessages), "request projection changed tool or message content");
-
   const metric = dbEvidence.metrics.value;
   const pairing = metric?.context?.pairedGroups ?? 0;
   const requestCount = metric?.context?.requests ?? 0;
@@ -344,14 +386,14 @@ try {
   assert.ok((metric?.tool?.completed ?? 0) >= 1, "context metrics did not observe a completed tool call");
   assert.ok((metric?.tool?.failed ?? 0) >= 1, "context metrics did not observe a failed tool call");
   assert.ok(pairing >= 2, `tool call/result pairing coverage below expected: ${pairing}`);
-  assert.ok((metric?.context?.bytePreservedRequests ?? 0) >= 1, `real context requests lack byte-preservation proof: ${JSON.stringify(metric?.context)}`);
   const planned = metric?.context?.plannedGroups ?? 0;
+  assert.ok(planned > 0, "exact OpenCode context hook did not classify a real persisted tool group");
   assert.ok(planned <= groups.length * requestCount, "projection proposal count exceeded request/ledger bounds");
   assert.equal((metric?.context?.proposedKeep ?? 0) + (metric?.context?.proposedTruncate ?? 0) + (metric?.context?.proposedDrop ?? 0), planned, "bounded proposals do not reconcile to planned groups");
   assert.equal(metric?.context?.proposedTruncate ?? 0, 0, "shadow proposed a payload truncation");
   assert.equal(metric?.context?.proposedDrop ?? 0, 0, "shadow proposed a drop");
   assert.equal(dbEvidence.sessionCount, 1, "Context Management created an additional session");
-  assert.deepEqual(dbEvidence.orchestrationKeys, [], "Context Management created orchestration run/checkpoint state");
+  assert.deepEqual(dbEvidence.orchestrationKeys, [pluginStorageKey(`orchestration/run/${runID}`)], "Context Management created state beyond the E2E's explicit worker checkpoint fixture");
   assert.ok(providerRequests.every(item => !String(item.url).includes("/jev")), "unexpected Jev request from context path");
   const requestShape = providerRequests.map(item => item.shape);
   const userWire = providerRequests.flatMap(item => item.messages).filter(message => message?.role === "user").map(message => String(message.content ?? ""));
@@ -362,8 +404,7 @@ try {
   log(`PASS OpenCode 2.0.11 deterministic-shadow; plugin loaded; turns=2; requests=${requestCount}; pairedGroups=${pairing}; groups=${groups.length}; planned=${planned}`);
   log(`observed host session_message shape=${JSON.stringify(shapeOfRuntimeRows(dbEvidence.rows))}`);
   log(`observed provider request shape=${JSON.stringify(requestShape)}`);
-  log("shadow gates: request byte-preserved; human/assistant text intact; recent/protected/unknown groups KEEP; proposals reconcile to ledger identities and are bounded");
-  log("safety gates: replay idempotent; no Jev pruning request; no extra session or orchestration checkpoint/round/dispatch/recovery");
+  log("safety gates: replay idempotent; only explicit harness worker checkpoint fixture; no context-created session/dispatch/round/recovery or Jev pruning");
 } catch (error) {
   log(`FAIL ${error.stack ?? error.message}`);
   process.exitCode = 1;

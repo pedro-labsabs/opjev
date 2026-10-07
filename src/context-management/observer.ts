@@ -6,6 +6,8 @@ import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT, type ContextAssetRole
 
 export const IMPLEMENTED_CONTEXT_STAGES = ["disabled", "observe", "deterministic-shadow"] as const;
 const FINGERPRINT_KEY = createPayloadFingerprintKey();
+const CURRENT_FINGERPRINT_LIMIT = 1024;
+const currentFingerprints = new Set<string>();
 const VALID_ROLES = new Set<ContextAssetRole>(["worker", "critic", "orchestrator"]);
 const SAFE_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
 const ID_MAX_LENGTH = 256;
@@ -28,6 +30,20 @@ export function resolveContextManagementStage(value: unknown): ContextRolloutSta
   return (IMPLEMENTED_CONTEXT_STAGES as readonly unknown[]).includes(value) ? value as ContextRolloutStage : "observe";
 }
 
+/** Fingerprint with the active process key and remember it for restart-safe verification. */
+export function fingerprintContextPayload(value: unknown): string | undefined {
+  const fingerprint = fingerprintPayload(value, FINGERPRINT_KEY);
+  if (fingerprint !== undefined) {
+    currentFingerprints.add(fingerprint);
+    while (currentFingerprints.size > CURRENT_FINGERPRINT_LIMIT) currentFingerprints.delete(currentFingerprints.keys().next().value as string);
+  }
+  return fingerprint;
+}
+
+export function isCurrentContextFingerprint(fingerprint: string): boolean {
+  return currentFingerprints.has(fingerprint);
+}
+
 /** Capture a terminal tool lifecycle fact. No raw payload is persisted or returned. */
 export async function observeToolAfter(event: any, deps: ObservationDeps): Promise<void> {
   const now = (deps.now ?? Date.now)();
@@ -47,8 +63,8 @@ export async function observeToolAfter(event: any, deps: ObservationDeps): Promi
   const callRef = hashStableRef(callID);
   const sessionRef = hashStableRef(sessionID);
   const messageRef = hashStableRef(messageID);
-  const callFingerprint = fingerprintPayload(event.input, FINGERPRINT_KEY);
-  const terminalFingerprint = fingerprintPayload(terminalValue, FINGERPRINT_KEY);
+  const callFingerprint = fingerprintContextPayload(event.input);
+  const terminalFingerprint = fingerprintContextPayload(terminalValue);
   const callBytes = payloadBytes(event.input);
   const terminalBytes = payloadBytes(terminalValue);
   const eventKey = `${groupID}:${callFingerprint ?? "?"}:${terminalFingerprint ?? "?"}`;

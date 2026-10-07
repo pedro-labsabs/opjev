@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { resolveOptions } from "./config.ts";
 import { ContextLedger } from "./context-management/ledger.ts";
-import { observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
+import { fingerprintContextPayload, isCurrentContextFingerprint, observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
 import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
 import { makeStorage } from "./harness.mjs";
@@ -280,4 +280,10 @@ it("bounds pending metrics writes, drops overflow, drains, and accepts later obs
   assert.equal(await recordContextMetrics(storage, { tool: { completed: 1 } }, 2_400), true);
   assert.equal(gets, 129);
   assert.equal(sets, 129);
+});
+it("recognizes fingerprints only after creating them with this process key", () => {
+  const fingerprint = fingerprintContextPayload({ payload: "private" });
+  assert.equal(typeof fingerprint, "string");
+  assert.equal(isCurrentContextFingerprint(fingerprint), true);
+  assert.equal(isCurrentContextFingerprint("f".repeat(64)), false);
 });

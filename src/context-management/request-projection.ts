@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { classifyContextGroups, type DeterministicDecision, type DeterministicReason } from "./deterministic-pruner.ts";
 import { hashStableRef } from "./identity.ts";
+import { fingerprintContextPayload } from "./observer.ts";
 import { CONTEXT_LEDGER_SESSION_CAPACITY, type ContextToolGroupV1 } from "./types.ts";
 import type { ContextProtectionSnapshot } from "./protection.ts";
 
@@ -20,10 +21,13 @@ export interface BuildRequestProjectionInput {
   system: unknown;
   ledger: readonly ContextToolGroupV1[];
   protection: ContextProtectionSnapshot;
+  requestFingerprintAtStart?: string;
 }
 
 /** Plans are descriptive only in this PR; no retention action is applied. */
 export function buildRequestProjectionPlan(input: BuildRequestProjectionInput): ProjectionPlan {
+  const fingerprint = requestFingerprint(input.messages, input.system);
+  const requestChanged = input.requestFingerprintAtStart !== undefined && fingerprint !== input.requestFingerprintAtStart;
   const sessionRef = hashStableRef(input.sessionID);
   const groups = input.ledger.filter((group) => group.sessionRef === sessionRef).slice(0, CONTEXT_LEDGER_SESSION_CAPACITY);
   let decisions = classifyContextGroups({ groups, protection: input.protection });
@@ -36,13 +40,27 @@ export function buildRequestProjectionPlan(input: BuildRequestProjectionInput): 
     decisions = decisions.map((decision) => {
       const group = groups.find((candidate) => candidate.groupID === decision.groupID);
       const id = group && [...pairs.calls.keys()].find((callID) => hashStableRef(`${input.sessionID}\u0000${callID}`) === group.groupID);
-      if (!group || !id || pairs.calls.get(id) !== 1 || pairs.results.get(id) !== 1) {
+      const call = id ? pairs.calls.get(id) : undefined;
+      const result = id ? pairs.results.get(id) : undefined;
+      if (!group || !id || !call || !result || group.call.callRef !== hashStableRef(id)) {
         return { ...decision, action: "KEEP", reason: "request-pair-mismatch" };
+      }
+      const resultValue = result.result && typeof result.result === "object" && "value" in result.result
+        ? result.result.value : result.result;
+      if (group.call.tool !== call.name || group.terminal?.tool !== result.name
+        || fingerprintContextPayload(call.input) !== group.call.fingerprint
+        || fingerprintContextPayload(resultValue) !== group.terminal?.fingerprint) {
+        return { ...decision, action: "KEEP", reason: "request-payload-mismatch" };
       }
       return decision;
     });
   }
-  return { sessionID: input.sessionID, requestFingerprint: requestFingerprint(input.messages, input.system), decisions };
+  if (requestChanged) decisions = decisions.map((decision) => ({ ...decision, action: "KEEP", reason: "request-payload-mismatch" }));
+  return {
+    sessionID: input.sessionID,
+    requestFingerprint: input.requestFingerprintAtStart ?? fingerprint,
+    decisions,
+  };
 }
 
 /** Revalidation is the only operation here. Shadow always returns the supplied original array. */
@@ -52,7 +70,7 @@ export function applyProjectionPlan(plan: ProjectionPlan, messages: unknown[], s
   return { valid, messages, decisions: plan.decisions };
 }
 
-function requestFingerprint(messages: unknown, system: unknown): string | undefined {
+export function requestFingerprint(messages: unknown, system: unknown): string | undefined {
   try {
     const serialized = JSON.stringify([messages, system]);
     if (serialized === undefined) return undefined;
@@ -73,7 +91,8 @@ function inspectMessagePairs(messages: unknown[]): "valid" | "unknown" | "mismat
       if (!part || typeof part !== "object" || Array.isArray(part)) return "unknown";
       const value = part as Record<string, unknown>;
       if (value.type === "tool-call" || value.type === "tool-result") {
-        if (typeof value.id !== "string" || value.id.length === 0 || typeof value.name !== "string") return "mismatch";
+        if (typeof value.id !== "string" || value.id.length === 0 || typeof value.name !== "string"
+          || (value.type === "tool-call" ? !Object.hasOwn(value, "input") : !Object.hasOwn(value, "result"))) return "mismatch";
         const counts = value.type === "tool-call" ? calls : results;
         counts.set(value.id, (counts.get(value.id) ?? 0) + 1);
       } else if (!(["text", "media", "reasoning", "redacted-reasoning", "file", "source", "document", "image", "audio", "video", "compaction", "effort"] as string[]).includes(String(value.type))) {
@@ -86,15 +105,17 @@ function inspectMessagePairs(messages: unknown[]): "valid" | "unknown" | "mismat
   return "valid";
 }
 
-function collectPairs(messages: unknown[]): { calls: Map<string, number>; results: Map<string, number> } {
-  const calls = new Map<string, number>();
-  const results = new Map<string, number>();
+type ToolCall = { id: string; name: string; input: unknown };
+type ToolResult = { id: string; name: string; result: unknown };
+function collectPairs(messages: unknown[]): { calls: Map<string, ToolCall>; results: Map<string, ToolResult> } {
+  const calls = new Map<string, ToolCall>();
+  const results = new Map<string, ToolResult>();
   for (const message of messages) {
-    const item = message as { content: Array<{ type?: string; id?: string }> };
+    const item = message as { content: Array<Record<string, unknown>> };
     for (const part of item.content) {
       if (typeof part.id !== "string") continue;
-      if (part.type === "tool-call") calls.set(part.id, (calls.get(part.id) ?? 0) + 1);
-      if (part.type === "tool-result") results.set(part.id, (results.get(part.id) ?? 0) + 1);
+      if (part.type === "tool-call") calls.set(part.id, part as unknown as ToolCall);
+      if (part.type === "tool-result") results.set(part.id, part as unknown as ToolResult);
     }
   }
   return { calls, results };
