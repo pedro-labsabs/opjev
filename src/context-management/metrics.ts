@@ -24,6 +24,13 @@ export interface ContextMetricsV1 {
     toolCallParts: number;
     terminalParts: number;
     pairedGroups: number;
+    plannedGroups: number;
+    proposedKeep: number;
+    proposedTruncate: number;
+    proposedDrop: number;
+    invalidatedPlans: number;
+    bytePreservedRequests: number;
+    unknownGroups: number;
   };
 }
 
@@ -55,7 +62,7 @@ export async function recordContextMetrics(
     for (const key of Object.keys(next.tool) as Array<keyof ContextMetricsV1["tool"]>) {
       next.tool[key] = saturatingAdd(next.tool[key], safeCount(increment.tool?.[key]));
     }
-    for (const key of ["requests", "estimatedRequestBytesTotal"] as const) {
+    for (const key of ["requests", "estimatedRequestBytesTotal", "plannedGroups", "proposedKeep", "proposedTruncate", "proposedDrop", "invalidatedPlans", "unknownGroups", "bytePreservedRequests"] as const) {
       next.context[key] = saturatingAdd(next.context[key], safeCount(increment.context?.[key]));
     }
     for (const key of ["estimatedRequestBytes", "toolCallParts", "terminalParts", "pairedGroups"] as const) {
@@ -94,6 +101,10 @@ export function sanitizeContextMetrics(value: unknown, now = Date.now()): Contex
     requests: safeCount(contextRaw.requests), estimatedRequestBytes: safeCount(contextRaw.estimatedRequestBytes),
     estimatedRequestBytesTotal: safeCount(contextRaw.estimatedRequestBytesTotal), toolCallParts: safeCount(contextRaw.toolCallParts),
     terminalParts: safeCount(contextRaw.terminalParts), pairedGroups: safeCount(contextRaw.pairedGroups),
+    plannedGroups: safeCount(contextRaw.plannedGroups), proposedKeep: safeCount(contextRaw.proposedKeep),
+    proposedTruncate: safeCount(contextRaw.proposedTruncate), proposedDrop: safeCount(contextRaw.proposedDrop),
+    invalidatedPlans: safeCount(contextRaw.invalidatedPlans), unknownGroups: safeCount(contextRaw.unknownGroups),
+    bytePreservedRequests: safeCount(contextRaw.bytePreservedRequests),
   };
   return {
     schema: 1,
@@ -108,7 +119,10 @@ function emptyMetrics(now: number): ContextMetricsV1 {
   return {
     schema: 1, windowStartedAt: safeTime(now), updatedAt: safeTime(now),
     tool: { completed: 0, failed: 0, pairedGroups: 0, duplicateDeliveries: 0, identityLoss: 0, storageFailures: 0, queueOverflow: 0, unknownRoles: 0 },
-    context: { requests: 0, estimatedRequestBytes: 0, estimatedRequestBytesTotal: 0, toolCallParts: 0, terminalParts: 0, pairedGroups: 0 },
+    context: {
+      requests: 0, estimatedRequestBytes: 0, estimatedRequestBytesTotal: 0, toolCallParts: 0, terminalParts: 0, pairedGroups: 0,
+      plannedGroups: 0, proposedKeep: 0, proposedTruncate: 0, proposedDrop: 0, invalidatedPlans: 0, unknownGroups: 0, bytePreservedRequests: 0,
+    },
   };
 }
 function safeCount(value: unknown): number {

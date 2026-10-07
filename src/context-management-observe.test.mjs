@@ -40,13 +40,25 @@ function event(overrides = {}) {
   };
 }
 
-it("resolves missing, invalid, and unimplemented stages to observe; disabled is explicit", () => {
+it("resolves missing, invalid, and unimplemented stages to observe; deterministic shadow is implemented", () => {
   assert.equal(resolveContextManagementStage(undefined), "observe");
   assert.equal(resolveContextManagementStage("not-a-stage"), "observe");
-  assert.equal(resolveContextManagementStage("deterministic-shadow"), "observe");
-  assert.equal(resolveContextManagementStage("disabled"), "disabled");
+  assert.equal(resolveContextManagementStage("semantic-shadow"), "observe");
+  assert.equal(resolveContextManagementStage("deterministic-shadow"), "deterministic-shadow");
   assert.equal(resolveOptions({}).contextManagementStage, "observe");
   assert.equal(resolveOptions({ contextManagementStage: "disabled" }).contextManagementStage, "disabled");
+});
+
+it("uses explicit context stage options before an environment fallback for the real server runtime", () => {
+  const previous = process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE;
+  process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE = "deterministic-shadow";
+  try {
+    assert.equal(resolveOptions({}).contextManagementStage, "deterministic-shadow");
+    assert.equal(resolveOptions({ contextManagementStage: "observe" }).contextManagementStage, "observe");
+  } finally {
+    if (previous === undefined) delete process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE;
+    else process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE = previous;
+  }
 });
 
 it("stores bounded pairs for completed and failed calls without persisting canaries", async () => {

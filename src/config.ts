@@ -60,14 +60,17 @@ export interface RouterOptions {
 }
 
 export function resolveOptions(raw: Record<string, unknown> = {}): Required<RouterOptions> {
-  const envEndpoint = typeof process !== "undefined" && process.env?.OPJEV_JEV_ENDPOINT ? process.env.OPJEV_JEV_ENDPOINT : undefined;
+  const envEndpoint = typeof process !== "undefined" && process.env?.OPJEV_JEV_ENDPOINT
+    ? process.env.OPJEV_JEV_ENDPOINT : undefined;
+  const contextStageEnv = typeof process !== "undefined" && process.env?.OPJEV_CONTEXT_MANAGEMENT_STAGE
+    ? process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE : undefined;
   return {
     jevModel: (raw.jevModel as string) ?? "jev-1.13-free",
     jevEndpoint: (raw.jevEndpoint as string) ?? envEndpoint ?? "https://opencode.ai/zen/v1/systemone",
     apiKeyEnv: (raw.apiKeyEnv as string) ?? "OPENCODE_API_KEY",
     confidenceThreshold: (raw.confidenceThreshold as number) ?? 0.55,
     enableAutoRoute: (raw.enableAutoRoute as boolean) ?? true,
-    contextManagementStage: typeof raw.contextManagementStage === "string" ? raw.contextManagementStage : "observe",
+    contextManagementStage: typeof raw.contextManagementStage === "string" ? raw.contextManagementStage : contextStageEnv ?? "observe",
     jevTimeoutMs: (raw.jevTimeoutMs as number) ?? 15000,
   };
 }

@@ -4,7 +4,7 @@ import { recordContextMetrics, type ContextMetricIncrement } from "./metrics.ts"
 import { createContextAssetSink, isContextAssetSinkAtCapacity } from "./storage-sink.ts";
 import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT, type ContextAssetRole, type ContextAssetSource, type ContextAssetV1, type ContextToolGroupV1, type ContextRolloutStage } from "./types.ts";
 
-export const IMPLEMENTED_CONTEXT_STAGES = ["disabled", "observe"] as const;
+export const IMPLEMENTED_CONTEXT_STAGES = ["disabled", "observe", "deterministic-shadow"] as const;
 const FINGERPRINT_KEY = createPayloadFingerprintKey();
 const VALID_ROLES = new Set<ContextAssetRole>(["worker", "critic", "orchestrator"]);
 const SAFE_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
