@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Exact OpenCode 2.0.11 OBSERVE-only runtime proof for Issue #4 Boundary A.
+// Exact OpenCode 2.0.11 deterministic-SHADOW runtime proof for Issue #4 Boundary B.
 // The provider and tool responses are local and controlled; the installed OPJEV
 // plugin, hooks, session history, and SQLite kv store are the real host runtime.
 
@@ -16,7 +16,7 @@ import { installServerPluginToProject, installPluginToHome } from "./install-plu
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/opencode";
-const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-context-observe-"));
+const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-context-shadow-"));
 const HOME = path.join(RUN_DIR, "home");
 const PROJECT = path.join(RUN_DIR, "project");
 const CANARIES = {
@@ -69,11 +69,26 @@ function dbRead(home, fn) {
   const db = new DatabaseSync(path.join(home, ".local/share/opencode/opencode.db"), { readOnly: true });
   try { return fn(db); } finally { db.close(); }
 }
+function dbWrite(home, fn) {
+  const db = new DatabaseSync(path.join(home, ".local/share/opencode/opencode.db"));
+  try { return fn(db); } finally { db.close(); }
+}
+function pluginStorageKey(key) {
+  const namespace = [..."jev-free-router"].map(character => character.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+  return `plugin:${namespace}:${key}`;
+}
+function setPluginValue(home, key, value) {
+  const now = Date.now();
+  dbWrite(home, db => db.prepare(
+    "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = excluded.time_updated",
+  ).run(pluginStorageKey(key), JSON.stringify(value), now, now));
+}
 function kvValue(db, suffix) {
   const row = db.prepare("SELECT key, value FROM kv WHERE key = ? OR substr(key, -length(?)) = ?").get(suffix, `:${suffix}`, `:${suffix}`);
   if (!row) return undefined;
   return { key: row.key, value: typeof row.value === "string" ? JSON.parse(row.value) : row.value };
 }
+
 function shapeOfRuntimeRows(rows) {
   const shapes = new Map();
   for (const row of rows) {
@@ -131,7 +146,7 @@ try {
     req.on("end", () => {
       let body = {};
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
-      providerRequests.push({ shape: openaiShape(body), messages: body.messages ?? [] });
+      providerRequests.push({ url: req.url, shape: openaiShape(body), messages: body.messages ?? [] });
       const previousCalls = (body.messages ?? []).reduce((count, message) => count + (message?.role === "assistant" && Array.isArray(message.tool_calls) ? message.tool_calls.length : 0), 0);
       const hasSecondPrompt = JSON.stringify(body.messages ?? []).includes(CANARIES.secondHuman);
       const requestedTool = !hasSecondPrompt && previousCalls === 1 ? "read" : "shell";
@@ -188,13 +203,14 @@ try {
     permission: { read: "allow", shell: "allow" },
     provider: { opencode: { options: { baseURL: `http://127.0.0.1:${providerPort}` } } },
     model: "opencode/big-pickle",
-    plugins: [{ package: "./plugins/opencode-jev-free-router", options: { enableAutoRoute: false, contextManagementStage: "observe" } }],
+    plugins: [{ package: "./plugins/opencode-jev-free-router", options: { enableAutoRoute: false, contextManagementStage: "deterministic-shadow", jevEndpoint: `http://127.0.0.1:${providerPort}/jev` } }],
   };
   fs.writeFileSync(path.join(PROJECT, "opencode.json"), JSON.stringify(config, null, 2));
   const hostPort = await freePort();
   const host = spawnHost(["serve", "--hostname", "127.0.0.1", "--port", String(hostPort)], {
     PATH: process.env.PATH ?? "", HOME, OPENCODE_CONFIG_DIR: path.join(HOME, ".config/opencode"),
     OPENCODE_DATA_DIR: path.join(HOME, ".local/share/opencode"), OPENCODE_API_KEY: "local-context-e2e-only",
+    OPJEV_CONTEXT_MANAGEMENT_STAGE: "deterministic-shadow",
   });
   let password = "";
   await waitFor(() => { password = /server password (\S+)/.exec(host.output)?.[1] ?? ""; return password; }, 30000, "server password");
@@ -214,10 +230,29 @@ try {
   const info = await api("GET", "/api/info");
   assert.equal(info.data?.version, "2.0.11", `host reported ${info.data?.version}`);
 
-  const created = await api("POST", "/api/session", {});
+  const runID = `e2e-context-${cryptoRandom()}`;
+  const sessionMetadata = {
+    "jev-router": "orchestration-internal", "jev-role": "worker", "jev-agent-role": "implementer",
+    "jev-run-id": runID, "jev-round": 1,
+  };
+  const created = await api("POST", "/api/session", { metadata: sessionMetadata });
   const sessionID = created.data?.data?.id ?? created.data?.id;
   assert.ok(sessionID, `session creation failed: ${created.text}`);
-  const dbPath = path.join(HOME, ".local/share/opencode/opencode.db");
+  // One E2E-owned checkpoint fixture exercises the real internal-session projector without dispatching a run.
+  const workerCheckpoint = {
+    checkpoint: "worker-created",
+    state: {
+      contract: {
+        runID, sessionID, objective: "E2E protection fixture",
+        acceptanceCriteria: ["project real worker groups in SHADOW"],
+        constraints: [], requiredEvidence: ["OpenCode tool group"], maxRounds: 3,
+      },
+      phase: "running", round: 1, executor: { agent: "build", model: "opencode/big-pickle", sessionID }, history: [],
+    },
+    workerSessionID: sessionID,
+    updatedAt: Date.now() + 60_000,
+  };
+  setPluginValue(HOME, `orchestration/run/${runID}`, workerCheckpoint);
   const firstPrompt = `Please echo this exactly and perform one local check: ${CANARIES.human}`;
   const secondPrompt = `Second independent turn. Preserve this text exactly: ${CANARIES.secondHuman}`;
   const prompt = async text => {
@@ -244,8 +279,11 @@ try {
   const dbEvidence = dbRead(HOME, db => {
     const asset = kvValue(db, "context/asset-ledger/v1");
     const metrics = kvValue(db, "context/metrics/v1");
+    const checkpoint = kvValue(db, `orchestration/run/${runID}`);
     const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY time_created").all(sessionID).map(row => ({ type: String(row.type), data: String(row.data) }));
-    return { asset, metrics, rows };
+    const orchestrationKeys = db.prepare("SELECT key FROM kv WHERE key LIKE '%orchestration/run/%'").all().map(row => String(row.key));
+    const sessionCount = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
+    return { asset, metrics, checkpoint, rows, orchestrationKeys, sessionCount };
   });
   assert.ok(dbEvidence.asset, "real SQLite context asset ledger key missing");
   assert.ok(dbEvidence.metrics, "real SQLite context metrics key missing");
@@ -267,15 +305,59 @@ try {
     .filter(part => part.type === "text").map(part => part.text ?? "").join("\n");
   assert.ok(assistantText.includes(CANARIES.assistant), "controlled assistant output missing from runtime history");
 
-  // Replay the exact stored groups through the production idempotent ledger API.
-  // This checks storage replay semantics without modifying host history or records.
+  // Replay real host observations and validate the exact worker metadata/checkpoint link.
   const { ContextLedger } = await import("../src/context-management/ledger.ts");
+  const { projectContextProtection } = await import("../src/context-management/protection.ts");
+  const { classifyContextGroups } = await import("../src/context-management/deterministic-pruner.ts");
+  const { hashStableRef } = await import("../src/context-management/identity.ts");
   const replay = new ContextLedger();
   replay.replace(assetGroups);
   const beforeReplay = replay.size;
   for (const group of replay.snapshot()) replay.upsertGroup(group);
   assert.equal(replay.size, beforeReplay, "replaying persisted groups created duplicates");
+  const groups = replay.snapshot();
+  const sessionRef = hashStableRef(sessionID);
+  const runRef = hashStableRef(runID);
+  assert.ok(groups.length > 0, "real OpenCode context hook did not observe a tool group");
+  assert.ok(groups.length <= 8, `test fixture unexpectedly exceeded the recent-group guard (${groups.length})`);
+  assert.ok(groups.every(group => group.sessionRef === sessionRef && /^[a-f0-9]{64}$/.test(group.messageRef ?? "")
+    && group.call.role === "worker" && group.call.runRef === runRef && group.call.round === 1),
+  "ledger groups did not retain hashed message and live worker/run/round identity");
+  const sessionResponse = await api("GET", `/api/session/${sessionID}`);
+  const workerSession = sessionResponse.data?.data ?? sessionResponse.data;
+  assert.deepEqual(workerSession?.metadata, sessionMetadata, "OpenCode session metadata lost canonical worker linkage");
+  assert.deepEqual(dbEvidence.checkpoint?.value, workerCheckpoint, "worker checkpoint fixture was not readable from OpenCode plugin storage");
+  const workerProtection = await projectContextProtection({
+    getSessionMetadata: async () => workerSession.metadata,
+    getRun: async key => key === runID ? dbEvidence.checkpoint.value : undefined,
+  }, sessionID, groups);
+  assert.equal(workerProtection.role, "worker");
+  assert.ok(workerProtection.groups.every(item => item.state === "unknown"), "cross-process fingerprints did not fail closed");
+  const actualDecisions = classifyContextGroups({ groups, protection: workerProtection });
+  assert.ok(actualDecisions.every(item => item.action === "KEEP" && item.reason === "unknown-protection"), "unknown worker groups were proposed for pruning");
+  const eligibleRecentGroups = groups.map(group => ({
+    ...group,
+    call: { ...group.call, protection: "clear" },
+    terminal: { ...group.terminal, protection: "clear" },
+  }));
+  const eligibleRecentProtection = { ...workerProtection, groups: workerProtection.groups.map(item => ({ ...item, state: "clear" })) };
+  const recentDecisions = classifyContextGroups({ groups: eligibleRecentGroups, protection: eligibleRecentProtection });
+  assert.ok(recentDecisions.every(item => item.action === "KEEP" && item.reason === "recent-group"), "newest eight complete groups were not guarded");
 
+  for (const role of ["critic", "orchestrator"]) {
+    const protectedSnapshot = await projectContextProtection({
+      getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": role }),
+      getRun: async () => undefined,
+    }, sessionID, groups);
+    const roleDecisions = classifyContextGroups({ groups, protection: protectedSnapshot });
+    assert.ok(roleDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), `${role} group was not protected`);
+  }
+  const unknownSnapshot = await projectContextProtection({
+    getSessionMetadata: async () => sessionMetadata,
+    getRun: async () => ({ checkpoint: "worker-created", state: {}, workerSessionID: sessionID, updatedAt: Date.now() }),
+  }, sessionID, groups);
+  assert.ok(unknownSnapshot.groups.every(item => item.state === "unknown"), "malformed checkpoint linkage did not fail closed");
+  assert.ok(classifyContextGroups({ groups, protection: unknownSnapshot }).every(item => item.action === "KEEP"), "unknown protection proposed pruning");
   const metric = dbEvidence.metrics.value;
   const pairing = metric?.context?.pairedGroups ?? 0;
   const requestCount = metric?.context?.requests ?? 0;
@@ -283,18 +365,40 @@ try {
   assert.ok((metric?.tool?.completed ?? 0) >= 1, "context metrics did not observe a completed tool call");
   assert.ok((metric?.tool?.failed ?? 0) >= 1, "context metrics did not observe a failed tool call");
   assert.ok(pairing >= 2, `tool call/result pairing coverage below expected: ${pairing}`);
+  const planned = metric?.context?.plannedGroups ?? 0;
+  assert.ok(planned > 0, "exact OpenCode context hook did not classify a real persisted tool group");
+  assert.ok(planned <= groups.length * requestCount, "projection proposal count exceeded request/ledger bounds");
+  assert.equal((metric?.context?.proposedKeep ?? 0) + (metric?.context?.proposedTruncate ?? 0) + (metric?.context?.proposedDrop ?? 0), planned, "bounded proposals do not reconcile to planned groups");
+  assert.equal(metric?.context?.proposedTruncate ?? 0, 0, "shadow proposed a payload truncation");
+  assert.equal(metric?.context?.proposedDrop ?? 0, 0, "shadow proposed a drop");
+  assert.equal(metric?.context?.requestSnapshotsUnchanged ?? 0, requestCount,
+    "real context hook did not validate unchanged system/messages for every request");
+  assert.ok((metric?.context?.estimatedRequestBytesBeforeTotal ?? 0) > 0,
+    "real context hook did not measure the request before planning");
+  assert.equal(metric?.context?.estimatedRequestBytesBeforeTotal, metric?.context?.estimatedRequestBytesAfterTotal,
+    "real context hook request-byte estimates differed before/after deterministic SHADOW");
+  assert.ok((metric?.context?.protectedGroups ?? 0) > 0,
+    "host-side projector did not select worker-round protection for real groups");
+  assert.ok((metric?.context?.workerRoundProtectedGroups ?? 0) > 0,
+    "host-side projector did not record worker-round-evidence as the protection reason");
+  assert.equal(metric?.context?.requestShapeUnknownGroups ?? 0, 0,
+    "real OpenCode context message shape was not understood by the projector");
+  assert.equal(metric?.context?.requestPairMismatchGroups ?? 0, 0,
+    "real OpenCode call/result identity did not reconcile with the ledger");
+  log(`hook evidence: unchanged=${metric.context.requestSnapshotsUnchanged}; worker-round-protected=${metric.context.workerRoundProtectedGroups}; protected=${metric.context.protectedGroups}; unknown-protection=${metric.context.unknownProtectionGroups}; request-shape-unknown=${metric.context.requestShapeUnknownGroups}; pair-mismatch=${metric.context.requestPairMismatchGroups}; payload-mismatch=${metric.context.requestPayloadMismatchGroups}`);
+  assert.equal(dbEvidence.sessionCount, 1, "Context Management created an additional session");
+  assert.deepEqual(dbEvidence.orchestrationKeys, [pluginStorageKey(`orchestration/run/${runID}`)], "Context Management created state beyond the E2E's explicit worker checkpoint fixture");
+  assert.ok(providerRequests.every(item => !String(item.url).includes("/jev")), "unexpected Jev request from context path");
   const requestShape = providerRequests.map(item => item.shape);
   const userWire = providerRequests.flatMap(item => item.messages).filter(message => message?.role === "user").map(message => String(message.content ?? ""));
   assert.ok(userWire.includes(firstPrompt), "outgoing first human text missing or changed before provider request");
   assert.ok(userWire.includes(secondPrompt), "outgoing second human text missing or changed before provider request");
   assert.ok(providerRequests.flatMap(item => item.messages).some(message => message?.role === "assistant" && message.content === `First turn complete ${CANARIES.assistant}`), "assistant content did not reach a subsequent provider request unchanged");
 
-  log(`PASS OpenCode 2.0.11 OBSERVE-only; plugin loaded; turns=2; observedRequests=${requestCount}; pairedGroups=${pairing}; groups=${assetGroups.length}`);
+  log(`PASS OpenCode 2.0.11 deterministic-shadow; plugin loaded; turns=2; requests=${requestCount}; pairedGroups=${pairing}; groups=${groups.length}; planned=${planned}`);
   log(`observed host session_message shape=${JSON.stringify(shapeOfRuntimeRows(dbEvidence.rows))}`);
   log(`observed provider request shape=${JSON.stringify(requestShape)}`);
-  log("privacy gate: human/input/result/error/assistant canaries absent from context ledger and metrics; present only in runtime/provider path as expected");
-  log("idempotency gate: replayed persisted groups through ContextLedger.upsertGroup with stable group count");
-  log("no pruning decision or request projection is implemented in this OBSERVE run");
+  log("safety gates: replay idempotent; only explicit harness worker checkpoint fixture; no context-created session/dispatch/round/recovery or Jev pruning");
 } catch (error) {
   log(`FAIL ${error.stack ?? error.message}`);
   process.exitCode = 1;

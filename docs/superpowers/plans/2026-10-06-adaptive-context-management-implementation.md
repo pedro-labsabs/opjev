@@ -63,7 +63,7 @@
   - `RetentionAction = "KEEP" | "KEEP_IDENTITY_TRUNCATE_PAYLOAD" | "DROP"`
   - `ProtectionState = "protected" | "clear" | "unknown"`
   - `ContextAssetV1` with the fields and enums fixed by the spec.
-  - `ContextToolGroupV1` containing exactly one call asset plus at most one result/failure asset and bounded timestamps.
+  - `ContextToolGroupV1` containing one call asset plus at most one result/failure asset, bounded timestamps, and one shared hashed `messageRef` for the observed invocation identity.
   - constants: `CONTEXT_SCHEMA = 1`, `CONTEXT_LEDGER_GROUP_CAPACITY = 2048`, `CONTEXT_LEDGER_SESSION_CAPACITY = 256`, `CONTEXT_LEDGER_TTL_MS = 86_400_000`, `CONTEXT_ASSET_MAX_SERIALIZED_BYTES = 512`, `CONTEXT_LEDGER_PENDING_LIMIT = 128`, `CONTEXT_RECENT_GROUPS = 8`.
   - `hashStableRef(value: string): string` for high-entropy IDs.
   - `createPayloadFingerprintKey(): Uint8Array` and `fingerprintPayload(value: unknown, key: Uint8Array): string | undefined` using HMAC-SHA-256.

@@ -45,7 +45,7 @@ const ASSET_KEYS = new Set([
   "messageRef", "entityRef", "payloadBytes", "fingerprint", "createdAt", "lastReferencedAt", "supersededBy",
   "evidenceRoles", "protection", "retention", "confidence",
 ]);
-const GROUP_KEYS = new Set(["groupID", "sessionRef", "call", "terminal", "createdAt", "updatedAt"]);
+const GROUP_KEYS = new Set(["groupID", "sessionRef", "messageRef", "call", "terminal", "createdAt", "updatedAt"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -142,6 +142,7 @@ function sanitizeGroup(value: unknown): ContextToolGroupV1 | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, GROUP_KEYS)) return undefined;
   if (typeof value.groupID !== "string" || !HEX_64.test(value.groupID)) return undefined;
   if (typeof value.sessionRef !== "string" || !HEX_64.test(value.sessionRef)) return undefined;
+  if (value.messageRef !== undefined && (typeof value.messageRef !== "string" || !HEX_64.test(value.messageRef))) return undefined;
   if (!isPositiveTime(value.createdAt) || !isPositiveTime(value.updatedAt) || Number(value.updatedAt) < Number(value.createdAt)) return undefined;
   const call = deserializeContextAsset(value.call);
   const terminal = value.terminal === undefined ? undefined : deserializeContextAsset(value.terminal);
@@ -153,6 +154,7 @@ function sanitizeGroup(value: unknown): ContextToolGroupV1 | undefined {
   return {
     groupID: value.groupID,
     sessionRef: value.sessionRef,
+    ...(value.messageRef !== undefined ? { messageRef: value.messageRef as string } : {}),
     call,
     ...(terminal ? { terminal } : {}),
     createdAt: value.createdAt,
@@ -168,11 +170,12 @@ export function serializeContextGroup(group: ContextToolGroupV1): readonly unkno
     group.terminal ? serializeContextAsset(group.terminal) : null,
     group.createdAt,
     group.updatedAt,
+    group.messageRef ?? null,
   ];
 }
 
 export function deserializeContextGroup(value: unknown): ContextToolGroupV1 | undefined {
-  if (Array.isArray(value) && value.length === 6) {
+  if (Array.isArray(value) && (value.length === 6 || value.length === 7)) {
     return sanitizeGroup({
       groupID: value[0],
       sessionRef: value[1],
@@ -180,6 +183,7 @@ export function deserializeContextGroup(value: unknown): ContextToolGroupV1 | un
       ...(value[3] !== null ? { terminal: value[3] } : {}),
       createdAt: value[4],
       updatedAt: value[5],
+      ...(typeof value[6] === "string" ? { messageRef: value[6] } : {}),
     });
   }
   return sanitizeGroup(value);
@@ -283,6 +287,7 @@ function cloneGroup(group: ContextToolGroupV1): ContextToolGroupV1 {
   return {
     groupID: group.groupID,
     sessionRef: group.sessionRef,
+    ...(group.messageRef ? { messageRef: group.messageRef } : {}),
     call: cloneAsset(group.call),
     ...(group.terminal ? { terminal: cloneAsset(group.terminal) } : {}),
     createdAt: group.createdAt,

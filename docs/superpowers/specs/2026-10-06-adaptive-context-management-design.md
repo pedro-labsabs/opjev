@@ -127,7 +127,7 @@ interface ContextAssetV1 {
   source: "tool-call" | "tool-result" | "tool-failure" | "tool-artifact";
   tool: string;                  // allowlisted identifier, <= 80 chars
   callRef: string;               // 64 hex; links call, result, and failure
-  messageRef?: string;           // 64 hex message ID fingerprint
+  messageRef?: string;           // 64 hex part-specific reference; invocation linkage is shared at group level
   entityRef?: string;            // 64 hex normalized entity/path fingerprint
   payloadBytes?: number;         // measured UTF-8 bytes, clamped to safe integer
   fingerprint?: string;          // 64 hex over bytes observed in memory
@@ -140,6 +140,19 @@ interface ContextAssetV1 {
   confidence?: "high" | "medium" | "low"; // semantic decision only; absent otherwise
 }
 ```
+```ts
+interface ContextToolGroupV1 {
+  groupID: string;
+  sessionRef: string;
+  messageRef?: string;            // hashed execute.after messageID shared by call and terminal
+  call: ContextAssetV1;
+  terminal?: ContextAssetV1;
+  createdAt: number;
+  updatedAt: number;
+}
+```
+
+The observer stores the shared `messageRef` once per group rather than duplicating it into both bounded asset records. Missing message identity remains unmappable and `KEEP`; projection requires the request call's containing message ID to match this reference and the result to remain linked by the same call ID.
 
 `Context Asset` represents metadata about a part/group, not a copy of that part. For future call events, compute fingerprints transiently; persist only the digest, byte count, stable identifiers, safe labels, and enumerated policy result. Never persist raw tool input/output, message text, shell commands, paths, credentials, headers, prompts, or Jev reasoning. For path equality, use a keyed or ordinary cryptographic digest of a normalized path; do not persist the path itself. A missing tool-specific normalization means `entityRef` is absent and no same-entity rule applies.
 
@@ -330,6 +343,8 @@ Do not rank configurations by DROP count or bytes saved alone. Report savings be
 | **Bounded Semantic ENFORCE** | Apply only schema-valid high-confidence decisions on eligible IDs after final protection/fingerprint recheck; no authority over anything else | Full metrics, decision provenance/version, outcome/evidence comparisons | Staged cohort/reference E2E and production observation show no evidence/acceptance regression; low-confidence/unknown coverage never pruned; explicit maintainer approval | Disable semantic enforcement immediately; retain deterministic mode only if its independent gate remains valid |
 
 Do not skip stages. A feature/configuration error defaults to OBSERVE/KEEP. Promotion does not change routing or the #5 OBSERVE stage.
+
+The OpenCode 2.0.11 SHADOW E2E currently reports `requestPayloadMismatchGroups=5` for five proposals; all remain KEEP. This fail-closed result does not prove payload equivalence. Do not promote adapter-side payload equality or enable deterministic reduction/ENFORCE until exact-host reconciliation demonstrates matching payload fingerprints for supported request shapes.
 
 ## 22. Test strategy for the future implementation
 

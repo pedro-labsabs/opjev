@@ -88,6 +88,7 @@ os chat models free continuam no pool de lanes acima.
 | `apiKeyEnv` | `OPENCODE_API_KEY` | Env com a key do Zen |
 | `confidenceThreshold` | `0.55` | Abaixo disso, escala para `heavy-reasoning` |
 | `enableAutoRoute` | `true` | Liga o auto-route no hook `prompt` |
+| `contextManagementStage` | `observe` | `observe` ou `deterministic-shadow`; fallback de servidor por `OPJEV_CONTEXT_MANAGEMENT_STAGE` quando a opção não chega ao plugin |
 | `jevTimeoutMs` | `15000` | Timeout das chamadas ao Jev |
 
 ## Correcoes da analise abrangente (2026-09, priorizadas pelo Jev)

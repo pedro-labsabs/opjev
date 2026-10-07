@@ -3,9 +3,12 @@ import assert from "node:assert/strict";
 
 import { resolveOptions } from "./config.ts";
 import { ContextLedger } from "./context-management/ledger.ts";
-import { observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
+import { fingerprintContextPayload, isCurrentContextFingerprint, observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
 import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
+import { hashStableRef } from "./context-management/identity.ts";
+import { projectContextProtection } from "./context-management/protection.ts";
+import { classifyContextGroups } from "./context-management/deterministic-pruner.ts";
 import { makeStorage } from "./harness.mjs";
 
 const rawCanaries = ["HUMAN-CANARY-8e8d", "INPUT-CANARY-1bc3", "RESULT-CANARY-b119", "ERROR-CANARY-99f4", "sk-test-context-secret-74c2"];
@@ -40,13 +43,25 @@ function event(overrides = {}) {
   };
 }
 
-it("resolves missing, invalid, and unimplemented stages to observe; disabled is explicit", () => {
+it("resolves missing, invalid, and unimplemented stages to observe; deterministic shadow is implemented", () => {
   assert.equal(resolveContextManagementStage(undefined), "observe");
   assert.equal(resolveContextManagementStage("not-a-stage"), "observe");
-  assert.equal(resolveContextManagementStage("deterministic-shadow"), "observe");
-  assert.equal(resolveContextManagementStage("disabled"), "disabled");
+  assert.equal(resolveContextManagementStage("semantic-shadow"), "observe");
+  assert.equal(resolveContextManagementStage("deterministic-shadow"), "deterministic-shadow");
   assert.equal(resolveOptions({}).contextManagementStage, "observe");
   assert.equal(resolveOptions({ contextManagementStage: "disabled" }).contextManagementStage, "disabled");
+});
+
+it("uses explicit context stage options before an environment fallback for the real server runtime", () => {
+  const previous = process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE;
+  process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE = "deterministic-shadow";
+  try {
+    assert.equal(resolveOptions({}).contextManagementStage, "deterministic-shadow");
+    assert.equal(resolveOptions({ contextManagementStage: "observe" }).contextManagementStage, "observe");
+  } finally {
+    if (previous === undefined) delete process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE;
+    else process.env.OPJEV_CONTEXT_MANAGEMENT_STAGE = previous;
+  }
 });
 
 it("stores bounded pairs for completed and failed calls without persisting canaries", async () => {
@@ -64,6 +79,11 @@ it("stores bounded pairs for completed and failed calls without persisting canar
   const groups = deps.ledger();
   assert.equal(groups.length, 2);
   assert.ok(groups.every((x) => x.terminal));
+  assert.deepEqual(groups.map((x) => x.messageRef), [
+    hashStableRef("message-high-entropy-4812"),
+    hashStableRef("message-high-entropy-error-5013"),
+  ]);
+  assert.ok(groups.every((x) => x.call.messageRef === undefined && x.terminal.messageRef === undefined));
   assert.deepEqual(groups.map((x) => x.terminal.source).sort(), ["tool-failure", "tool-result"]);
   const persisted = JSON.stringify([
     deps.storage._map.get(CONTEXT_LEDGER_KEY),
@@ -268,4 +288,39 @@ it("bounds pending metrics writes, drops overflow, drains, and accepts later obs
   assert.equal(await recordContextMetrics(storage, { tool: { completed: 1 } }, 2_400), true);
   assert.equal(gets, 129);
   assert.equal(sets, 129);
+});
+it("recognizes fingerprints only after creating them with this process key", () => {
+  const fingerprint = fingerprintContextPayload({ payload: "private" });
+  assert.equal(typeof fingerprint, "string");
+  assert.equal(isCurrentContextFingerprint(fingerprint), true);
+  assert.equal(isCurrentContextFingerprint("f".repeat(64)), false);
+});
+it("classifies observed groups using their current protection projection", async () => {
+  let now = 2_000;
+  const deps = fixture({ now: () => now++ });
+  for (let index = 0; index < 10; index++) {
+    await observeToolAfter(event({
+      id: `real-call-${index}`,
+      messageID: `real-message-${index}`,
+      input: { command: `real-command-${index}` },
+      result: { output: `real-output-${index}` },
+    }), deps);
+  }
+
+  const groups = deps.ledger();
+  assert.equal(groups.length, 10);
+  assert.ok(groups.every(group => group.call.protection === "unknown" && group.terminal.protection === "unknown"));
+  const protection = await projectContextProtection({
+    getSessionMetadata: async () => ({}),
+    getRun: async () => undefined,
+  }, "session-high-entropy-981d", groups);
+  assert.ok(protection.groups.every(group => group.state === "clear"));
+
+  const decisions = classifyContextGroups({ groups, protection });
+  assert.ok(decisions.slice(0, 2).every(decision => decision.reason === "relation-unproven"));
+  assert.ok(decisions.slice(2).every(decision => decision.reason === "recent-group"));
+  assert.ok(decisions.every(decision => decision.action === "KEEP"));
+
+  const missingProjection = classifyContextGroups({ groups, protection: { role: "unknown", groups: [] } });
+  assert.ok(missingProjection.every(decision => decision.action === "KEEP" && decision.reason === "unknown-protection"));
 });
