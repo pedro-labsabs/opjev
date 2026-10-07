@@ -24,7 +24,7 @@ export interface ClassifyContextGroupsInput {
   recentGroupIDs?: readonly string[];
 }
 
-/** The production allowlist is intentionally empty: no observed tool name alone proves safe equivalence. */
+/** This boundary has no verified tool adapters; every equivalence/supersession stays relation-unproven/KEEP. */
 export function classifyContextGroups(input: ClassifyContextGroupsInput): DeterministicDecision[] {
   const protectedByID = new Map(input.protection.groups.map((group) => [group.groupID, group.state]));
   const recent = new Set(input.recentGroupIDs ?? newestCompleteGroups(input.groups));

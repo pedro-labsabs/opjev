@@ -6,6 +6,7 @@ import { ContextLedger } from "./context-management/ledger.ts";
 import { fingerprintContextPayload, isCurrentContextFingerprint, observeContextRequest, observeToolAfter, resolveContextManagementStage } from "./context-management/observer.ts";
 import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
+import { hashStableRef } from "./context-management/identity.ts";
 import { makeStorage } from "./harness.mjs";
 
 const rawCanaries = ["HUMAN-CANARY-8e8d", "INPUT-CANARY-1bc3", "RESULT-CANARY-b119", "ERROR-CANARY-99f4", "sk-test-context-secret-74c2"];
@@ -76,6 +77,11 @@ it("stores bounded pairs for completed and failed calls without persisting canar
   const groups = deps.ledger();
   assert.equal(groups.length, 2);
   assert.ok(groups.every((x) => x.terminal));
+  assert.deepEqual(groups.map((x) => x.messageRef), [
+    hashStableRef("message-high-entropy-4812"),
+    hashStableRef("message-high-entropy-error-5013"),
+  ]);
+  assert.ok(groups.every((x) => x.call.messageRef === undefined && x.terminal.messageRef === undefined));
   assert.deepEqual(groups.map((x) => x.terminal.source).sort(), ["tool-failure", "tool-result"]);
   const persisted = JSON.stringify([
     deps.storage._map.get(CONTEXT_LEDGER_KEY),

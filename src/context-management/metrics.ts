@@ -21,6 +21,8 @@ export interface ContextMetricsV1 {
     requests: number;
     estimatedRequestBytes: number;
     estimatedRequestBytesTotal: number;
+    estimatedRequestBytesBeforeTotal: number;
+    estimatedRequestBytesAfterTotal: number;
     toolCallParts: number;
     terminalParts: number;
     pairedGroups: number;
@@ -30,6 +32,22 @@ export interface ContextMetricsV1 {
     proposedDrop: number;
     invalidatedPlans: number;
     unknownGroups: number;
+    requestSnapshotsUnchanged: number;
+    protectedGroups: number;
+    unknownProtectionGroups: number;
+    userSessionUnlinkedGroups: number;
+    protectedRoleGroups: number;
+    workerRoundProtectedGroups: number;
+    canonicalStateUnknownGroups: number;
+    groupIdentityUnknownGroups: number;
+    recentGroups: number;
+    incompleteGroups: number;
+    unknownRoleGroups: number;
+    malformedGroups: number;
+    unprovenRelationGroups: number;
+    requestShapeUnknownGroups: number;
+    requestPairMismatchGroups: number;
+    requestPayloadMismatchGroups: number;
   };
 }
 
@@ -61,7 +79,14 @@ export async function recordContextMetrics(
     for (const key of Object.keys(next.tool) as Array<keyof ContextMetricsV1["tool"]>) {
       next.tool[key] = saturatingAdd(next.tool[key], safeCount(increment.tool?.[key]));
     }
-    for (const key of ["requests", "estimatedRequestBytesTotal", "plannedGroups", "proposedKeep", "proposedTruncate", "proposedDrop", "invalidatedPlans", "unknownGroups"] as const) {
+    for (const key of [
+      "requests", "estimatedRequestBytesTotal", "estimatedRequestBytesBeforeTotal", "estimatedRequestBytesAfterTotal",
+      "plannedGroups", "proposedKeep", "proposedTruncate", "proposedDrop", "invalidatedPlans", "unknownGroups",
+      "requestSnapshotsUnchanged", "protectedGroups", "unknownProtectionGroups", "userSessionUnlinkedGroups",
+      "protectedRoleGroups", "workerRoundProtectedGroups", "canonicalStateUnknownGroups", "groupIdentityUnknownGroups",
+      "recentGroups", "incompleteGroups", "unknownRoleGroups", "malformedGroups", "unprovenRelationGroups", "requestShapeUnknownGroups",
+      "requestPairMismatchGroups", "requestPayloadMismatchGroups",
+    ] as const) {
       next.context[key] = saturatingAdd(next.context[key], safeCount(increment.context?.[key]));
     }
     for (const key of ["estimatedRequestBytes", "toolCallParts", "terminalParts", "pairedGroups"] as const) {
@@ -98,11 +123,26 @@ export function sanitizeContextMetrics(value: unknown, now = Date.now()): Contex
   };
   const context: ContextMetricsV1["context"] = {
     requests: safeCount(contextRaw.requests), estimatedRequestBytes: safeCount(contextRaw.estimatedRequestBytes),
-    estimatedRequestBytesTotal: safeCount(contextRaw.estimatedRequestBytesTotal), toolCallParts: safeCount(contextRaw.toolCallParts),
-    terminalParts: safeCount(contextRaw.terminalParts), pairedGroups: safeCount(contextRaw.pairedGroups),
+    estimatedRequestBytesTotal: safeCount(contextRaw.estimatedRequestBytesTotal),
+    estimatedRequestBytesBeforeTotal: safeCount(contextRaw.estimatedRequestBytesBeforeTotal),
+    estimatedRequestBytesAfterTotal: safeCount(contextRaw.estimatedRequestBytesAfterTotal),
+    toolCallParts: safeCount(contextRaw.toolCallParts), terminalParts: safeCount(contextRaw.terminalParts), pairedGroups: safeCount(contextRaw.pairedGroups),
     plannedGroups: safeCount(contextRaw.plannedGroups), proposedKeep: safeCount(contextRaw.proposedKeep),
     proposedTruncate: safeCount(contextRaw.proposedTruncate), proposedDrop: safeCount(contextRaw.proposedDrop),
     invalidatedPlans: safeCount(contextRaw.invalidatedPlans), unknownGroups: safeCount(contextRaw.unknownGroups),
+    requestSnapshotsUnchanged: safeCount(contextRaw.requestSnapshotsUnchanged),
+    protectedGroups: safeCount(contextRaw.protectedGroups), unknownProtectionGroups: safeCount(contextRaw.unknownProtectionGroups),
+    userSessionUnlinkedGroups: safeCount(contextRaw.userSessionUnlinkedGroups),
+    protectedRoleGroups: safeCount(contextRaw.protectedRoleGroups),
+    workerRoundProtectedGroups: safeCount(contextRaw.workerRoundProtectedGroups),
+    canonicalStateUnknownGroups: safeCount(contextRaw.canonicalStateUnknownGroups),
+    groupIdentityUnknownGroups: safeCount(contextRaw.groupIdentityUnknownGroups),
+    recentGroups: safeCount(contextRaw.recentGroups), incompleteGroups: safeCount(contextRaw.incompleteGroups),
+    unknownRoleGroups: safeCount(contextRaw.unknownRoleGroups), malformedGroups: safeCount(contextRaw.malformedGroups),
+    unprovenRelationGroups: safeCount(contextRaw.unprovenRelationGroups),
+    requestShapeUnknownGroups: safeCount(contextRaw.requestShapeUnknownGroups),
+    requestPairMismatchGroups: safeCount(contextRaw.requestPairMismatchGroups),
+    requestPayloadMismatchGroups: safeCount(contextRaw.requestPayloadMismatchGroups),
   };
   return {
     schema: 1,
@@ -118,8 +158,14 @@ function emptyMetrics(now: number): ContextMetricsV1 {
     schema: 1, windowStartedAt: safeTime(now), updatedAt: safeTime(now),
     tool: { completed: 0, failed: 0, pairedGroups: 0, duplicateDeliveries: 0, identityLoss: 0, storageFailures: 0, queueOverflow: 0, unknownRoles: 0 },
     context: {
-      requests: 0, estimatedRequestBytes: 0, estimatedRequestBytesTotal: 0, toolCallParts: 0, terminalParts: 0, pairedGroups: 0,
+      requests: 0, estimatedRequestBytes: 0, estimatedRequestBytesTotal: 0,
+      estimatedRequestBytesBeforeTotal: 0, estimatedRequestBytesAfterTotal: 0,
+      toolCallParts: 0, terminalParts: 0, pairedGroups: 0,
       plannedGroups: 0, proposedKeep: 0, proposedTruncate: 0, proposedDrop: 0, invalidatedPlans: 0, unknownGroups: 0,
+      requestSnapshotsUnchanged: 0, protectedGroups: 0, unknownProtectionGroups: 0, userSessionUnlinkedGroups: 0,
+      protectedRoleGroups: 0, workerRoundProtectedGroups: 0, canonicalStateUnknownGroups: 0, groupIdentityUnknownGroups: 0,
+      recentGroups: 0, incompleteGroups: 0, unknownRoleGroups: 0, malformedGroups: 0, unprovenRelationGroups: 0, requestShapeUnknownGroups: 0,
+      requestPairMismatchGroups: 0, requestPayloadMismatchGroups: 0,
     },
   };
 }

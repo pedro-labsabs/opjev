@@ -309,7 +309,6 @@ try {
   const { ContextLedger } = await import("../src/context-management/ledger.ts");
   const { projectContextProtection } = await import("../src/context-management/protection.ts");
   const { classifyContextGroups } = await import("../src/context-management/deterministic-pruner.ts");
-  const { buildRequestProjectionPlan, applyProjectionPlan } = await import("../src/context-management/request-projection.ts");
   const { hashStableRef } = await import("../src/context-management/identity.ts");
   const replay = new ContextLedger();
   replay.replace(assetGroups);
@@ -321,8 +320,9 @@ try {
   const runRef = hashStableRef(runID);
   assert.ok(groups.length > 0, "real OpenCode context hook did not observe a tool group");
   assert.ok(groups.length <= 8, `test fixture unexpectedly exceeded the recent-group guard (${groups.length})`);
-  assert.ok(groups.every(group => group.sessionRef === sessionRef && group.call.role === "worker"
-    && group.call.runRef === runRef && group.call.round === 1), "ledger groups did not retain live worker/run/round identity");
+  assert.ok(groups.every(group => group.sessionRef === sessionRef && /^[a-f0-9]{64}$/.test(group.messageRef ?? "")
+    && group.call.role === "worker" && group.call.runRef === runRef && group.call.round === 1),
+  "ledger groups did not retain hashed message and live worker/run/round identity");
   const sessionResponse = await api("GET", `/api/session/${sessionID}`);
   const workerSession = sessionResponse.data?.data ?? sessionResponse.data;
   assert.deepEqual(workerSession?.metadata, sessionMetadata, "OpenCode session metadata lost canonical worker linkage");
@@ -358,24 +358,6 @@ try {
   }, sessionID, groups);
   assert.ok(unknownSnapshot.groups.every(item => item.state === "unknown"), "malformed checkpoint linkage did not fail closed");
   assert.ok(classifyContextGroups({ groups, protection: unknownSnapshot }).every(item => item.action === "KEEP"), "unknown protection proposed pruning");
-  const rawCalls = providerRequests.flatMap(request => request.messages.flatMap(message => message?.role === "assistant" ? message.tool_calls ?? [] : []));
-  const rawResults = providerRequests.flatMap(request => request.messages.filter(message => message?.role === "tool"));
-  const requestMessages = [];
-  for (const group of groups) {
-    const call = rawCalls.find(item => hashStableRef(item.id) === group.call.callRef);
-    const result = rawResults.find(item => hashStableRef(item.tool_call_id) === group.call.callRef);
-    assert.ok(call && result, `ledger group ${group.groupID} did not reconcile to provider request call/result IDs`);
-    requestMessages.push(
-      { role: "assistant", content: [{ type: "tool-call", id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments) }] },
-      { role: "tool", content: [{ type: "tool-result", id: result.tool_call_id, name: call.function.name, result: { type: "text", value: result.content } }] },
-    );
-  }
-  const plan = buildRequestProjectionPlan({ sessionID, messages: requestMessages, system: [], ledger: groups, protection: workerProtection });
-  const shadow = applyProjectionPlan(plan, requestMessages, []);
-  assert.equal(shadow.valid, true);
-  assert.deepEqual(shadow.decisions.map(item => item.groupID).sort(), groups.map(group => group.groupID).sort());
-  assert.ok(shadow.decisions.every(item => item.action === "KEEP" && item.reason === "request-payload-mismatch"), "stale process fingerprints did not fail closed");
-  assert.equal(JSON.stringify(shadow.messages), JSON.stringify(requestMessages), "request projection changed tool or message content");
   const metric = dbEvidence.metrics.value;
   const pairing = metric?.context?.pairedGroups ?? 0;
   const requestCount = metric?.context?.requests ?? 0;
@@ -389,6 +371,21 @@ try {
   assert.equal((metric?.context?.proposedKeep ?? 0) + (metric?.context?.proposedTruncate ?? 0) + (metric?.context?.proposedDrop ?? 0), planned, "bounded proposals do not reconcile to planned groups");
   assert.equal(metric?.context?.proposedTruncate ?? 0, 0, "shadow proposed a payload truncation");
   assert.equal(metric?.context?.proposedDrop ?? 0, 0, "shadow proposed a drop");
+  assert.equal(metric?.context?.requestSnapshotsUnchanged ?? 0, requestCount,
+    "real context hook did not validate unchanged system/messages for every request");
+  assert.ok((metric?.context?.estimatedRequestBytesBeforeTotal ?? 0) > 0,
+    "real context hook did not measure the request before planning");
+  assert.equal(metric?.context?.estimatedRequestBytesBeforeTotal, metric?.context?.estimatedRequestBytesAfterTotal,
+    "real context hook request-byte estimates differed before/after deterministic SHADOW");
+  assert.ok((metric?.context?.protectedGroups ?? 0) > 0,
+    "host-side projector did not select worker-round protection for real groups");
+  assert.ok((metric?.context?.workerRoundProtectedGroups ?? 0) > 0,
+    "host-side projector did not record worker-round-evidence as the protection reason");
+  assert.equal(metric?.context?.requestShapeUnknownGroups ?? 0, 0,
+    "real OpenCode context message shape was not understood by the projector");
+  assert.equal(metric?.context?.requestPairMismatchGroups ?? 0, 0,
+    "real OpenCode call/result identity did not reconcile with the ledger");
+  log(`hook evidence: unchanged=${metric.context.requestSnapshotsUnchanged}; worker-round-protected=${metric.context.workerRoundProtectedGroups}; protected=${metric.context.protectedGroups}; unknown-protection=${metric.context.unknownProtectionGroups}; request-shape-unknown=${metric.context.requestShapeUnknownGroups}; pair-mismatch=${metric.context.requestPairMismatchGroups}; payload-mismatch=${metric.context.requestPayloadMismatchGroups}`);
   assert.equal(dbEvidence.sessionCount, 1, "Context Management created an additional session");
   assert.deepEqual(dbEvidence.orchestrationKeys, [pluginStorageKey(`orchestration/run/${runID}`)], "Context Management created state beyond the E2E's explicit worker checkpoint fixture");
   assert.ok(providerRequests.every(item => !String(item.url).includes("/jev")), "unexpected Jev request from context path");

@@ -22,6 +22,62 @@ const messages = [
   { id: "assistant-1", role: "assistant", content: [{ type: "text", text: "ordinary prose" }, { type: "tool-call", id: callID, name: "read", input: { path: "x" } }] },
   { id: "tool-1", role: "tool", content: [{ type: "tool-result", id: callID, name: "read", result: { type: "text", value: "result" } }] },
 ];
+function requestMatchedGroup(value = messages) {
+  return {
+    ...group,
+    messageRef: hashStableRef(value[1].id),
+    call: {
+      ...group.call,
+      fingerprint: fingerprintContextPayload(value[1].content.find(part => part.type === "tool-call").input),
+    },
+    terminal: {
+      ...group.terminal,
+      fingerprint: fingerprintContextPayload(value[2].content.find(part => part.type === "tool-result").result.value),
+    },
+  };
+}
+
+it("requires the observed call message identity as well as session and call IDs", () => {
+  const messageBound = requestMatchedGroup();
+  const valid = buildRequestProjectionPlan({ sessionID: sid, messages, system: [], ledger: [messageBound], protection });
+  assert.equal(valid.decisions[0].reason, "recent-group");
+
+  const changed = structuredClone(messages);
+  changed[1].id = "different-message";
+  const mismatched = buildRequestProjectionPlan({ sessionID: sid, messages: changed, system: [], ledger: [messageBound], protection });
+  assert.equal(mismatched.decisions[0].action, "KEEP");
+  assert.equal(mismatched.decisions[0].reason, "request-pair-mismatch");
+});
+
+it("keeps duplicate call/result parts and tool parts without message identity", () => {
+  const duplicate = structuredClone(messages);
+  duplicate[1].content.push(structuredClone(duplicate[1].content[1]));
+  const duplicatePlan = buildRequestProjectionPlan({ sessionID: sid, messages: duplicate, system: [], ledger: [requestMatchedGroup()], protection });
+  assert.equal(duplicatePlan.decisions[0].reason, "request-pair-mismatch");
+
+  const missingMessageID = structuredClone(messages);
+  delete missingMessageID[1].id;
+  const missingPlan = buildRequestProjectionPlan({ sessionID: sid, messages: missingMessageID, system: [], ledger: [requestMatchedGroup()], protection });
+  assert.equal(missingPlan.decisions[0].reason, "request-pair-mismatch");
+});
+
+it("keeps duplicate results and tool parts outside message envelopes", () => {
+  const duplicateResult = structuredClone(messages);
+  duplicateResult[2].content.push(structuredClone(duplicateResult[2].content[0]));
+  const duplicateResultPlan = buildRequestProjectionPlan({
+    sessionID: sid, messages: duplicateResult, system: [], ledger: [requestMatchedGroup()], protection,
+  });
+  assert.equal(duplicateResultPlan.decisions[0].reason, "request-pair-mismatch");
+
+  const uncontainedPart = [...structuredClone(messages), {
+    type: "tool-call", id: callID, name: "read", input: { path: "x" },
+  }];
+  const uncontainedPlan = buildRequestProjectionPlan({
+    sessionID: sid, messages: uncontainedPart, system: [], ledger: [requestMatchedGroup()], protection,
+  });
+  assert.equal(uncontainedPlan.decisions[0].action, "KEEP");
+  assert.equal(uncontainedPlan.decisions[0].reason, "request-shape-unknown");
+});
 
 it("leaves the full request byte-identical in deterministic shadow", () => {
   const beforeMessages = JSON.stringify(messages);
@@ -66,6 +122,7 @@ it("fails closed when request payloads or tool identities differ from persisted 
   assert.ok(callFingerprint && resultFingerprint);
   const currentGroup = {
     ...group,
+    messageRef: hashStableRef("assistant-1"),
     call: { ...group.call, fingerprint: callFingerprint },
     terminal: { ...group.terminal, fingerprint: resultFingerprint },
   };
@@ -170,6 +227,9 @@ it("invalidates the plan if another plugin mutates during metrics persistence", 
   const metrics = values.get(CONTEXT_METRICS_KEY);
   assert.equal(metrics.context.plannedGroups, 1);
   assert.equal(metrics.context.proposedKeep, 1);
+  assert.equal(metrics.context.requestSnapshotsUnchanged, 0);
+  assert.ok(metrics.context.estimatedRequestBytesBeforeTotal > 0);
+  assert.equal(metrics.context.estimatedRequestBytesBeforeTotal, metrics.context.estimatedRequestBytesAfterTotal);
 });
 it("keeps unknown message shapes and human/assistant prose byte-equivalent", () => {
   const unknown = [{ role: "user", text: "human" }, { role: "assistant", text: "assistant" }];

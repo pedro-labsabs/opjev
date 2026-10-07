@@ -99,7 +99,7 @@ export async function observeToolAfter(event: any, deps: ObservationDeps): Promi
       runRef: runID ? hashStableRef(runID) : undefined, round, role, tool, callRef,
       payloadBytes: terminalBytes, fingerprint: terminalFingerprint, createdAt,
     });
-    const group: ContextToolGroupV1 = { groupID, sessionRef, call, terminal, createdAt, updatedAt: createdAt };
+    const group: ContextToolGroupV1 = { groupID, sessionRef, messageRef, call, terminal, createdAt, updatedAt: createdAt };
     const sink = deps.sink ?? createContextAssetSink(deps.owner, deps.storage, { now: deps.now });
     const wasFull = isContextAssetSinkAtCapacity(deps.owner);
     let persisted = false;
@@ -212,7 +212,7 @@ function payloadBytes(value: unknown): number | undefined {
     return undefined;
   }
 }
-function estimateRequestBytes(event: unknown): number {
+export function estimateRequestBytes(event: unknown): number {
   if (!isRecord(event)) return 0;
   try {
     const request = {

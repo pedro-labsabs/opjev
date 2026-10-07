@@ -42,7 +42,8 @@ export function buildRequestProjectionPlan(input: BuildRequestProjectionInput): 
       const id = group && [...pairs.calls.keys()].find((callID) => hashStableRef(`${input.sessionID}\u0000${callID}`) === group.groupID);
       const call = id ? pairs.calls.get(id) : undefined;
       const result = id ? pairs.results.get(id) : undefined;
-      if (!group || !id || !call || !result || group.call.callRef !== hashStableRef(id)) {
+      if (!group || !id || !call || !result || group.call.callRef !== hashStableRef(id)
+        || !call.messageRef || group.messageRef !== call.messageRef) {
         return { ...decision, action: "KEEP", reason: "request-pair-mismatch" };
       }
       const resultValue = result.result && typeof result.result === "object" && "value" in result.result
@@ -92,6 +93,8 @@ function inspectMessagePairs(messages: unknown[]): "valid" | "unknown" | "mismat
       const value = part as Record<string, unknown>;
       if (value.type === "tool-call" || value.type === "tool-result") {
         if (typeof value.id !== "string" || value.id.length === 0 || typeof value.name !== "string"
+          || (value.type === "tool-call" && (item.role !== "assistant" || typeof item.id !== "string" || item.id.length === 0))
+          || (value.type === "tool-result" && item.role !== "tool")
           || (value.type === "tool-call" ? !Object.hasOwn(value, "input") : !Object.hasOwn(value, "result"))) return "mismatch";
         const counts = value.type === "tool-call" ? calls : results;
         counts.set(value.id, (counts.get(value.id) ?? 0) + 1);
@@ -105,16 +108,18 @@ function inspectMessagePairs(messages: unknown[]): "valid" | "unknown" | "mismat
   return "valid";
 }
 
-type ToolCall = { id: string; name: string; input: unknown };
+type ToolCall = { id: string; name: string; input: unknown; messageRef?: string };
 type ToolResult = { id: string; name: string; result: unknown };
 function collectPairs(messages: unknown[]): { calls: Map<string, ToolCall>; results: Map<string, ToolResult> } {
   const calls = new Map<string, ToolCall>();
   const results = new Map<string, ToolResult>();
   for (const message of messages) {
-    const item = message as { content: Array<Record<string, unknown>> };
+    const item = message as { id?: unknown; content: Array<Record<string, unknown>> };
     for (const part of item.content) {
       if (typeof part.id !== "string") continue;
-      if (part.type === "tool-call") calls.set(part.id, part as unknown as ToolCall);
+      if (part.type === "tool-call") {
+        calls.set(part.id, { ...(part as unknown as ToolCall), messageRef: typeof item.id === "string" ? hashStableRef(item.id) : undefined });
+      }
       if (part.type === "tool-result") results.set(part.id, part as unknown as ToolResult);
     }
   }

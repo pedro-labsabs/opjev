@@ -54,6 +54,7 @@ export interface ContextAssetV1 {
 export interface ContextToolGroupV1 {
   groupID: string;
   sessionRef: string;
+  messageRef?: string;
   call: ContextAssetV1;
   terminal?: ContextAssetV1;
   createdAt: number;
