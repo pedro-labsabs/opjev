@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Exact OpenCode 2.0.11 OBSERVE-only runtime proof for Issue #4 Boundary A.
+// Exact OpenCode 2.0.11 deterministic-SHADOW runtime proof for Issue #4 Boundary B.
 // The provider and tool responses are local and controlled; the installed OPJEV
 // plugin, hooks, session history, and SQLite kv store are the real host runtime.
 
@@ -16,7 +16,7 @@ import { installServerPluginToProject, installPluginToHome } from "./install-plu
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/opencode";
-const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-context-observe-"));
+const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-context-shadow-"));
 const HOME = path.join(RUN_DIR, "home");
 const PROJECT = path.join(RUN_DIR, "project");
 const CANARIES = {
@@ -131,7 +131,7 @@ try {
     req.on("end", () => {
       let body = {};
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
-      providerRequests.push({ shape: openaiShape(body), messages: body.messages ?? [] });
+      providerRequests.push({ url: req.url, shape: openaiShape(body), messages: body.messages ?? [] });
       const previousCalls = (body.messages ?? []).reduce((count, message) => count + (message?.role === "assistant" && Array.isArray(message.tool_calls) ? message.tool_calls.length : 0), 0);
       const hasSecondPrompt = JSON.stringify(body.messages ?? []).includes(CANARIES.secondHuman);
       const requestedTool = !hasSecondPrompt && previousCalls === 1 ? "read" : "shell";
@@ -188,13 +188,14 @@ try {
     permission: { read: "allow", shell: "allow" },
     provider: { opencode: { options: { baseURL: `http://127.0.0.1:${providerPort}` } } },
     model: "opencode/big-pickle",
-    plugins: [{ package: "./plugins/opencode-jev-free-router", options: { enableAutoRoute: false, contextManagementStage: "observe" } }],
+    plugins: [{ package: "./plugins/opencode-jev-free-router", options: { enableAutoRoute: false, contextManagementStage: "deterministic-shadow", jevEndpoint: `http://127.0.0.1:${providerPort}/jev` } }],
   };
   fs.writeFileSync(path.join(PROJECT, "opencode.json"), JSON.stringify(config, null, 2));
   const hostPort = await freePort();
   const host = spawnHost(["serve", "--hostname", "127.0.0.1", "--port", String(hostPort)], {
     PATH: process.env.PATH ?? "", HOME, OPENCODE_CONFIG_DIR: path.join(HOME, ".config/opencode"),
     OPENCODE_DATA_DIR: path.join(HOME, ".local/share/opencode"), OPENCODE_API_KEY: "local-context-e2e-only",
+    OPJEV_CONTEXT_MANAGEMENT_STAGE: "deterministic-shadow",
   });
   let password = "";
   await waitFor(() => { password = /server password (\S+)/.exec(host.output)?.[1] ?? ""; return password; }, 30000, "server password");
@@ -245,7 +246,9 @@ try {
     const asset = kvValue(db, "context/asset-ledger/v1");
     const metrics = kvValue(db, "context/metrics/v1");
     const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY time_created").all(sessionID).map(row => ({ type: String(row.type), data: String(row.data) }));
-    return { asset, metrics, rows };
+    const orchestrationKeys = db.prepare("SELECT key FROM kv WHERE key LIKE '%orchestration/run/%'").all().map(row => String(row.key));
+    const sessionCount = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
+    return { asset, metrics, rows, orchestrationKeys, sessionCount };
   });
   assert.ok(dbEvidence.asset, "real SQLite context asset ledger key missing");
   assert.ok(dbEvidence.metrics, "real SQLite context metrics key missing");
@@ -267,14 +270,72 @@ try {
     .filter(part => part.type === "text").map(part => part.text ?? "").join("\n");
   assert.ok(assistantText.includes(CANARIES.assistant), "controlled assistant output missing from runtime history");
 
-  // Replay the exact stored groups through the production idempotent ledger API.
-  // This checks storage replay semantics without modifying host history or records.
+  // Replay exact persisted groups, then run production protection/classification against those IDs.
   const { ContextLedger } = await import("../src/context-management/ledger.ts");
+  const { projectContextProtection } = await import("../src/context-management/protection.ts");
+  const { classifyContextGroups } = await import("../src/context-management/deterministic-pruner.ts");
+  const { buildRequestProjectionPlan, applyProjectionPlan } = await import("../src/context-management/request-projection.ts");
+  const { hashStableRef } = await import("../src/context-management/identity.ts");
   const replay = new ContextLedger();
   replay.replace(assetGroups);
   const beforeReplay = replay.size;
   for (const group of replay.snapshot()) replay.upsertGroup(group);
   assert.equal(replay.size, beforeReplay, "replaying persisted groups created duplicates");
+  const groups = replay.snapshot();
+  const sessionRef = hashStableRef(sessionID);
+  assert.ok(groups.length <= 8, `test fixture unexpectedly exceeded the recent-group guard (${groups.length})`);
+  assert.ok(groups.every(group => group.sessionRef === sessionRef), "ledger groups do not reconcile to the live session");
+  const ordinary = await projectContextProtection({
+    getSessionMetadata: async () => ({}),
+    getRun: async () => { throw new Error("ordinary session has no run"); },
+  }, sessionID, groups);
+  assert.equal(ordinary.role, "user-session");
+  assert.ok(ordinary.groups.every(item => item.state === "clear"), "complete non-orchestration groups were not proven unlinked");
+  const actualDecisions = classifyContextGroups({ groups, protection: ordinary });
+  assert.equal(actualDecisions.length, groups.length);
+  assert.ok(actualDecisions.every(item => item.action === "KEEP"), "persisted unknown protection authorized pruning");
+  const eligibleRecentGroups = groups.map(group => ({
+    ...group,
+    call: { ...group.call, protection: "clear" },
+    terminal: { ...group.terminal, protection: "clear" },
+  }));
+  const eligibleRecentProtection = { ...ordinary, groups: ordinary.groups.map(item => ({ ...item, state: "clear" })) };
+  const recentDecisions = classifyContextGroups({ groups: eligibleRecentGroups, protection: eligibleRecentProtection });
+  assert.ok(recentDecisions.every(item => item.action === "KEEP" && item.reason === "recent-group"), "newest eight complete groups were not guarded");
+
+  for (const role of ["critic", "orchestrator"]) {
+    const protectedSnapshot = await projectContextProtection({
+      getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": role }),
+      getRun: async () => undefined,
+    }, sessionID, groups);
+    const roleDecisions = classifyContextGroups({ groups, protection: protectedSnapshot });
+    assert.ok(roleDecisions.every(item => item.action === "KEEP" && item.reason === "protected"), `${role} group was not protected`);
+  }
+  const unknownSnapshot = await projectContextProtection({
+    getSessionMetadata: async () => ({ "jev-router": "orchestration-internal", "jev-role": "worker", "jev-run-id": "missing-run", "jev-round": 1 }),
+    getRun: async () => ({ checkpoint: "worker-created", state: {}, workerSessionID: sessionID, updatedAt: Date.now() }),
+  }, sessionID, groups);
+  assert.ok(unknownSnapshot.groups.every(item => item.state === "unknown"), "malformed checkpoint linkage did not fail closed");
+  assert.ok(classifyContextGroups({ groups, protection: unknownSnapshot }).every(item => item.action === "KEEP"), "unknown protection proposed pruning");
+
+  const rawCalls = providerRequests.flatMap(request => request.messages.flatMap(message => message?.role === "assistant" ? message.tool_calls ?? [] : []));
+  const rawResults = providerRequests.flatMap(request => request.messages.filter(message => message?.role === "tool"));
+  const requestMessages = [];
+  for (const group of groups) {
+    const call = rawCalls.find(item => hashStableRef(item.id) === group.call.callRef);
+    const result = rawResults.find(item => hashStableRef(item.tool_call_id) === group.call.callRef);
+    assert.ok(call && result, `ledger group ${group.groupID} did not reconcile to provider request call/result IDs`);
+    requestMessages.push(
+      { role: "assistant", content: [{ type: "tool-call", id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments) }] },
+      { role: "tool", content: [{ type: "tool-result", id: result.tool_call_id, name: call.function.name, result: { type: "text", value: result.content } }] },
+    );
+  }
+  const plan = buildRequestProjectionPlan({ sessionID, messages: requestMessages, system: [], ledger: groups, protection: ordinary });
+  const shadow = applyProjectionPlan(plan, requestMessages, []);
+  assert.equal(shadow.valid, true);
+  assert.deepEqual(shadow.decisions.map(item => item.groupID).sort(), groups.map(group => group.groupID).sort());
+  assert.ok(shadow.decisions.every(item => item.action === "KEEP"), "real ledger groups were proposed for pruning");
+  assert.equal(JSON.stringify(shadow.messages), JSON.stringify(requestMessages), "request projection changed tool or message content");
 
   const metric = dbEvidence.metrics.value;
   const pairing = metric?.context?.pairedGroups ?? 0;
@@ -283,18 +344,26 @@ try {
   assert.ok((metric?.tool?.completed ?? 0) >= 1, "context metrics did not observe a completed tool call");
   assert.ok((metric?.tool?.failed ?? 0) >= 1, "context metrics did not observe a failed tool call");
   assert.ok(pairing >= 2, `tool call/result pairing coverage below expected: ${pairing}`);
+  assert.ok((metric?.context?.bytePreservedRequests ?? 0) >= 1, `real context requests lack byte-preservation proof: ${JSON.stringify(metric?.context)}`);
+  const planned = metric?.context?.plannedGroups ?? 0;
+  assert.ok(planned <= groups.length * requestCount, "projection proposal count exceeded request/ledger bounds");
+  assert.equal((metric?.context?.proposedKeep ?? 0) + (metric?.context?.proposedTruncate ?? 0) + (metric?.context?.proposedDrop ?? 0), planned, "bounded proposals do not reconcile to planned groups");
+  assert.equal(metric?.context?.proposedTruncate ?? 0, 0, "shadow proposed a payload truncation");
+  assert.equal(metric?.context?.proposedDrop ?? 0, 0, "shadow proposed a drop");
+  assert.equal(dbEvidence.sessionCount, 1, "Context Management created an additional session");
+  assert.deepEqual(dbEvidence.orchestrationKeys, [], "Context Management created orchestration run/checkpoint state");
+  assert.ok(providerRequests.every(item => !String(item.url).includes("/jev")), "unexpected Jev request from context path");
   const requestShape = providerRequests.map(item => item.shape);
   const userWire = providerRequests.flatMap(item => item.messages).filter(message => message?.role === "user").map(message => String(message.content ?? ""));
   assert.ok(userWire.includes(firstPrompt), "outgoing first human text missing or changed before provider request");
   assert.ok(userWire.includes(secondPrompt), "outgoing second human text missing or changed before provider request");
   assert.ok(providerRequests.flatMap(item => item.messages).some(message => message?.role === "assistant" && message.content === `First turn complete ${CANARIES.assistant}`), "assistant content did not reach a subsequent provider request unchanged");
 
-  log(`PASS OpenCode 2.0.11 OBSERVE-only; plugin loaded; turns=2; observedRequests=${requestCount}; pairedGroups=${pairing}; groups=${assetGroups.length}`);
+  log(`PASS OpenCode 2.0.11 deterministic-shadow; plugin loaded; turns=2; requests=${requestCount}; pairedGroups=${pairing}; groups=${groups.length}; planned=${planned}`);
   log(`observed host session_message shape=${JSON.stringify(shapeOfRuntimeRows(dbEvidence.rows))}`);
   log(`observed provider request shape=${JSON.stringify(requestShape)}`);
-  log("privacy gate: human/input/result/error/assistant canaries absent from context ledger and metrics; present only in runtime/provider path as expected");
-  log("idempotency gate: replayed persisted groups through ContextLedger.upsertGroup with stable group count");
-  log("no pruning decision or request projection is implemented in this OBSERVE run");
+  log("shadow gates: request byte-preserved; human/assistant text intact; recent/protected/unknown groups KEEP; proposals reconcile to ledger identities and are bounded");
+  log("safety gates: replay idempotent; no Jev pruning request; no extra session or orchestration checkpoint/round/dispatch/recovery");
 } catch (error) {
   log(`FAIL ${error.stack ?? error.message}`);
   process.exitCode = 1;
