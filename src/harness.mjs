@@ -302,12 +302,18 @@ export function makeCtx({
         else state.agent = agent;
       },
       hook: (name, cb) => {
-        hooks.session[name] = cb;
+        const prior = hooks.session[name];
+        hooks.session[name] = prior
+          ? async (...args) => { await prior(...args); await cb(...args); }
+          : cb;
       },
     },
     tool: {
       hook: (name, cb) => {
-        hooks.tool[name] = cb;
+        const prior = hooks.tool[name];
+        hooks.tool[name] = prior
+          ? async (...args) => { await prior(...args); await cb(...args); }
+          : cb;
       },
       transform: (cb) => {
         const editor = {

@@ -53,6 +53,8 @@ export interface RouterOptions {
   confidenceThreshold?: number;
   /** Desliga roteamento automatico via hooks, mantem so as tools. Default: true */
   enableAutoRoute?: boolean;
+  /** Estagio de Context Management. Valores ausentes ou nao implementados observam sem pruning. */
+  contextManagementStage?: string;
   /** Timeout (ms) das chamadas ao Jev SystemOne. Default: 15000 */
   jevTimeoutMs?: number;
 }
@@ -65,6 +67,7 @@ export function resolveOptions(raw: Record<string, unknown> = {}): Required<Rout
     apiKeyEnv: (raw.apiKeyEnv as string) ?? "OPENCODE_API_KEY",
     confidenceThreshold: (raw.confidenceThreshold as number) ?? 0.55,
     enableAutoRoute: (raw.enableAutoRoute as boolean) ?? true,
+    contextManagementStage: typeof raw.contextManagementStage === "string" ? raw.contextManagementStage : "observe",
     jevTimeoutMs: (raw.jevTimeoutMs as number) ?? 15000,
   };
 }

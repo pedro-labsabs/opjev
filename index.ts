@@ -11,6 +11,7 @@ import { type ExecutionContract } from "./src/orchestration/types.ts";
 import { OrchestrationResultRpc, ORCHESTRATION_RESULT_EVENT } from "./src/orchestration/presentation.ts";
 import { buildDecisionRecord, sanitizeState } from "./src/sanitize.ts";
 import { isInternalCriticSession, isInternalOrchestratorSession, isInternalWorkerSession } from "./src/worker-hooks.ts";
+import { registerContextManagementHooks } from "./src/context-management/runtime-hooks.ts";
 
 export default Plugin.define({
   id: "jev-free-router",
@@ -128,6 +129,7 @@ export default Plugin.define({
     await registerTools(ctx, opts, getKey);
 
     await registerSessionHooks(ctx, opts, getKey);
+    await registerContextManagementHooks(ctx, opts);
   },
 });
 export { sanitizeState, buildDecisionRecord } from "./src/sanitize.ts";
