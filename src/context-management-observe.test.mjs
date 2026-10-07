@@ -7,6 +7,8 @@ import { fingerprintContextPayload, isCurrentContextFingerprint, observeContextR
 import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_PENDING_LIMIT } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY, recordContextMetrics } from "./context-management/metrics.ts";
 import { hashStableRef } from "./context-management/identity.ts";
+import { projectContextProtection } from "./context-management/protection.ts";
+import { classifyContextGroups } from "./context-management/deterministic-pruner.ts";
 import { makeStorage } from "./harness.mjs";
 
 const rawCanaries = ["HUMAN-CANARY-8e8d", "INPUT-CANARY-1bc3", "RESULT-CANARY-b119", "ERROR-CANARY-99f4", "sk-test-context-secret-74c2"];
@@ -292,4 +294,33 @@ it("recognizes fingerprints only after creating them with this process key", () 
   assert.equal(typeof fingerprint, "string");
   assert.equal(isCurrentContextFingerprint(fingerprint), true);
   assert.equal(isCurrentContextFingerprint("f".repeat(64)), false);
+});
+it("classifies observed groups using their current protection projection", async () => {
+  let now = 2_000;
+  const deps = fixture({ now: () => now++ });
+  for (let index = 0; index < 10; index++) {
+    await observeToolAfter(event({
+      id: `real-call-${index}`,
+      messageID: `real-message-${index}`,
+      input: { command: `real-command-${index}` },
+      result: { output: `real-output-${index}` },
+    }), deps);
+  }
+
+  const groups = deps.ledger();
+  assert.equal(groups.length, 10);
+  assert.ok(groups.every(group => group.call.protection === "unknown" && group.terminal.protection === "unknown"));
+  const protection = await projectContextProtection({
+    getSessionMetadata: async () => ({}),
+    getRun: async () => undefined,
+  }, "session-high-entropy-981d", groups);
+  assert.ok(protection.groups.every(group => group.state === "clear"));
+
+  const decisions = classifyContextGroups({ groups, protection });
+  assert.ok(decisions.slice(0, 2).every(decision => decision.reason === "relation-unproven"));
+  assert.ok(decisions.slice(2).every(decision => decision.reason === "recent-group"));
+  assert.ok(decisions.every(decision => decision.action === "KEEP"));
+
+  const missingProjection = classifyContextGroups({ groups, protection: { role: "unknown", groups: [] } });
+  assert.ok(missingProjection.every(decision => decision.action === "KEEP" && decision.reason === "unknown-protection"));
 });

@@ -344,6 +344,8 @@ Do not rank configurations by DROP count or bytes saved alone. Report savings be
 
 Do not skip stages. A feature/configuration error defaults to OBSERVE/KEEP. Promotion does not change routing or the #5 OBSERVE stage.
 
+The OpenCode 2.0.11 SHADOW E2E currently reports `requestPayloadMismatchGroups=5` for five proposals; all remain KEEP. This fail-closed result does not prove payload equivalence. Do not promote adapter-side payload equality or enable deterministic reduction/ENFORCE until exact-host reconciliation demonstrates matching payload fingerprints for supported request shapes.
+
 ## 22. Test strategy for the future implementation
 
 Pure unit tests: schema sanitization and bounds; digest identity/idempotent upsert; exact duplicate/supersession rules; every row in the deterministic table; evidence protection precedence; recent 8-group guard; tool allowlist semantics; pair integrity; malformed/stale schema fail-closed; governor eligibility across low/moderate/high/critical/unknown/latch; semantic batch size/cooldown/cache/TTL/strict full-response coverage/confidence; bounded metrics without token fabrication; canonical bridge field selection and byte cap.

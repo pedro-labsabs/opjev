@@ -1,6 +1,7 @@
 import { ContextLedger } from "./ledger.ts";
 import { recordContextMetrics } from "./metrics.ts";
-import { CONTEXT_LEDGER_KEY } from "./types.ts";
+import { CONTEXT_LEDGER_KEY, CONTEXT_LEDGER_SESSION_CAPACITY } from "./types.ts";
+import { hashStableRef } from "./identity.ts";
 import { estimateRequestBytes, observeContextRequest, observeToolAfter, resolveContextManagementStage, IMPLEMENTED_CONTEXT_STAGES } from "./observer.ts";
 import { projectContextProtection } from "./protection.ts";
 import { applyProjectionPlan, buildRequestProjectionPlan, requestFingerprint } from "./request-projection.ts";
@@ -72,19 +73,22 @@ async function planShadowRequest(ctx: ContextRuntime, event: unknown, snapshot: 
     if (stored && typeof stored === "object" && !Array.isArray(stored) && "schema" in stored && stored.schema === 1 && "groups" in stored && Array.isArray(stored.groups)) {
       ledger.replace(stored.groups);
     }
+    const sessionGroups = ledger.snapshot()
+      .filter((group) => group.sessionRef === hashStableRef(sessionID))
+      .slice(0, CONTEXT_LEDGER_SESSION_CAPACITY);
     const session = await ctx.session.get({ sessionID });
     const metadata = session && typeof session === "object" && !Array.isArray(session) && "metadata" in session
       ? session.metadata : undefined;
     const protection = await projectContextProtection({
       getSessionMetadata: async () => metadata,
       getRun: async (runID) => await ctx.storage.get(`orchestration/run/${runID}`),
-    }, sessionID, ledger.snapshot());
+    }, sessionID, sessionGroups);
     if (!requestSnapshotIsCurrent(event, snapshot)) {
       await recordContextMetrics(ctx.storage, { context: { invalidatedPlans: 1 } });
       return;
     }
     const plan = buildRequestProjectionPlan({
-      sessionID, messages, system, ledger: ledger.snapshot(), protection, requestFingerprintAtStart,
+      sessionID, messages, system, ledger: sessionGroups, protection, requestFingerprintAtStart,
     });
     const result = applyProjectionPlan(plan, messages, system);
     decisions = result.decisions;

@@ -34,8 +34,7 @@ export function classifyContextGroups(input: ClassifyContextGroupsInput): Determ
     const protection: ProtectionState | undefined = protectedByID.get(group.groupID);
     if (input.protection.role === "critic" || input.protection.role === "orchestrator" || protection === "protected"
       || members.some((asset) => asset.protection === "protected")) reason = "protected";
-    else if (input.protection.role === "unknown" || protection === undefined || protection === "unknown"
-      || members.some((asset) => asset.protection === "unknown")) reason = "unknown-protection";
+    else if (input.protection.role === "unknown" || protection === undefined || protection === "unknown") reason = "unknown-protection";
     else if (!group.terminal) reason = "incomplete-group";
     else if (recent.has(group.groupID)) reason = "recent-group";
     else if (input.protection.role !== "user-session" && input.protection.role !== "worker") reason = "unknown-role";

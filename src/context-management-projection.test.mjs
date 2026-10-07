@@ -5,7 +5,8 @@ import { hashStableRef } from "./context-management/identity.ts";
 import { registerContextManagementHooks } from "./context-management/runtime-hooks.ts";
 import { CONTEXT_LEDGER_KEY } from "./context-management/types.ts";
 import { CONTEXT_METRICS_KEY } from "./context-management/metrics.ts";
-import { fingerprintContextPayload } from "./context-management/observer.ts";
+import { fingerprintContextPayload, observeToolAfter } from "./context-management/observer.ts";
+import { makeStorage } from "./harness.mjs";
 
 const sid = "session-1";
 const sessionRef = hashStableRef(sid);
@@ -238,4 +239,80 @@ it("keeps unknown message shapes and human/assistant prose byte-equivalent", () 
   const result = applyProjectionPlan(plan, unknown, []);
   assert.equal(result.decisions[0].action, "KEEP");
   assert.equal(JSON.stringify(result.messages), before);
+});
+it("projects and counts protection only for the current session", async () => {
+  const storage = makeStorage();
+  const owner = {};
+  const criticID = "critic-session";
+  const workerID = "worker-session";
+  const runID = "worker-run";
+  const metadata = {
+    [criticID]: { "jev-router": "orchestration-internal", "jev-role": "critic" },
+    [workerID]: { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-run-id": runID, "jev-round": 1 },
+  };
+  const requestFor = (sessionID) => {
+    const id = `call-${sessionID}`;
+    const messageID = `message-${sessionID}`;
+    const input = { command: `command-${sessionID}` };
+    const result = { output: `result-${sessionID}` };
+    return {
+      sessionID,
+      system: [],
+      messages: [
+        { id: messageID, role: "assistant", content: [{ type: "tool-call", id, name: "tools.shell", input }] },
+        { id: `terminal-${sessionID}`, role: "tool", content: [{ type: "tool-result", id, name: "tools.shell", result }] },
+      ],
+      observed: { id, messageID, input, result },
+    };
+  };
+
+  const observedAt = Date.now();
+  for (const sessionID of [criticID, workerID]) {
+    const request = requestFor(sessionID);
+    await observeToolAfter({
+      tool: "tools.shell", sessionID, agent: "build", status: "completed", ...request.observed,
+    }, {
+      storage, owner, now: () => observedAt,
+      getSession: async id => ({ metadata: metadata[id] }),
+    });
+  }
+  assert.equal(storage._map.get(CONTEXT_LEDGER_KEY)?.groups.length, 2);
+
+  storage._map.set(`orchestration/run/${runID}`, {
+    checkpoint: "evidence-ready",
+    state: { contract: { runID }, round: 1 },
+    workerSessionID: workerID,
+    updatedAt: observedAt + 1_000,
+  });
+
+  let contextHook;
+  const ctx = {
+    storage,
+    session: {
+      async get({ sessionID }) { return { metadata: metadata[sessionID] }; },
+      async hook(name, callback) { if (name === "context") contextHook = callback; },
+    },
+    tool: { async hook() {} },
+  };
+  await registerContextManagementHooks(ctx, { contextManagementStage: "deterministic-shadow" });
+
+  const criticRequest = requestFor(criticID);
+  await contextHook({ sessionID: criticID, messages: criticRequest.messages, system: criticRequest.system });
+  let metrics = storage._map.get(CONTEXT_METRICS_KEY).context;
+  assert.equal(metrics.plannedGroups, 1, JSON.stringify(metrics));
+  assert.equal(metrics.protectedGroups, 1);
+  assert.equal(metrics.protectedRoleGroups, 1);
+  assert.equal(metrics.unknownProtectionGroups, 0);
+  assert.equal(metrics.groupIdentityUnknownGroups, 0);
+
+  const workerRequest = requestFor(workerID);
+  await contextHook({ sessionID: workerID, messages: workerRequest.messages, system: workerRequest.system });
+  metrics = storage._map.get(CONTEXT_METRICS_KEY).context;
+  assert.equal(metrics.plannedGroups, 2);
+  assert.equal(metrics.protectedGroups, 2);
+  assert.equal(metrics.protectedRoleGroups, 1);
+  assert.equal(metrics.workerRoundProtectedGroups, 1);
+  assert.equal(metrics.unknownProtectionGroups, 0);
+  assert.equal(metrics.groupIdentityUnknownGroups, 0);
+  assert.equal(metrics.proposedKeep, 2);
 });
