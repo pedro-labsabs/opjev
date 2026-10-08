@@ -523,7 +523,7 @@ export function summarizeAudit(db) {
       typeof state.executor?.sessionID === "string" ? state.executor.sessionID : undefined;
     const evidenceSessionID = typeof worker?.sessionID === "string" ? worker.sessionID : undefined;
     const evidenceCurrent = evidence && evidence.round === state.round;
-    const workerSessionConsistent = typeof workerSessionID === "string" &&
+    const workerSessionConsistent = typeof workerSessionID === "string" && workerSessionID.length > 0 &&
       evidenceSessionID === workerSessionID &&
       (typeof record.workerSessionID !== "string" || typeof state.executor?.sessionID !== "string" || record.workerSessionID === state.executor.sessionID);
     const criticCheck = Array.isArray(evidence?.deterministicChecks)
@@ -596,10 +596,10 @@ export function summarizeAudit(db) {
       workerSessionConsistent && workerRoundsLinked &&
       hasCompleteWorkerRound(finalRoundGroup ?? {}) &&
       finalRoundGroup.outcome.model === worker.model && finalRoundGroup.outcome.agent === worker.agent;
-    const persistedWorkerSessionID = typeof record.workerSessionID === "string" ? record.workerSessionID :
-      typeof state.executor?.sessionID === "string" ? state.executor.sessionID : undefined;
+    const persistedWorkerSessionID = typeof record.workerSessionID === "string" ? record.workerSessionID || undefined :
+      typeof state.executor?.sessionID === "string" && state.executor.sessionID ? state.executor.sessionID : undefined;
     const currentRoundSessions = new Set(workerRoundFacts
-      .filter(item => item.round === state.round && typeof item.sessionID === "string")
+      .filter(item => item.round === state.round && typeof item.sessionID === "string" && item.sessionID.length > 0)
       .map(item => item.sessionID));
     const failureKinds = ["provider-error", "throttle", "quota-limit", "context-overflow", "operational-failure"];
     const failureDomains = ["provider", "quota", "context", "execution", "operational"];
@@ -609,12 +609,12 @@ export function summarizeAudit(db) {
     const currentRoundWorkerSessions = new Set([
       ...currentRoundSessions,
       ...currentRoundFailureObservations
-        .filter(item => typeof persistedWorkerSessionID === "string" &&
-          typeof item.sessionID === "string" && item.sessionID === persistedWorkerSessionID)
+        .filter(item => typeof persistedWorkerSessionID === "string" && persistedWorkerSessionID.length > 0 &&
+          typeof item.sessionID === "string" && item.sessionID.length > 0 && item.sessionID === persistedWorkerSessionID)
         .map(item => item.sessionID),
     ]);
     const priorRoundSessions = new Set(workerRoundFacts
-      .filter(item => item.round < state.round && typeof item.sessionID === "string")
+      .filter(item => item.round < state.round && typeof item.sessionID === "string" && item.sessionID.length > 0)
       .map(item => item.sessionID));
     const persistedSessionIsPrior = typeof persistedWorkerSessionID === "string" &&
       priorRoundSessions.has(persistedWorkerSessionID);
@@ -631,12 +631,14 @@ export function summarizeAudit(db) {
     const expectedAgent = state.executor?.agent ?? record.selection?.agent;
     const expectedModel = state.executor?.model ?? record.selection?.model;
     const hasGovernedFailure = currentRoundFailureObservations.some(item =>
-      typeof persistedWorkerSessionID === "string" && typeof item.sessionID === "string" &&
-      typeof currentWorkerSessionID === "string" &&
+      typeof persistedWorkerSessionID === "string" && persistedWorkerSessionID.length > 0 &&
+      typeof item.sessionID === "string" && item.sessionID.length > 0 &&
+      typeof currentWorkerSessionID === "string" && currentWorkerSessionID.length > 0 &&
       item.sessionID === persistedWorkerSessionID && item.sessionID === currentWorkerSessionID &&
       item.agent === expectedAgent && item.model === expectedModel);
     const unlinkedCurrentRoundFailure = currentRoundFailureObservations.some(item =>
-      typeof persistedWorkerSessionID !== "string" || typeof item.sessionID !== "string" ||
+      typeof persistedWorkerSessionID !== "string" || !persistedWorkerSessionID ||
+      typeof item.sessionID !== "string" || !item.sessionID ||
       item.sessionID !== persistedWorkerSessionID);
     const ambiguousInterrupt = runObservations.some(item =>
       ["worker", "critic", "orchestrator"].includes(item.role) && item.errorCode === "interrupt-unconfirmed");
