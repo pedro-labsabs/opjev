@@ -312,6 +312,36 @@ test("audit recognizes a current-round failure on a reused prior-round worker se
   assert.equal(summary.missingLinks, 0);
   assert.equal(summary.auditFailed, false);
 });
+test("audit rejects a current-round worker failure on an unlinked session", t => {
+  const run = auditRun("unlinked-repair-failure", {
+    phase: "failed", model: "model-prior", round: 2, evidence: true, verdict: false,
+  });
+  run.record.checkpoint = "run-failed";
+  run.record.state.evidence.round = 1;
+  run.record.state.history = [{
+    round: 1,
+    executor: { agent: "build", model: "model-prior" },
+    outcome: "failed",
+    verdict: { nextAction: "repair-same", failureClass: "implementation" },
+  }];
+  const observations = [
+    ...linkedObservations(run.id, 1, "model-prior").map(item => item.kind === "outcome"
+      ? { ...item, acceptance: false, failureClass: "implementation" }
+      : item),
+    {
+      kind: "provider-error", runID: run.id, role: "worker", round: 2,
+      sessionID: "unlinked-worker-session", model: "model-prior", agent: "build", failureDomain: "provider",
+    },
+  ];
+
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.preWorkerFailures, 0);
+  assert.equal(summary.governedPreEvidenceFailures, 0);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.missingLinks, 1);
+  assert.equal(summary.auditFailed, true);
+});
 test("audit reports in-flight runs separately without treating them as evidence loss", t => {
   const run = auditRun("pending-run", { phase: "running", evidence: false, verdict: false });
   const summary = summarizeAudit(createAuditDb(t, [], [run]));
