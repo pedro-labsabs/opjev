@@ -578,6 +578,21 @@ export function summarizeAudit(db) {
     const finalRoundGroup = Number.isInteger(workerRound) && typeof workerSessionID === "string"
       ? workerRoundGroups.get(JSON.stringify([workerRound, workerSessionID]))
       : undefined;
+    const currentEvidenceRoundGroup = Number.isInteger(workerRound) && typeof evidenceSessionID === "string"
+      ? workerRoundGroups.get(JSON.stringify([workerRound, evidenceSessionID]))
+      : undefined;
+    const currentEvidenceRoundFactsLinked = !!worker && workerSessionConsistent &&
+      !!currentEvidenceRoundGroup &&
+      currentEvidenceRoundGroup.counts.round === 1 &&
+      currentEvidenceRoundGroup.counts.request === 1 &&
+      currentEvidenceRoundGroup.counts.outcome === 0 &&
+      currentEvidenceRoundGroup.round.model === worker.model &&
+      currentEvidenceRoundGroup.request.model === worker.model &&
+      currentEvidenceRoundGroup.round.agent === worker.agent &&
+      currentEvidenceRoundGroup.request.agent === worker.agent &&
+      currentEvidenceRoundGroup.round.model === currentEvidenceRoundGroup.request.model &&
+      currentEvidenceRoundGroup.round.agent === currentEvidenceRoundGroup.request.agent &&
+      currentEvidenceRoundGroup.round.route === currentEvidenceRoundGroup.request.route;
     const linked = !!worker && evidenceCurrent && Number.isInteger(workerRound) && typeof workerSessionID === "string" &&
       workerSessionConsistent && workerRoundsLinked &&
       hasCompleteWorkerRound(finalRoundGroup ?? {}) &&
@@ -607,10 +622,12 @@ export function summarizeAudit(db) {
       !currentVerdictApplied && !ambiguousInterrupt;
     const ambiguousRunState = state.phase === "running" && record.checkpoint === "run-failed" && currentWorkerStarted;
     const pending = ["planning", "ready", "running", "evaluating", "repairing"].includes(state.phase) && !ambiguousRunState;
-    const evidenceInconsistency = incompleteHistoricalRound || historyMismatch || duplicateWorkerRound ||
+    const evidenceInconsistency = malformedWorkerRoundFact || incompleteHistoricalRound || historyMismatch || duplicateWorkerRound ||
       terminal && (!evidenceCurrent || !currentVerdictApplied || !linked) ||
       state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
         !hasGovernedFailure && !ambiguousInterrupt ||
+      state.phase === "failed" && !!evidenceCurrent && !currentVerdictApplied && !ambiguousInterrupt &&
+        !currentEvidenceRoundFactsLinked ||
       state.phase === "failed" && !!evidenceCurrent && currentVerdictApplied && !linked;
     const maxObservedRound = workerRounds.length ? Math.max(...workerRounds) : 0;
     readRuns.push({
@@ -630,7 +647,7 @@ export function summarizeAudit(db) {
       linked,
       accepted: state.phase === "completed" && state.lastVerdict?.nextAction === "accept",
       budgetExceeded: Number.isInteger(state.contract?.maxRounds) && maxObservedRound > state.contract.maxRounds,
-      roundViolation: incompleteHistoricalRound || historyMismatch || duplicateWorkerRound,
+      roundViolation: malformedWorkerRoundFact || incompleteHistoricalRound || historyMismatch || duplicateWorkerRound,
       preEvidenceFailure,
       postEvidencePreVerdict,
       ambiguousRunState,

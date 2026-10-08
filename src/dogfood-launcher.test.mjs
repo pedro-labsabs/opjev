@@ -135,6 +135,42 @@ test("audit classifies a linked operational failure before evidence without call
   assert.equal(summary.missingLinks, 0);
   assert.equal(summary.auditFailed, false);
 });
+test("audit fails when governed pre-evidence failures contain malformed round observations", t => {
+  const run = auditRun("governed-malformed-fact", { phase: "failed", evidence: false, verdict: false });
+  run.record.checkpoint = "run-failed";
+  run.record.workerSessionID = "session-governed-malformed-fact";
+  run.record.state.executor = { agent: "build", model: "model-governed-malformed-fact", sessionID: run.record.workerSessionID };
+  const observations = [
+    {
+      kind: "operational-failure", runID: run.id, role: "worker", round: 1,
+      sessionID: run.record.workerSessionID, model: "model-governed-malformed-fact", agent: "build",
+      errorCode: "provider-error", failureDomain: "provider",
+    },
+    { kind: "request", runID: run.id, role: "worker", round: 1, model: "model-governed-malformed-fact", agent: "build" },
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.governedPreEvidenceFailures, 1);
+  assert.equal(summary.roundViolations, 1);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.missingLinks, 1);
+  assert.equal(summary.auditFailed, true);
+});
+
+test("audit requires current round and request identity after evidence even before verdict", t => {
+  const run = auditRun("before-verdict-missing-request", { phase: "failed", evidence: true, verdict: false });
+  run.record.checkpoint = "run-failed";
+  const observations = [{
+    kind: "round", runID: run.id, role: "worker", round: 1,
+    model: run.record.state.evidence.executor.model, agent: "build", sessionID: run.record.workerSessionID,
+  }];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.postEvidencePreVerdictFailures, 1);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.missingLinks, 1);
+  assert.equal(summary.auditFailed, true);
+});
 
 test("audit classifies evidence without an applied verdict as a post-evidence failure", t => {
   const run = auditRun("before-verdict", { phase: "failed", evidence: true, verdict: false });

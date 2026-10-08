@@ -30,7 +30,12 @@ export function registerInternalToolSession(
   role: Exclude<InternalToolRole, "external" | "ambiguous">,
 ): void {
   if (!sessionID || sessionID.length > 256) throw new Error("invalid internal session identity");
-  if (registeredInternalSessions.has(sessionID)) return;
+  const existing = registeredInternalSessions.get(sessionID);
+  if (existing) {
+    if (existing.fenced) throw new Error("internal session fenced; refusing reuse");
+    return;
+  }
+  if (internalToolRegistrySaturated) throw new Error("internal tool registry saturated; fail-closed");
   if (registeredInternalSessions.size >= MAX_REGISTERED_INTERNAL_SESSIONS) {
     const evictable = [...registeredInternalSessions].find(([, entry]) => !entry.fenced)?.[0];
     if (evictable) registeredInternalSessions.delete(evictable);
@@ -38,7 +43,7 @@ export function registerInternalToolSession(
       // Fenced sessions may still be executing. Saturation fails closed for all
       // internal tools instead of evicting a fence and allowing late effects.
       internalToolRegistrySaturated = true;
-      return;
+      throw new Error("internal tool registry saturated; fail-closed");
     }
   }
   registeredInternalSessions.set(sessionID, { role, fenced: false });
@@ -98,7 +103,7 @@ export async function enforceInternalToolAuthority(
 ): Promise<void> {
   const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
   if (!sessionID) deny("session state unavailable");
-  if (internalToolRegistrySaturated || registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
+  if (registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
 
   let role: InternalToolRole;
   try {
@@ -110,7 +115,11 @@ export async function enforceInternalToolAuthority(
   } catch {
     deny("session state unavailable");
   }
-  if (role === "external" || role === "worker") return;
+
+  if (registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
+  if (role === "external") return;
+  if (internalToolRegistrySaturated) deny("session fenced");
+  if (role === "worker") return;
   if (role === "ambiguous") deny("role metadata ambiguous");
 
   const tool = typeof event.tool === "string" ? event.tool : "";
