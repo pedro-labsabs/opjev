@@ -92,12 +92,21 @@ The three later ordinary TUI attempts do not supersede the earlier successful sy
 
 The late audit regression also verifies multi-round history against the runtime-observed executor while separately requiring scheduled `round` and `request` model facts to agree. This avoids false missing links when OpenCode substitutes the observed model.
 
+### Audit verdict/outcome integrity follow-up — 2026-10-08
+
+A further audit regression found four terminal-state inconsistencies: `state.lastVerdict` could differ from the newest persisted history verdict; without history, its acceptance/failure class could disagree with the final linked outcome; a completed state could carry a non-accept verdict even when the ledger repeated that non-accept result; or a linked completed run could be counted as accepted after exceeding `maxRounds`. `summarizeAudit` now requires exact structural agreement between terminal verdict and history, checks verdict acceptance/failure class against the final outcome when history is absent, requires `completed` to have an `accept` verdict, and counts acceptance only for completed, linked, internally consistent runs within budget. Round-limit violations remain a separate audit failure. No verdict, acceptance, failure class, or outcome is inferred.
+
+RED→GREEN: each inconsistency regression failed before its corresponding check: missing evidence-inconsistency for history divergence, false accepted count for state/outcome disagreement, missing terminal-state failure for a completed non-accept verdict, and false acceptance after the round budget. The focused regressions pass 4/4; the full launcher/audit regression suite passes 37/37. Tests preserve multi-round joins and bounded counters.
+
+Fresh read-only `opjev audit` after this correction: 57/2,048 observations and 10 canonical runs; 3 completed/accepted, 6 failed, 1 pending; 10 live Jev selections, 0 heuristic; 7 EvidencePackets and critic checks, 3 verdicts and linked accepted outcomes; 0 evidence inconsistencies, missing links, orphan links, invalid records, round violations, or round-limit violations. The existing three accepted runs remain synthetic, not natural dogfood. No records were cleared or rewritten.
+
+
 ### Gates on the corrected HEAD
 
 | Command | Result |
 |---|---|
 | `npm run typecheck` | **PASS** |
-| `npm test` | **PASS** — 800 tests, 104 suites; 0 failures |
+| `npm test` | **PASS** — 804 tests, 104 suites; 0 failures |
 | `npm run evaluate:routing` | **PASS** — 11/11, fallback 4/4 |
 | `npm run e2e:matrix` | **PASS** — 17 scenarios |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **PASS** — 60/60; 45 test-only local model completions and a local Jev mock. Real OpenCode 2.0.11 TUI/gateway path: one admission/dispatch, `parent=0`, 20/20 summary RPC responses HTTP 200, bounded/preterminal projection, visible result, zero inbox patches. |

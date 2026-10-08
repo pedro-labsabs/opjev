@@ -69,7 +69,10 @@ function auditRun(id, { phase = "stopped", model = `model-${id}`, maxRounds = 3,
           round,
           deterministicChecks: [{ name: "critic-session-outcome", status: "pass" }],
         } : undefined,
-        lastVerdict: verdict ? { nextAction: phase === "completed" ? "accept" : "continue" } : undefined,
+        lastVerdict: verdict ? {
+          nextAction: phase === "completed" ? "accept" : "continue",
+          failureClass: "none",
+        } : undefined,
       },
     },
   };
@@ -413,6 +416,99 @@ test("audit reports in-flight runs separately without treating them as evidence 
   assert.equal(summary.pendingRuns, 1);
   assert.equal(summary.missingLinks, 0);
   assert.equal(summary.auditFailed, false);
+});
+
+test("audit rejects completed runs whose last verdict diverges from persisted history", t => {
+  for (const lastVerdict of [
+    { nextAction: "repair-same", failureClass: "implementation" },
+    { nextAction: "accept", failureClass: "implementation" },
+    undefined,
+  ]) {
+    const run = auditRun("last-verdict-mismatch", { phase: "completed", model: "model-last-verdict" });
+    run.record.state.history = [{
+      round: 1,
+      executor: { agent: "build", model: "model-last-verdict" },
+      outcome: "succeeded",
+      verdict: { nextAction: "accept", failureClass: "none" },
+    }];
+    run.record.state.lastVerdict = lastVerdict;
+    const summary = summarizeAudit(createAuditDb(
+      t,
+      linkedObservations(run.id, 1, "model-last-verdict"),
+      [run],
+    ));
+
+    assert.equal(summary.linked, 1);
+    assert.equal(summary.evidenceInconsistencies, 1);
+    assert.equal(summary.auditFailed, true);
+    assert.equal(summary.accepted, 0);
+    assert.equal(summary.missingLinks, 1);
+    assert.equal(summary.roundViolations, 0);
+  }
+});
+
+test("audit does not count a canonical acceptance whose outcome contradicts it without history", t => {
+  const run = auditRun("unlinked-acceptance", { phase: "completed", model: "model-unlinked-acceptance" });
+  const observations = linkedObservations(run.id, 1, "model-unlinked-acceptance").map(item =>
+    item.kind === "outcome" ? { ...item, acceptance: false, failureClass: "implementation" } : item,
+  );
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.linked, 1);
+  assert.equal(summary.accepted, 0);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.auditFailed, true);
+});
+
+test("audit rejects a completed run whose matching final facts do not accept", t => {
+  const run = auditRun("completed-repair-verdict", { phase: "completed", model: "model-completed-repair" });
+  run.record.state.lastVerdict = { nextAction: "repair-same", failureClass: "implementation" };
+  const observations = linkedObservations(run.id, 1, "model-completed-repair").map(item =>
+    item.kind === "outcome" ? { ...item, acceptance: false, failureClass: "implementation" } : item,
+  );
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.linked, 1);
+  assert.equal(summary.accepted, 0);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.auditFailed, true);
+});
+
+test("audit does not count a completed run that exceeded its round budget", t => {
+  const run = auditRun("over-budget-accepted", {
+    phase: "completed",
+    model: "model-budget-final",
+    maxRounds: 1,
+    round: 2,
+  });
+  run.record.state.history = [
+    {
+      round: 1,
+      executor: { agent: "build", model: "model-budget-first" },
+      outcome: "failed",
+      verdict: { nextAction: "repair-same", failureClass: "implementation" },
+    },
+    {
+      round: 2,
+      executor: { agent: "build", model: "model-budget-final" },
+      outcome: "succeeded",
+      verdict: { nextAction: "accept", failureClass: "none" },
+    },
+  ];
+  run.record.state.lastVerdict = run.record.state.history[1].verdict;
+  const observations = [
+    ...linkedObservations(run.id, 1, "model-budget-first").map(item => item.kind === "outcome"
+      ? { ...item, acceptance: false, failureClass: "implementation" }
+      : item),
+    ...linkedObservations(run.id, 2, "model-budget-final"),
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.linked, 1);
+  assert.equal(summary.roundLimitViolations, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.accepted, 0);
+  assert.equal(summary.auditFailed, true);
 });
 
 test("audit fails a completed run whose applied verdict lacks its linked outcome", t => {

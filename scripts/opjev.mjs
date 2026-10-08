@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { installPluginToHome } from "./install-plugin.mjs";
+import { isDeepStrictEqual } from "node:util";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = path.join(os.homedir(), ".local", "share", "opjev-dogfood");
@@ -645,6 +646,14 @@ export function summarizeAudit(db) {
     const currentVerdictApplied = history.some(entry => entry?.round === state.round && entry.verdict) ||
       (!history.length && !!state.lastVerdict);
     const terminal = ["completed", "stopped", "awaiting-human"].includes(state.phase);
+    const lastHistoryVerdict = history.at(-1)?.verdict;
+    const terminalVerdictMismatch = terminal && history.length > 0 &&
+      !isDeepStrictEqual(lastHistoryVerdict, state.lastVerdict);
+    const terminalOutcomeMismatch = terminal && !!finalRoundGroup?.outcome &&
+      (!state.lastVerdict ||
+        finalRoundGroup.outcome.acceptance !== (state.lastVerdict.nextAction === "accept") ||
+        finalRoundGroup.outcome.failureClass !== state.lastVerdict.failureClass);
+    const completedVerdictMismatch = state.phase === "completed" && state.lastVerdict?.nextAction !== "accept";
     const preEvidenceFailure = state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
       hasGovernedFailure && !ambiguousInterrupt;
     const postEvidencePreVerdict = state.phase === "failed" && !!evidenceCurrent &&
@@ -653,6 +662,9 @@ export function summarizeAudit(db) {
     const pending = ["planning", "ready", "running", "evaluating", "repairing"].includes(state.phase) && !ambiguousRunState;
     const evidenceInconsistency = unlinkedCurrentRoundFailure ||
       malformedWorkerRoundFact || incompleteHistoricalRound || historyMismatch || duplicateWorkerRound ||
+      terminalVerdictMismatch ||
+      terminalOutcomeMismatch ||
+      completedVerdictMismatch ||
       terminal && (!evidenceCurrent || !currentVerdictApplied || !linked) ||
       state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
         !hasGovernedFailure && !ambiguousInterrupt ||
@@ -660,6 +672,7 @@ export function summarizeAudit(db) {
         !currentEvidenceRoundFactsLinked ||
       state.phase === "failed" && !!evidenceCurrent && currentVerdictApplied && !linked;
     const maxObservedRound = workerRounds.length ? Math.max(...workerRounds) : 0;
+    const budgetExceeded = Number.isInteger(state.contract?.maxRounds) && maxObservedRound > state.contract.maxRounds;
     readRuns.push({
       phase: state.phase,
       checkpoint: record.checkpoint,
@@ -675,8 +688,9 @@ export function summarizeAudit(db) {
       criticStatus: criticCheck?.status,
       verdict: currentVerdictApplied,
       linked,
-      accepted: state.phase === "completed" && state.lastVerdict?.nextAction === "accept",
-      budgetExceeded: Number.isInteger(state.contract?.maxRounds) && maxObservedRound > state.contract.maxRounds,
+      accepted: state.phase === "completed" && state.lastVerdict?.nextAction === "accept" &&
+        linked && !evidenceInconsistency && !budgetExceeded,
+      budgetExceeded,
       roundViolation: malformedWorkerRoundFact || incompleteHistoricalRound || historyMismatch || duplicateWorkerRound,
       preEvidenceFailure,
       postEvidencePreVerdict,
