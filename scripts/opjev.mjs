@@ -599,9 +599,23 @@ export function summarizeAudit(db) {
     const currentRoundSessions = new Set(workerRoundFacts
       .filter(item => item.round === state.round && typeof item.sessionID === "string")
       .map(item => item.sessionID));
-    const currentWorkerSessionID = workerSessionID ?? (currentRoundSessions.size === 1 ? [...currentRoundSessions][0] : undefined);
-    const currentWorkerStarted = !!evidenceCurrent || !!currentWorkerSessionID ||
-      currentRoundSessions.size > 0;
+    const persistedWorkerSessionID = typeof record.workerSessionID === "string" ? record.workerSessionID :
+      typeof state.executor?.sessionID === "string" ? state.executor.sessionID : undefined;
+    const priorRoundSessions = new Set(workerRoundFacts
+      .filter(item => item.round < state.round && typeof item.sessionID === "string")
+      .map(item => item.sessionID));
+    const persistedSessionIsPrior = typeof persistedWorkerSessionID === "string" &&
+      priorRoundSessions.has(persistedWorkerSessionID);
+    const currentWorkerSessionID = evidenceCurrent && typeof evidenceSessionID === "string"
+      ? evidenceSessionID
+      : currentRoundSessions.size === 1
+        ? [...currentRoundSessions][0]
+        : currentRoundSessions.size === 0 && typeof persistedWorkerSessionID === "string" &&
+          (!persistedSessionIsPrior || state.phase === "running" && record.checkpoint === "run-failed")
+          ? persistedWorkerSessionID
+          : undefined;
+    const currentWorkerStarted = !!evidenceCurrent || currentRoundSessions.size > 0 ||
+      typeof currentWorkerSessionID === "string";
     const expectedAgent = state.executor?.agent ?? record.selection?.agent;
     const expectedModel = state.executor?.model ?? record.selection?.model;
     const failureKinds = ["provider-error", "throttle", "quota-limit", "context-overflow", "operational-failure"];

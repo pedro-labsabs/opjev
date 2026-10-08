@@ -257,6 +257,30 @@ test("audit joins multi-round history to observed models after OpenCode substitu
   assert.equal(summary.roundViolations, 0);
   assert.equal(summary.auditFailed, false);
 });
+
+test("audit does not treat a previous-round worker as started in a failed new-round selection", t => {
+  const run = auditRun("new-round-selection-failure", {
+    phase: "failed", model: "model-prior", round: 2, evidence: true, verdict: false,
+  });
+  run.record.checkpoint = "run-failed";
+  run.record.state.evidence.round = 1;
+  run.record.state.history = [{
+    round: 1,
+    executor: { agent: "build", model: "model-prior" },
+    outcome: "failed",
+    verdict: { nextAction: "switch-model", failureClass: "wrong-model" },
+  }];
+  const observations = linkedObservations(run.id, 1, "model-prior").map(item => item.kind === "outcome"
+    ? { ...item, acceptance: false, failureClass: "wrong-model" }
+    : item);
+
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.preWorkerFailures, 1);
+  assert.equal(summary.evidenceInconsistencies, 0);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, false);
+});
 test("audit reports in-flight runs separately without treating them as evidence loss", t => {
   const run = auditRun("pending-run", { phase: "running", evidence: false, verdict: false });
   const summary = summarizeAudit(createAuditDb(t, [], [run]));
