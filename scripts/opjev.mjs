@@ -654,9 +654,11 @@ export function summarizeAudit(db) {
         finalRoundGroup.outcome.acceptance !== (state.lastVerdict.nextAction === "accept") ||
         finalRoundGroup.outcome.failureClass !== state.lastVerdict.failureClass);
     const completedVerdictMismatch = state.phase === "completed" && state.lastVerdict?.nextAction !== "accept";
-    const preEvidenceFailure = state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
+    const governedFailure = state.phase === "failed" && record.checkpoint === "run-failed" &&
+      typeof state.lastError === "string" && state.lastError.trim().length > 0;
+    const preEvidenceFailure = governedFailure && currentWorkerStarted && !evidenceCurrent &&
       hasGovernedFailure && !ambiguousInterrupt;
-    const postEvidencePreVerdict = state.phase === "failed" && !!evidenceCurrent &&
+    const postEvidencePreVerdict = governedFailure && !!evidenceCurrent &&
       !currentVerdictApplied && !ambiguousInterrupt;
     const ambiguousRunState = state.phase === "running" && record.checkpoint === "run-failed" && currentWorkerStarted;
     const pending = ["planning", "ready", "running", "evaluating", "repairing"].includes(state.phase) && !ambiguousRunState;
@@ -666,6 +668,7 @@ export function summarizeAudit(db) {
       terminalOutcomeMismatch ||
       completedVerdictMismatch ||
       terminal && (!evidenceCurrent || !currentVerdictApplied || !linked) ||
+      state.phase === "failed" && !ambiguousInterrupt && !governedFailure ||
       state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
         !hasGovernedFailure && !ambiguousInterrupt ||
       state.phase === "failed" && !!evidenceCurrent && !currentVerdictApplied && !ambiguousInterrupt &&
@@ -697,6 +700,7 @@ export function summarizeAudit(db) {
       ambiguousRunState,
       pending,
       ambiguousInterrupt,
+      governedFailure,
       evidenceInconsistency,
     });
   }
@@ -705,7 +709,7 @@ export function summarizeAudit(db) {
   const observedRunIDs = new Set(observations.map(item => item?.runID).filter(value => typeof value === "string" && value.length > 0));
   const orphanedRunLinks = [...observedRunIDs]
     .filter(runID => !runExists.get(`${runPrefix}${runID}`)).length;
-  const preWorkerFailures = readRuns.filter(run => run.phase === "failed" && !run.workerStarted && !run.evidence).length;
+  const preWorkerFailures = readRuns.filter(run => run.phase === "failed" && run.governedFailure && !run.workerStarted && !run.evidence).length;
   const governedPreEvidenceFailures = readRuns.filter(run => run.preEvidenceFailure).length;
   const postEvidencePreVerdictFailures = readRuns.filter(run => run.postEvidencePreVerdict).length;
   const pendingRuns = readRuns.filter(run => run.pending).length;

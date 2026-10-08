@@ -56,11 +56,13 @@ function auditRun(id, { phase = "stopped", model = `model-${id}`, maxRounds = 3,
     id,
     updatedAt: 1,
     record: {
+      ...(phase === "failed" ? { checkpoint: "run-failed" } : {}),
       selection: { via: "jev", model, agent: "build", route: "fast-coding" },
       criticSessionID: "critic",
       ...(workerSessionID ? { workerSessionID } : {}),
       state: {
         phase,
+        ...(phase === "failed" ? { lastError: "governed test failure" } : {}),
         round,
         contract: { runID: id, maxRounds },
         ...(workerSessionID ? { executor: { agent: "build", model, sessionID: workerSessionID } } : {}),
@@ -201,6 +203,44 @@ test("audit classifies evidence without an applied verdict as a post-evidence fa
   assert.equal(summary.postEvidencePreVerdictFailures, 1);
   assert.equal(summary.missingLinks, 0);
   assert.equal(summary.auditFailed, false);
+});
+test("audit rejects failed evidence-ready records without a canonical run-failed error", t => {
+  const run = auditRun("incomplete-post-evidence-failure", { phase: "failed", evidence: true, verdict: false });
+  run.record.checkpoint = "evidence-ready";
+  delete run.record.state.lastError;
+  const sessionID = run.record.workerSessionID;
+  const observations = [
+    { kind: "round", runID: run.id, role: "worker", round: 1, model: "model-incomplete-post-evidence-failure", agent: "build", sessionID },
+    { kind: "request", runID: run.id, role: "worker", round: 1, model: "model-incomplete-post-evidence-failure", agent: "build", sessionID },
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.postEvidencePreVerdictFailures, 0);
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.missingLinks, 1);
+  assert.equal(summary.auditFailed, true);
+});
+test("audit requires both the run-failed checkpoint and canonical state error", t => {
+  for (const [id, checkpoint, lastError] of [
+    ["missing-failure-checkpoint", "evidence-ready", "governed test failure"],
+    ["missing-failure-error", "run-failed", undefined],
+  ]) {
+    const run = auditRun(id, { phase: "failed", evidence: true, verdict: false });
+    run.record.checkpoint = checkpoint;
+    if (lastError === undefined) delete run.record.state.lastError;
+    else run.record.state.lastError = lastError;
+    const sessionID = run.record.workerSessionID;
+    const observations = [
+      { kind: "round", runID: run.id, role: "worker", round: 1, model: `model-${id}`, agent: "build", sessionID },
+      { kind: "request", runID: run.id, role: "worker", round: 1, model: `model-${id}`, agent: "build", sessionID },
+    ];
+    const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+    assert.equal(summary.postEvidencePreVerdictFailures, 0);
+    assert.equal(summary.evidenceInconsistencies, 1);
+    assert.equal(summary.missingLinks, 1);
+    assert.equal(summary.auditFailed, true);
+  }
 });
 
 test("audit separates an unconfirmed interrupt from a governed terminal failure", t => {
