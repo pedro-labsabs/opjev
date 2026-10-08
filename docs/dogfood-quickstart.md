@@ -1,5 +1,5 @@
 # OPJEV dogfood quickstart
-> **Controlled accepted TUI smoke verified 2026-10-08; PASS PARA REVISÃO DO MANTENEDOR only.** Three controlled synthetic outcomes are linked and persisted. Later ordinary TUI attempts exposed a contradictory live Jev verdict (correctly rejected) and a stopped run. The pinned gateway E2E rerun passed 60/60; an earlier run timed out before evidence and did not prove a follow-up defect. See `docs/reports/dogfood-operational-readiness-2026-10-07.md`. Not natural dogfood or maintainer approval.
+> **Controlled accepted TUI smoke verified 2026-10-08; PASS PARA REVISÃO DO MANTENEDOR only.** Three controlled synthetic outcomes remain linked and persisted. The latest unique ordinary-TUI smoke completed admission/dispatch once and showed a governed failure after worker success and critic/evidence: live Jev returned contradictory verdict fields, rejected without fabricating verdict or outcome. Two such contradictory Jev responses and one stopped run remain visible. No natural dogfood or maintainer approval is claimed; see `docs/reports/dogfood-operational-readiness-2026-10-07.md`.
 
 ## Start and resume
 
@@ -37,7 +37,7 @@ While the TUI is open, in another terminal:
 opjev status
 ```
 
-`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events; its accepted EvidencePacket/verdict/outcome join persisted after restart. Later TUI attempts exposed a contradictory live Jev verdict, rejected without fabricating acceptance, and one stopped run. The gateway E2E rerun passed 60/60 including real follow-up delivery; its earlier failure followed a worker operational-failure at the configured 120-second deadline before evidence. The environment passes for maintainer review, not READY FOR DOGFOOD. See the dated report for gates and risks.
+`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events; its accepted EvidencePacket/verdict/outcome join persisted after restart. Two later TUI runs returned contradictory live Jev verdicts, correctly rejected, and a separate run stopped before verdict. The latest unique smoke also showed exactly one intercept/admission/dispatch with no duplicates or fail-closed events. The gateway E2E passed 60/60; its earlier failure followed a worker operational failure at the configured 120-second deadline before evidence. The environment is for maintainer review, not READY FOR DOGFOOD. See the dated report for gates and risks.
 
 For a sanitized, read-only aggregate of collection quality:
 
