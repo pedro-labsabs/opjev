@@ -568,7 +568,7 @@ export function summarizeAudit(db) {
       const group = groups[0];
       return groups.length !== 1 || !hasCompleteWorkerRound(group ?? {}) ||
         !entry.executor || !entry.outcome || !entry.verdict ||
-        entry.executor.agent !== group.round.agent || entry.executor.model !== group.round.model ||
+        entry.executor.agent !== group.round.agent ||
         entry.executor.agent !== group.outcome.agent || entry.executor.model !== group.outcome.model ||
         group.outcome.acceptance !== (entry.verdict.nextAction === "accept") ||
         group.outcome.failureClass !== entry.verdict.failureClass;

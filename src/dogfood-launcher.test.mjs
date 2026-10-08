@@ -234,6 +234,29 @@ test("audit links every applied multi-round outcome to its persisted history and
   assert.equal(summary.auditFailed, false);
 });
 
+test("audit joins multi-round history to observed models after OpenCode substitutions", t => {
+  const run = auditRun("multi-model-substitution", { phase: "completed", model: "observed-final", round: 2 });
+  run.record.state.history = [
+    { round: 1, executor: { agent: "build", model: "observed-first" }, outcome: "failed", verdict: { nextAction: "repair-same", failureClass: "implementation" } },
+    { round: 2, executor: { agent: "build", model: "observed-final" }, outcome: "succeeded", verdict: { nextAction: "accept", failureClass: "none" } },
+  ];
+  const observations = [
+    ...linkedObservations(run.id, 1, "requested-first").map(item => ({
+      ...item,
+      ...(item.kind === "outcome" ? { model: "observed-first", acceptance: false, failureClass: "implementation" } : {}),
+    })),
+    ...linkedObservations(run.id, 2, "requested-final").map(item => ({
+      ...item,
+      ...(item.kind === "outcome" ? { model: "observed-final" } : {}),
+    })),
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.linked, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.roundViolations, 0);
+  assert.equal(summary.auditFailed, false);
+});
 test("audit reports in-flight runs separately without treating them as evidence loss", t => {
   const run = auditRun("pending-run", { phase: "running", evidence: false, verdict: false });
   const summary = summarizeAudit(createAuditDb(t, [], [run]));
