@@ -62,7 +62,7 @@ These gates proved the tested boundaries only and did not supersede the failed s
 
 ## Verification on 2026-10-08
 
-**Status: BLOCKED.** The bounded timeout and audit corrections pass their regressions; typecheck, 800-test suite, routing, matrix, real multi-round and Context E2Es pass. The required gateway E2E failed three follow-up-consumption assertions, and the latest ordinary TUI attempts did not produce a new accepted verdict: one live Jev response violated the verdict invariants and a subsequent controlled run was stopped after no visible progress. Three earlier synthetic accepted runs remain linked and persisted. This is not natural dogfood or maintainer approval.
+**Status: PASS PARA REVISÃO DO MANTENEDOR (not READY FOR DOGFOOD).** Timeout/fencing and audit regressions pass. On this source HEAD, typecheck, 800 tests, routing, matrix, gateway (60/60), real multi-round (18/18), Context E2E (2 turns/4 requests), and `git diff --check` pass. A controlled ordinary-TUI accepted run remains linked and persisted; later tasks produced a malformed live Jev verdict (kernel failed closed) and one stopped pre-verdict run. These failures remain visible; no natural dogfood has been collected. This is not maintainer approval.
 
 ### Root causes and corrections
 
@@ -84,7 +84,7 @@ The ordinary `opjev` launcher, pinned OpenCode 2.0.11 CLI/server, isolated serve
 - The three accepted outcomes are controlled synthetic runs. The two latest attempts are also synthetic; none is natural dogfood. Historic failed and pending records remain in the isolated profile. No prompt/output content, secrets, or run/session IDs are included.
 - After both new attempts, `opjev status` reported stopped and the sanitized audit remained readable. The accepted earlier result and ledger persistence after restart remain proven; the latest attempts themselves did not produce acceptance.
 
-**Operational blocker:** a live Jev judgement response can violate the cross-field `JevVerdict` invariants. The kernel correctly fails closed. Automatically repairing, retrying, or deriving acceptance would conceal the invalid judgment and is prohibited. Resolve Jev response reliability without changing kernel authority before relying on this environment for unattended everyday work.
+**Residual reliability risk:** one live Jev judgment returned contradictory fields (`done=true` with a non-`none` failure class). The strict validator rejected it; the kernel fabricated no verdict or acceptance. Automatic repair, retry, or derivation remains prohibited. The evidence proves a valid accepted path exists, while this malformed judgment remains for maintainer review.
 
 The final ordinary TUI attempts therefore do not supersede the earlier successful synthetic evidence, but they prevent declaring the live path reliable. They are not natural dogfood.
 
@@ -98,12 +98,12 @@ The late audit regression also verifies multi-round history against the runtime-
 | `npm test` | **PASS** — 800 tests, 104 suites; 0 failures |
 | `npm run evaluate:routing` | **PASS** — 11/11, fallback 4/4 |
 | `npm run e2e:matrix` | **PASS** — 17 scenarios |
-| `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **FAIL** — 57/60; three real follow-up-consumption assertions failed |
+| `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **PASS** — 60/60; all follow-up-consumption assertions passed on rerun |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:multiround-real` | **PASS** — 18/18; live Jev/SystemOne case and controlled timeout boundaries |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:context` | **PASS** — OpenCode 2.0.11; 2 turns, 4 requests |
 | `git diff --check` | **PASS** |
 
-Gateway E2E failure evidence: both follow-ups were acknowledged as attached, but terminal cleanup persisted them as unconsumed (`run-finished-without-consumption`); the worker input did not contain the follow-up. All single-admission, no-duplicate, parent-zero, visible TUI, and remaining gateway assertions passed. The diagnostic result is `/tmp/opjev-e2e/runs/2026-10-08T16-01-56-773Z/e2e-result.json`. No retry or repair was attempted because the failure cause is not isolated to a single runtime boundary; this remains a required gate failure.
+The first gateway E2E attempt was 57/60: the two follow-up records remained unconsumed and the worker input lacked the follow-up. Read-only inspection of that isolated run showed `failed`, round 1, no critic/evidence/verdict/history, and a worker `operational-failure` 120,018 ms after its request; persisted and observed worker session/agent/model identities matched. This matches the fixture's configured 120,000 ms worker deadline. The model-side reason is not present in the sanitized ledger. The run ended before it could reach the next worker prompt, so that attempt did not prove a follow-up-delivery defect. A rerun on this HEAD passed 60/60, including all 13 follow-up assertions, durable consumption, and exactly-once delivery to the real OpenCode 2.0.11 worker input. Rerun summary: `/tmp/opjev-e2e/runs/2026-10-08T16-50-24-811Z/e2e-result.json`.
 
 These automated gates are distinct from the controlled ordinary-TUI smoke and from future natural dogfood. The stable executable is `/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11`, SHA-256 `0ed7d8546cf24acc41e6371ec30928ed931ec1474e1a54bbecdde8e0dd801d2f`; the global OpenCode 2.0.18 installation remains untouched.
 
@@ -112,4 +112,4 @@ These automated gates are distinct from the controlled ordinary-TUI smoke and fr
 - The ledger is bounded at 2,048 observations; eviction and observations lost before append cannot be independently counted.
 - One historic pending run remains unresolved and visible. Audit does not convert it into a terminal result.
 - The internal-session fence registry is capped at 4,096. If it fills with non-reusable fenced sessions, execution fails closed until runtime restart; no unsafe fence eviction is attempted.
-- The three accepted runs are controlled synthetic checks; a later live Jev response was rejected for contradictory verdict fields, and one subsequent run was stopped after no visible progress. Natural dogfood collection has not started; live judge response reliability remains a blocker.
+- The three accepted runs are controlled synthetic checks. Later controlled TUI attempts include one rejected contradictory live Jev verdict and one run stopped before verdict; historic failed and pending records remain. No natural dogfood has started. The malformed live-judge response is a reliability risk for maintainer review, not evidence of an accepted outcome.
