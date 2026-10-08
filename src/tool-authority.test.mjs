@@ -7,6 +7,7 @@ import {
   registerInternalToolSession,
   resolveInternalToolRole,
 } from "./orchestration/tool-authority.ts";
+import { makeWorkerRuntime } from "./plugin-runtime.ts";
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
 
 const INTERNAL = "orchestration-internal";
@@ -114,5 +115,62 @@ describe("separação entre tool visibility e local authority", () => {
   it("não confunde uma sessão externa sem metadata opcional com role interno", async () => {
     const ctx = { session: { get: async () => ({ id: "plain-session" }) } };
     assert.equal(await simulateToolCall(ctx, "plain-session", "edit"), 1);
+  });
+
+  it("fences a worker before a non-settling runtime interrupt so no later tool runs", async () => {
+    const sessionID = `fenced-worker-${Date.now()}`;
+    const ctx = {
+      session: {
+        create: async () => ({ id: sessionID }),
+        get: async () => sessionInfo("worker", "implementer"),
+        interrupt: async () => await new Promise(() => {}),
+      },
+    };
+    const runtime = makeWorkerRuntime(ctx);
+    await runtime.createWorker({
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      metadata: {},
+    });
+    void runtime.interrupt({ sessionID });
+
+    let toolSideEffects = 0;
+    await assert.rejects(
+      (async () => {
+        await enforceInternalToolAuthority(ctx, { sessionID, tool: "edit" });
+        toolSideEffects += 1;
+      })(),
+      /interrupt|fenced/i,
+    );
+    assert.equal(toolSideEffects, 0);
+  });
+
+  it("reports interruption only when the OpenCode response confirms it", async () => {
+    let response;
+    let sequence = 0;
+    const ctx = {
+      session: {
+        create: async () => ({ id: `interrupt-confirm-${Date.now()}-${++sequence}` }),
+        get: async () => sessionInfo("worker", "implementer"),
+        interrupt: async () => response,
+      },
+    };
+    const expected = [
+      [{ interrupted: true }, true],
+      [{ interrupted: false }, false],
+      [undefined, false],
+      [{ interrupted: "true" }, false],
+    ];
+
+    for (const [apiResponse, confirmed] of expected) {
+      response = apiResponse;
+      const runtime = makeWorkerRuntime(ctx);
+      const { sessionID } = await runtime.createWorker({
+        agent: "build",
+        model: { providerID: "opencode", id: "big-pickle" },
+        metadata: {},
+      });
+      assert.equal(await runtime.interrupt({ sessionID }), confirmed);
+    }
   });
 });

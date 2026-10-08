@@ -120,6 +120,101 @@ test("audit treats persisted worker identity as evidence that a failed run reach
   assert.equal(summary.auditFailed, true);
 });
 
+test("audit classifies a linked operational failure before evidence without calling it a missing link", t => {
+  const run = auditRun("governed-before-evidence", { phase: "failed", evidence: false, verdict: false });
+  run.record.checkpoint = "run-failed";
+  run.record.workerSessionID = "session-governed-before-evidence";
+  run.record.state.executor = { agent: "build", model: "model-governed-before-evidence", sessionID: run.record.workerSessionID };
+  const observations = [{
+    kind: "operational-failure", runID: run.id, role: "worker", round: 1,
+    sessionID: run.record.workerSessionID, model: "model-governed-before-evidence", agent: "build", errorCode: "provider-error", failureDomain: "provider",
+  }];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.governedPreEvidenceFailures, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, false);
+});
+
+test("audit classifies evidence without an applied verdict as a post-evidence failure", t => {
+  const run = auditRun("before-verdict", { phase: "failed", evidence: true, verdict: false });
+  run.record.checkpoint = "run-failed";
+  const observations = [
+    { kind: "round", runID: run.id, role: "worker", round: 1, model: run.record.state.evidence.executor.model, agent: "build", sessionID: run.record.workerSessionID },
+    { kind: "request", runID: run.id, role: "worker", round: 1, model: run.record.state.evidence.executor.model, agent: "build", sessionID: run.record.workerSessionID },
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.postEvidencePreVerdictFailures, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, false);
+});
+
+test("audit separates an unconfirmed interrupt from a governed terminal failure", t => {
+  const run = auditRun("interrupt-unknown", { phase: "running", evidence: false, verdict: false });
+  run.record.checkpoint = "run-failed";
+  run.record.workerSessionID = "session-interrupt-unknown";
+  run.record.state.executor = { agent: "build", model: "model-interrupt-unknown", sessionID: run.record.workerSessionID };
+  const observations = [{
+    kind: "operational-failure", runID: run.id, role: "worker", round: 1,
+    sessionID: run.record.workerSessionID, errorCode: "interrupt-unconfirmed", failureDomain: "operational",
+  }];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.ambiguousInterruptions, 1);
+  assert.equal(summary.ambiguousRuns, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, true);
+});
+
+test("audit links every applied multi-round outcome to its persisted history and final evidence", t => {
+  const run = auditRun("multi-linked", { phase: "completed", model: "model-final", round: 2 });
+  run.record.state.history = [
+    { round: 1, executor: { agent: "build", model: "model-first" }, outcome: "failed", verdict: { nextAction: "repair-same", failureClass: "implementation" } },
+    { round: 2, executor: { agent: "build", model: "model-final" }, outcome: "succeeded", verdict: { nextAction: "accept", failureClass: "none" } },
+  ];
+  const observations = [
+    ...linkedObservations("multi-linked", 1, "model-first").map(item => ({ ...item, acceptance: false, failureClass: "implementation" })),
+    ...linkedObservations("multi-linked", 2, "model-final"),
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.linked, 1);
+  assert.equal(summary.auditFailed, false);
+});
+
+test("audit reports in-flight runs separately without treating them as evidence loss", t => {
+  const run = auditRun("pending-run", { phase: "running", evidence: false, verdict: false });
+  const summary = summarizeAudit(createAuditDb(t, [], [run]));
+
+  assert.equal(summary.pendingRuns, 1);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, false);
+});
+
+test("audit fails a completed run whose applied verdict lacks its linked outcome", t => {
+  const run = auditRun("missing-final-outcome", { phase: "completed", model: "model-outcome" });
+  const observations = linkedObservations("missing-final-outcome", 1, "model-outcome").slice(0, 2);
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.evidenceInconsistencies, 1);
+  assert.equal(summary.missingLinks, 1);
+  assert.equal(summary.auditFailed, true);
+});
+
+test("audit flags multiple worker sessions dispatched in one round", t => {
+  const run = auditRun("duplicate-round", { phase: "completed", model: "model-duplicate" });
+  const observations = [
+    ...linkedObservations("duplicate-round", 1, "model-duplicate"),
+    ...linkedObservations("duplicate-round", 1, "model-duplicate").map(item => ({ ...item, sessionID: "duplicate-session" })),
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.roundViolations, 1);
+  assert.equal(summary.auditFailed, true);
+});
+
 test("audit requires round, request, and outcome to join to the persisted worker session", t => {
   const run = auditRun("session-mismatch", { phase: "completed", model: "model-session" });
   const observations = linkedObservations("session-mismatch", 1, "model-session");

@@ -17,11 +17,12 @@ export const PROVIDER_COMPATIBILITY_PERMISSIONS = [
 ] as const;
 
 const INTERNAL_ROUTER_MARKER = "orchestration-internal";
-const TOOL_READ_ALLOWLIST = new Set(["read", "glob", "grep"]);
-const INTERNAL_ROLES = new Set(["worker", "critic", "orchestrator"]);
-const AGENT_ROLES = new Set(["implementer", "critic", "orchestrator"]);
+const TOOL_READ_ALLOWLIST = { read: true, glob: true, grep: true } as const;
+const INTERNAL_ROLES = { worker: true, critic: true, orchestrator: true } as const;
+const AGENT_ROLES = { implementer: true, critic: true, orchestrator: true } as const;
 const MAX_REGISTERED_INTERNAL_SESSIONS = 4096;
-const registeredInternalSessions = new Map<string, Exclude<InternalToolRole, "external" | "ambiguous">>();
+const registeredInternalSessions = new Map<string, { role: Exclude<InternalToolRole, "external" | "ambiguous">; fenced: boolean }>();
+let internalToolRegistrySaturated = false;
 
 /** Track sessions created by this control plane, bounded for long-lived hosts. */
 export function registerInternalToolSession(
@@ -29,18 +30,34 @@ export function registerInternalToolSession(
   role: Exclude<InternalToolRole, "external" | "ambiguous">,
 ): void {
   if (!sessionID || sessionID.length > 256) throw new Error("invalid internal session identity");
-  registeredInternalSessions.delete(sessionID);
-  registeredInternalSessions.set(sessionID, role);
-  while (registeredInternalSessions.size > MAX_REGISTERED_INTERNAL_SESSIONS) {
-    const oldest = registeredInternalSessions.keys().next().value;
-    if (oldest === undefined) break;
-    registeredInternalSessions.delete(oldest);
+  if (registeredInternalSessions.has(sessionID)) return;
+  if (registeredInternalSessions.size >= MAX_REGISTERED_INTERNAL_SESSIONS) {
+    const evictable = [...registeredInternalSessions].find(([, entry]) => !entry.fenced)?.[0];
+    if (evictable) registeredInternalSessions.delete(evictable);
+    else {
+      // Fenced sessions may still be executing. Saturation fails closed for all
+      // internal tools instead of evicting a fence and allowing late effects.
+      internalToolRegistrySaturated = true;
+      return;
+    }
   }
+  registeredInternalSessions.set(sessionID, { role, fenced: false });
+}
+
+/** Revoke all future tools before requesting runtime interruption. */
+export function fenceInternalToolSession(sessionID: string): void {
+  const entry = registeredInternalSessions.get(sessionID);
+  if (entry) entry.fenced = true;
+  else internalToolRegistrySaturated = true;
+}
+
+export function assertInternalToolRegistryAvailable(): void {
+  if (internalToolRegistrySaturated) throw new Error("internal tool registry saturated; fail-closed");
 }
 
 /** Resolve only control-plane metadata persisted on the session itself. */
 export function resolveInternalToolRole(metadata: unknown, sessionID?: string): InternalToolRole {
-  const expectedRole = sessionID ? registeredInternalSessions.get(sessionID) : undefined;
+  const expectedRole = sessionID ? registeredInternalSessions.get(sessionID)?.role : undefined;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     return expectedRole ? "ambiguous" : "external";
   }
@@ -49,8 +66,8 @@ export function resolveInternalToolRole(metadata: unknown, sessionID?: string): 
   const agentRole = meta["jev-agent-role"];
   const router = meta["jev-router"];
   const hasInternalClaim = router === INTERNAL_ROUTER_MARKER ||
-    (typeof role === "string" && INTERNAL_ROLES.has(role)) ||
-    (typeof agentRole === "string" && AGENT_ROLES.has(agentRole));
+    (typeof role === "string" && Object.hasOwn(INTERNAL_ROLES, role)) ||
+    (typeof agentRole === "string" && Object.hasOwn(AGENT_ROLES, agentRole));
 
   if (!hasInternalClaim) return expectedRole ? "ambiguous" : "external";
   if (router !== INTERNAL_ROUTER_MARKER) return "ambiguous";
@@ -65,7 +82,7 @@ export function resolveInternalToolRole(metadata: unknown, sessionID?: string): 
   return resolved;
 }
 
-function deny(reason: "session state unavailable" | "role metadata ambiguous" | "local read-only authority"): never {
+function deny(reason: "session state unavailable" | "role metadata ambiguous" | "local read-only authority" | "session fenced"): never {
   throw new Tool.Error({ message: `OPJEV_INTERNAL_TOOL_DENIED: ${reason}` });
 }
 
@@ -81,10 +98,15 @@ export async function enforceInternalToolAuthority(
 ): Promise<void> {
   const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
   if (!sessionID) deny("session state unavailable");
+  if (internalToolRegistrySaturated || registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
 
   let role: InternalToolRole;
   try {
-    role = resolveInternalToolRole((await ctx.session.get({ sessionID }) as any)?.metadata, sessionID);
+    const info = await ctx.session.get({ sessionID });
+    const metadata = info && typeof info === "object" && !Array.isArray(info) && "metadata" in info
+      ? info.metadata
+      : undefined;
+    role = resolveInternalToolRole(metadata, sessionID);
   } catch {
     deny("session state unavailable");
   }
@@ -92,6 +114,7 @@ export async function enforceInternalToolAuthority(
   if (role === "ambiguous") deny("role metadata ambiguous");
 
   const tool = typeof event.tool === "string" ? event.tool : "";
-  if (!TOOL_READ_ALLOWLIST.has(tool)) deny("local read-only authority");
+  if (!Object.hasOwn(TOOL_READ_ALLOWLIST, tool)) deny("local read-only authority");
 }
+
 import { Tool } from "@opencode/schema/tool";

@@ -522,6 +522,7 @@ export function summarizeAudit(db) {
     const workerSessionID = typeof record.workerSessionID === "string" ? record.workerSessionID :
       typeof state.executor?.sessionID === "string" ? state.executor.sessionID : undefined;
     const evidenceSessionID = typeof worker?.sessionID === "string" ? worker.sessionID : undefined;
+    const evidenceCurrent = evidence && evidence.round === state.round;
     const workerSessionConsistent = typeof workerSessionID === "string" &&
       evidenceSessionID === workerSessionID &&
       (typeof record.workerSessionID !== "string" || typeof state.executor?.sessionID !== "string" || record.workerSessionID === state.executor.sessionID);
@@ -538,65 +539,120 @@ export function summarizeAudit(db) {
         continue;
       }
       const key = JSON.stringify([item.round, item.sessionID]);
-      const group = workerRoundGroups.get(key) ?? { roundNumber: item.round };
+      const group = workerRoundGroups.get(key) ?? { roundNumber: item.round, counts: { round: 0, request: 0, outcome: 0 } };
       group[item.kind] = item;
+      group.counts[item.kind] += 1;
       workerRoundGroups.set(key, group);
     }
     const hasCompleteWorkerRound = group => !!group.round && !!group.request && !!group.outcome &&
+      group.counts.round === 1 && group.counts.request === 1 && group.counts.outcome === 1 &&
       typeof group.round.model === "string" && typeof group.round.agent === "string" &&
       group.round.model === group.request.model && group.round.agent === group.request.agent &&
       group.round.route === group.request.route &&
-      typeof group.outcome.model === "string" && typeof group.outcome.agent === "string";
+      typeof group.outcome.model === "string" && typeof group.outcome.agent === "string" &&
+      typeof group.outcome.acceptance === "boolean" && typeof group.outcome.failureClass === "string";
     const workerRounds = [...new Set([...workerRoundGroups.values()].map(group => group.roundNumber))];
+    const groupsByRound = round => [...workerRoundGroups.values()].filter(group => group.roundNumber === round);
+    const duplicateWorkerRound = workerRounds.some(round => groupsByRound(round).length !== 1);
     const historicalRoundNumbers = Number.isInteger(state.round) && state.round > 1
       ? workerRounds.filter(round => round >= 1 && round < state.round)
       : [];
     const incompleteHistoricalRound = Number.isInteger(state.round) && state.round > 1 &&
       (historicalRoundNumbers.length !== state.round - 1 ||
         [...workerRoundGroups.values()].some(group => group.roundNumber < state.round && !hasCompleteWorkerRound(group)));
-    const workerRoundsLinked = !malformedWorkerRoundFact && workerRoundGroups.size > 0 &&
-      !incompleteHistoricalRound && [...workerRoundGroups.values()].every(hasCompleteWorkerRound);
+    const history = Array.isArray(state.history) ? state.history : [];
+    const historyMismatch = history.some(entry => {
+      if (!entry || !Number.isInteger(entry.round)) return true;
+      if (!entry.verdict && !entry.outcome && !entry.executor) return false;
+      const groups = groupsByRound(entry.round);
+      const group = groups[0];
+      return groups.length !== 1 || !hasCompleteWorkerRound(group ?? {}) ||
+        !entry.executor || !entry.outcome || !entry.verdict ||
+        entry.executor.agent !== group.round.agent || entry.executor.model !== group.round.model ||
+        entry.executor.agent !== group.outcome.agent || entry.executor.model !== group.outcome.model ||
+        group.outcome.acceptance !== (entry.verdict.nextAction === "accept") ||
+        group.outcome.failureClass !== entry.verdict.failureClass;
+    });
+    const workerRoundsLinked = !malformedWorkerRoundFact && !duplicateWorkerRound && workerRoundGroups.size > 0 &&
+      !incompleteHistoricalRound && !historyMismatch && [...workerRoundGroups.values()].every(hasCompleteWorkerRound);
     const finalRoundGroup = Number.isInteger(workerRound) && typeof workerSessionID === "string"
       ? workerRoundGroups.get(JSON.stringify([workerRound, workerSessionID]))
       : undefined;
-    const linked = !!worker && Number.isInteger(workerRound) && typeof workerSessionID === "string" &&
+    const linked = !!worker && evidenceCurrent && Number.isInteger(workerRound) && typeof workerSessionID === "string" &&
       workerSessionConsistent && workerRoundsLinked &&
       hasCompleteWorkerRound(finalRoundGroup ?? {}) &&
       finalRoundGroup.outcome.model === worker.model && finalRoundGroup.outcome.agent === worker.agent;
-    const workerStarted = workerRounds.length > 0 ||
-      runObservations.some(item => item.role === "worker" && (item.kind === "request" || item.kind === "outcome")) ||
-      typeof record.workerSessionID === "string" || typeof state.executor?.sessionID === "string" || !!evidence;
+    const currentRoundSessions = new Set(workerRoundFacts
+      .filter(item => item.round === state.round && typeof item.sessionID === "string")
+      .map(item => item.sessionID));
+    const currentWorkerSessionID = workerSessionID ?? (currentRoundSessions.size === 1 ? [...currentRoundSessions][0] : undefined);
+    const currentWorkerStarted = !!evidenceCurrent || !!currentWorkerSessionID ||
+      currentRoundSessions.size > 0;
+    const expectedAgent = state.executor?.agent ?? record.selection?.agent;
+    const expectedModel = state.executor?.model ?? record.selection?.model;
+    const failureKinds = ["provider-error", "throttle", "quota-limit", "context-overflow", "operational-failure"];
+    const failureDomains = ["provider", "quota", "context", "execution", "operational"];
+    const hasGovernedFailure = runObservations.some(item =>
+      item.role === "worker" && item.round === state.round && item.sessionID === currentWorkerSessionID &&
+      item.agent === expectedAgent && item.model === expectedModel &&
+      failureKinds.includes(item.kind) && failureDomains.includes(item.failureDomain));
+    const ambiguousInterrupt = runObservations.some(item =>
+      ["worker", "critic", "orchestrator"].includes(item.role) && item.errorCode === "interrupt-unconfirmed");
+    const currentVerdictApplied = history.some(entry => entry?.round === state.round && entry.verdict) ||
+      (!history.length && !!state.lastVerdict);
+    const terminal = ["completed", "stopped", "awaiting-human"].includes(state.phase);
+    const preEvidenceFailure = state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
+      hasGovernedFailure && !ambiguousInterrupt;
+    const postEvidencePreVerdict = state.phase === "failed" && !!evidenceCurrent &&
+      !currentVerdictApplied && !ambiguousInterrupt;
+    const ambiguousRunState = state.phase === "running" && record.checkpoint === "run-failed" && currentWorkerStarted;
+    const pending = ["planning", "ready", "running", "evaluating", "repairing"].includes(state.phase) && !ambiguousRunState;
+    const evidenceInconsistency = incompleteHistoricalRound || historyMismatch || duplicateWorkerRound ||
+      terminal && (!evidenceCurrent || !currentVerdictApplied || !linked) ||
+      state.phase === "failed" && currentWorkerStarted && !evidenceCurrent &&
+        !hasGovernedFailure && !ambiguousInterrupt ||
+      state.phase === "failed" && !!evidenceCurrent && currentVerdictApplied && !linked;
     const maxObservedRound = workerRounds.length ? Math.max(...workerRounds) : 0;
     readRuns.push({
       phase: state.phase,
-      workerStarted,
+      checkpoint: record.checkpoint,
+      workerStarted: currentWorkerStarted,
       incompleteHistoricalRound,
       selectionVia: record.selection?.via,
       model: safeAggregateName(worker?.model) ?? safeAggregateName(record.selection?.model),
       agent: safeAggregateName(worker?.agent) ?? safeAggregateName(record.selection?.agent),
       route: safeAggregateName(runObservations.find(item => item.kind === "outcome" || item.kind === "request")?.route) ??
         safeAggregateName(record.selection?.route),
-      evidence: !!evidence,
+      evidence: !!evidenceCurrent,
       critic: typeof record.criticSessionID === "string" && !!criticCheck,
       criticStatus: criticCheck?.status,
-      verdict: !!state.lastVerdict,
+      verdict: currentVerdictApplied,
       linked,
       accepted: state.phase === "completed" && state.lastVerdict?.nextAction === "accept",
       budgetExceeded: Number.isInteger(state.contract?.maxRounds) && maxObservedRound > state.contract.maxRounds,
+      roundViolation: incompleteHistoricalRound || historyMismatch || duplicateWorkerRound,
+      preEvidenceFailure,
+      postEvidencePreVerdict,
+      ambiguousRunState,
+      pending,
+      ambiguousInterrupt,
+      evidenceInconsistency,
     });
   }
 
-  const terminalMissing = readRuns.filter(run =>
-    run.incompleteHistoricalRound ||
-    run.phase === "completed" && (!run.evidence || !run.verdict || !run.linked) ||
-    run.phase === "failed" && run.workerStarted && (!run.evidence || !run.verdict || !run.linked) ||
-    run.evidence && !run.linked,
-  ).length;
+  const terminalMissing = readRuns.filter(run => run.evidenceInconsistency).length;
   const observedRunIDs = new Set(observations.map(item => item?.runID).filter(value => typeof value === "string" && value.length > 0));
   const orphanedRunLinks = [...observedRunIDs]
     .filter(runID => !runExists.get(`${runPrefix}${runID}`)).length;
   const preWorkerFailures = readRuns.filter(run => run.phase === "failed" && !run.workerStarted && !run.evidence).length;
-  const missingLinks = terminalMissing + orphanedRunLinks + invalidRunRecords;
+  const governedPreEvidenceFailures = readRuns.filter(run => run.preEvidenceFailure).length;
+  const postEvidencePreVerdictFailures = readRuns.filter(run => run.postEvidencePreVerdict).length;
+  const pendingRuns = readRuns.filter(run => run.pending).length;
+  const ambiguousInterruptions = readRuns.filter(run => run.ambiguousInterrupt).length;
+  const ambiguousRuns = readRuns.filter(run => run.ambiguousRunState).length;
+  const evidenceInconsistencies = terminalMissing;
+  const roundViolations = readRuns.filter(run => run.roundViolation).length;
+  const missingLinks = evidenceInconsistencies + orphanedRunLinks + invalidRunRecords;
   const roundLimitViolations = readRuns.filter(run => run.budgetExceeded).length;
   const phases = Object.fromEntries(Object.entries(Object.groupBy(readRuns, run => run.phase ?? "unknown")).map(([phase, runs]) => [phase, runs.length]));
   const agents = [...new Set(readRuns.map(run => run.agent).filter(Boolean))].sort();
@@ -639,6 +695,13 @@ export function summarizeAudit(db) {
     linked: readRuns.filter(run => run.linked).length,
     missingLinks,
     preWorkerFailures,
+    governedPreEvidenceFailures,
+    postEvidencePreVerdictFailures,
+    pendingRuns,
+    ambiguousInterruptions,
+    ambiguousRuns,
+    evidenceInconsistencies,
+    roundViolations,
     orphanedRunLinks,
     roundLimitViolations,
     rounds: observationCount("round"),
@@ -657,7 +720,7 @@ export function summarizeAudit(db) {
     routes,
     tokenEntries: tokenEntries.length,
     tokenTotals,
-    auditFailed: missingLinks > 0 || roundLimitViolations > 0,
+    auditFailed: missingLinks > 0 || roundLimitViolations > 0 || roundViolations > 0 || ambiguousInterruptions > 0 || ambiguousRuns > 0,
   };
 }
 
@@ -670,6 +733,7 @@ async function audit() {
     const summary = summarizeAudit(db);
     console.log(`[opjev] read-only ledger: observations=${summary.observations}/${summary.capacity}; canonical runs inspected=${summary.canonicalRunsInspected} (latest 100); schema=${summary.schema}`);
     console.log(`[opjev] runs: completed=${summary.phases.completed ?? 0}; failed=${summary.phases.failed ?? 0}; pre-worker-failures=${summary.preWorkerFailures}; awaiting-human=${summary.phases["awaiting-human"] ?? 0}; jev-live-selection=${summary.viaJev}; heuristic-selection=${summary.viaHeuristic}`);
+    console.log(`[opjev] failures: governed-pre-evidence=${summary.governedPreEvidenceFailures}; post-evidence-pre-verdict=${summary.postEvidencePreVerdictFailures}; pending=${summary.pendingRuns}; ambiguous-interruptions=${summary.ambiguousInterruptions}; ambiguous-runs=${summary.ambiguousRuns}; evidence-inconsistencies=${summary.evidenceInconsistencies}; round-violations=${summary.roundViolations}`);
     console.log(`[opjev] evidence: packets=${summary.evidencePackets}; critic-checks=${summary.criticChecks}; critic-status={${summary.criticCounts.join(",") || "none"}}; verdicts=${summary.verdicts}; ledger-linked=${summary.linked}; missing-link=${summary.missingLinks}; orphaned-run-links=${summary.orphanedRunLinks}; invalid-run-records=${summary.invalidRunRecords}; round-limit-violations=${summary.roundLimitViolations}`);
     console.log(`[opjev] facts: rounds=${summary.rounds}; requests=${summary.requests}; outcomes=${summary.outcomes}; recovery=${summary.recoveries}; provider-failures=${summary.providerFailures}; operational-failures=${summary.operationalFailures}`);
     console.log(`[opjev] outcome facts: acceptance=true:${summary.acceptanceTrue},false:${summary.acceptanceFalse},unknown:${summary.outcomes - summary.acceptanceTrue - summary.acceptanceFalse}; failure-class={${summary.failureClasses.join(",") || "none"}}`);

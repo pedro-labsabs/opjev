@@ -676,7 +676,7 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
   // ─────────────────────────────────────────────────────────────────────────────
   // 10. Worker timeout / interrupted
   // ─────────────────────────────────────────────────────────────────────────────
-  it("Cenário 10: worker timeout/interrupted (interrupção bounded, deterministic check fail, fase failed sem hang)", async () => {
+  it("Cenário 10: um wait que rejeita sem confirmação não registra worker como interrompido", async () => {
     const m = await bootCtx({
       models: ALL_MODELS,
       storage: makeStorage({}),
@@ -687,11 +687,7 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
       },
     });
 
-    // Simulamos timeout disparando interrupt
     m.ctx.session.wait = async () => {
-      if (m.ctx.session.interrupt) {
-        await m.ctx.session.interrupt({ sessionID: "worker-1" });
-      }
       throw new Error("worker execution timed out after limit");
     };
 
@@ -705,8 +701,8 @@ describe("Issue #14 — Gate Definitivo de Estabilização E2E Multi-Round (17 C
     const res = await m.tools.orchestrate_once.execute({ contract: baseContract({ maxRounds: 2 }) });
     const out = JSON.parse(res.content);
 
-    assert.equal(out.phase, "failed", "timeout resulta em failed");
-    assert.equal(out.worker.outcome, "interrupted", "worker registrado como interrupted");
+    assert.equal(out.phase, "failed", "wait failure resulta em erro governado");
+    assert.equal(out.worker, undefined, "worker sem conclusão confirmada não é projetado como interrompido");
     assert.match(out.error ?? "", /timed out/, "erro diagnostico bounded");
   });
 

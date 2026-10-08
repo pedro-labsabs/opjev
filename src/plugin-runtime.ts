@@ -7,7 +7,7 @@ import { OrchestrationError, type ExecutionContract } from "./orchestration/type
 import { createFollowupTakeSeam } from "./orchestration/followup.ts";
 
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
-import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
+import { assertInternalToolRegistryAvailable, fenceInternalToolSession, registerInternalToolSession } from "./orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -455,21 +455,16 @@ export async function orchestrationRoleOf(ctx: any, sessionID: string, event: an
 export function makeWorkerRuntime(ctx: any): WorkerRuntime {
   return {
     async createWorker(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
         location: input.location,
-        // Logical role separada de jev-role (session kind continua worker):
-        // toda worker do dispatcher atua como implementer do ExecutionContract.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "implementer" },
-        // Implementer executa, nao delega: nega spawn arbitrario de subagents
-        // sem tocar nas demais permissoes da sessao (V2: "subagent").
         permissions: buildImplementerPermissionRules(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
-      }
+      if (!sessionID) throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
       registerInternalToolSession(sessionID, "worker");
       return { sessionID };
     },
@@ -494,7 +489,9 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
@@ -508,18 +505,16 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
 export function makeCriticRuntime(ctx: any): CriticRuntime {
   return {
     async createCritic(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
         location: input.location,
-        // Critic logico: mesma sessao kind critic, papel auditavel separado.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "critic" },
         permissions: buildCriticProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
-      }
+      if (!sessionID) throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
       registerInternalToolSession(sessionID, "critic");
       return { sessionID };
     },
@@ -544,7 +539,9 @@ export function makeCriticRuntime(ctx: any): CriticRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
@@ -560,6 +557,7 @@ export function makeCriticRuntime(ctx: any): CriticRuntime {
 export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
   return {
     async createOrchestrator(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
@@ -568,9 +566,7 @@ export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
         permissions: buildOrchestratorProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
-      }
+      if (!sessionID) throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
       registerInternalToolSession(sessionID, "orchestrator");
       return { sessionID };
     },
@@ -595,10 +591,13 @@ export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
+
 
 export function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDecisions {
   return {

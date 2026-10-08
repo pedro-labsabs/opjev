@@ -1,5 +1,5 @@
 # OPJEV dogfood quickstart
-> **BLOCKED:** the installed runtime and gateway reach OPJEV, but a live worker wait can exceed its 60-second deadline because the dispatcher waits for `session.interrupt()` before persisting timeout. Do not use this launcher for daily project work until that dispatcher issue is fixed and a completed operational smoke is verified.
+> **Operational smoke verified 2026-10-08; submitted for maintainer review.** A controlled ordinary-TUI task completed through live Jev, kernel, critic, and the canonical ledger. This does not count as natural dogfood or auto-approve dogfood readiness; see `docs/reports/dogfood-operational-readiness-2026-10-07.md`.
 
 ## Start and resume
 
@@ -37,7 +37,7 @@ While the TUI is open, in another terminal:
 opjev status
 ```
 
-While the TUI is open, `opjev status` in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. A successful smoke must show one interception, one admission, one dispatch, and zero duplicates/fail-closed events. Completed-run notices include a bounded worker result summary; the projection is covered by unit tests, but a completed live TUI smoke is still required. This environment remains blocked by the worker-interrupt timeout and missing verdict/outcome linkage documented in `docs/reports/dogfood-operational-readiness-2026-10-07.md`.
+While the TUI is open, `opjev status` in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. A controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events. The terminal result notice is retried until the parent TUI session is idle, then displays the completion, route, round, outcome, and bounded result. The 2026-10-08 operational smoke verified this presentation and a persisted accepted evidence/verdict/outcome join; it was synthetic, not natural dogfood. See the dated report for gates and limitations.
 
 For a sanitized, read-only aggregate of collection quality:
 
@@ -45,8 +45,8 @@ For a sanitized, read-only aggregate of collection quality:
 opjev audit
 ```
 
-The audit reads only the canonical `resource/usage-ledger/v1` and canonical run records. It reports the latest 100 runs by update time, ledger schema/capacity and size, live Jev versus heuristic selection, evidence/critic/verdict status, round-limit violations, per-kind observation counts, distinct session count, agent/model/route names, acceptance/failure-class aggregates, recovery counts, and runtime-provided token totals. It emits no prompts, result text, session IDs, or run IDs. A missing ledger, invalid schema/record, completed run without EvidencePacket/verdict/full linked round-request-outcome join, failed run with an observed worker round lacking that join, evidence without a complete join, orphaned ledger run ID, or round-limit violation is an audit failure. A failed run with no observed worker round is reported separately as a pre-worker failure, not misclassified as evidence loss. Lookups are bounded by the ledger's validated capacity (currently 2,048 run IDs) and the latest 100 canonical runs. The ledger is the single shared factual store; its fixed capacity can evict older observations under pressure.
-Missing linkage or incomplete round/request/outcome counts expose persisted gaps; the bounded ledger has no independent durable counter for facts lost before append or evicted under pressure, so an audit cannot prove zero silent loss.
+The audit reads only the canonical `resource/usage-ledger/v1` and canonical run records. It reports the latest 100 runs by update time, ledger schema/capacity and size, live Jev versus heuristic selection, evidence/critic/verdict status, round-limit violations, per-kind observation counts, distinct session count, agent/model/route names, acceptance/failure-class aggregates, recovery counts, and runtime-provided token totals. It emits no prompts, result text, session IDs, or run IDs. Failure categories distinguish pre-worker failures, governed failures before evidence, failures after evidence but before verdict, pending runs, ambiguous interruption/run state, inconsistent evidence, round violations, orphaned links, invalid records, and genuine missing links.
+Known failures before evidence or verdict are not automatically missing-link defects. An unexplained missing link on a completed/judged run, malformed or duplicate run-round facts, evidence inconsistent with canonical state, orphaned ledger data, or a round-limit violation is an audit failure. Pending and ambiguous runs remain separately visible.
 
 Each accepted run is persisted under `orchestration/run/<runID>` with its bounded EvidencePacket/verdict and the initial executor-decision provenance (`selection.via` distinguishes `jev` from the deterministic heuristic). Resource observations use the same `runID` and round, permitting the audit to check the join. Storage inspection is read-only; do not dump the database or clear the ledger.
 
@@ -54,7 +54,7 @@ Each accepted run is persisted under `orchestration/run/<runID>` with its bounde
 
 Use ordinary tasks in varied real projects: small implementation changes, tests, debugging, and documentation work. Submit them normally in the TUI; do not add an orchestration prefix, invoke an internal tool, or choose a collection mode. Let a task finish or produce its governed failure, then close the TUI normally. The gateway intercepts each user prompt; worker/critic/orchestrator sessions remain internal and use the existing contract, FREE_POOL, and round limit. Natural tasks, not the controlled smoke, are the dogfood corpus. Keep private project content, prompts, outputs, credentials, and raw database records out of reports.
 
-After a task batch, run `opjev audit`. A nonzero heuristic-selection count means at least one task used the local decision fallback; it is not evidence of a live Jev selection. Missing linkage means the outcome cannot be joined to its canonical run/evidence and must be treated as lost observation, not inferred.
+After a task batch, run `opjev audit`. A nonzero heuristic-selection count means at least one task used the local decision fallback; it is not evidence of a live Jev selection. Known pre-evidence/pre-verdict failures are reported by their stage, not mislabeled as missing links. An unexplained missing link for a run whose canonical state requires an outcome remains a failure; do not infer or fabricate the missing fact.
 
 ## Version and gateway diagnosis
 
