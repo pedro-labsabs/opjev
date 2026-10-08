@@ -62,15 +62,16 @@ These gates proved the tested boundaries only and did not supersede the failed s
 
 ## Verification on 2026-10-08
 
-**Status: BLOCKED.** The core timeout and audit corrections and automated gates pass, but the latest ordinary TUI attempts did not produce a new accepted verdict: one live Jev response violated the verdict invariants, and a subsequent controlled run was stopped after no visible progress. Three earlier synthetic accepted runs remain linked and persisted; the live judge reliability issue is unresolved. This is not natural dogfood or maintainer approval.
+**Status: BLOCKED.** The bounded timeout and audit corrections pass their regressions; typecheck, 797-test suite, routing, matrix, real multi-round and Context E2Es pass. The required gateway E2E failed three follow-up-consumption assertions, and the latest ordinary TUI attempts did not produce a new accepted verdict: one live Jev response violated the verdict invariants and a subsequent controlled run was stopped after no visible progress. Three earlier synthetic accepted runs remain linked and persisted. This is not natural dogfood or maintainer approval.
 
 ### Root causes and corrections
 
 - **Timeout and session authority:** the dispatcher waited for the timeout callback, which awaited the OpenCode interrupt RPC without an independent bound. An unresolved interrupt therefore defeated the worker/critic/orchestrator deadline. The timeout path now separately bounds interrupt confirmation and reports interruption only when the host explicitly confirms it. Review also found a tool authorization already awaiting session metadata could resume after fencing, and a host-reused fenced session ID could be accepted; authority now rechecks the fence after lookup and refuses fenced-ID reuse before dispatch. Registry saturation blocks new/ambiguous internal authorization while unambiguously external TUI sessions remain usable. Unconfirmed sessions cannot be reused. No retry, extra dispatch, or outcome is fabricated.
 - **Audit:** the previous summary treated every failed post-worker run without evidence, verdict, and outcome as a missing-link defect. Canonical checkpoints and persisted run/round facts now distinguish governed pre-evidence failures, post-evidence/pre-verdict failures, pending runs, ambiguous interruption, inconsistent evidence, and actual missing links. Malformed worker round facts still fail audit even alongside a valid operational failure. Before a verdict, outcome may be absent, but one round/request pair must link by session, round, agent, and route; scheduled model facts must agree. Multi-round history compares runtime-observed executor identity with observed outcome while round/request facts remain internally linked. OpenCode's observed model may differ from the scheduled model and remains recorded separately in the EvidencePacket. A further review-found false positive is fixed: a prior-round session ID is not proof a worker started in a failed new round; current-round facts/evidence control that classification.
+- Current-round governed failure observations also prove a worker started when `repair-same` reuses a previous session but current-round round/request facts are absent; a prior-round session ID alone never proves a new-round worker started.
 - **TUI completion:** terminal notices could be marked delivered while the parent session was still busy, so the toast could be lost. The TUI now retries until the parent session is idle and only then marks the notice seen. A post-fix ordinary TUI smoke visibly displayed the completed outcome and bounded result.
 
-RED-to-GREEN evidence: never-resolving worker/critic/orchestrator interrupts first exceeded the nominal timeout, then returned bounded and fenced without later dispatch/judgment/outcome. Review regressions reproduced authorization completing after a fence, reuse of a fenced session ID, external tools denied at internal-registry saturation, malformed facts hidden by pre-evidence classification, missing current round/request linkage after evidence, false historical mismatch on multi-round model substitution, and previous-round session identity misclassified as a new-round worker start; each passed after correction.
+RED-to-GREEN evidence: never-resolving worker/critic/orchestrator interrupts first exceeded the nominal timeout, then returned bounded and fenced without later dispatch/judgment/outcome. Review regressions reproduced authorization completing after a fence, reuse of a fenced session ID, external tools denied at internal-registry saturation, malformed facts hidden by pre-evidence classification, missing current round/request linkage after evidence, false historical mismatch on multi-round model substitution, prior-round identity misclassified as a new worker, and a current-round reused-session provider failure misclassified as pre-worker; each passed after correction.
 
 ### Controlled ordinary-TUI smoke
 
@@ -94,7 +95,7 @@ The late audit regression also verifies multi-round history against the runtime-
 | Command | Result |
 |---|---|
 | `npm run typecheck` | **PASS** |
-| `npm test` | **PASS** — 796 tests, 104 suites; 0 failures |
+| `npm test` | **PASS** — 797 tests, 104 suites; 0 failures |
 | `npm run evaluate:routing` | **PASS** — 11/11, fallback 4/4 |
 | `npm run e2e:matrix` | **PASS** — 17 scenarios |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **FAIL** — 57/60; three real follow-up-consumption assertions failed |

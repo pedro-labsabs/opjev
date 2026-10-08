@@ -599,6 +599,15 @@ export function summarizeAudit(db) {
     const currentRoundSessions = new Set(workerRoundFacts
       .filter(item => item.round === state.round && typeof item.sessionID === "string")
       .map(item => item.sessionID));
+    const failureKinds = ["provider-error", "throttle", "quota-limit", "context-overflow", "operational-failure"];
+    const failureDomains = ["provider", "quota", "context", "execution", "operational"];
+    const currentRoundFailureObservations = runObservations.filter(item =>
+      item.role === "worker" && item.round === state.round &&
+      failureKinds.includes(item.kind) && failureDomains.includes(item.failureDomain));
+    const currentRoundWorkerSessions = new Set([
+      ...currentRoundSessions,
+      ...currentRoundFailureObservations.map(item => item.sessionID).filter(value => typeof value === "string"),
+    ]);
     const persistedWorkerSessionID = typeof record.workerSessionID === "string" ? record.workerSessionID :
       typeof state.executor?.sessionID === "string" ? state.executor.sessionID : undefined;
     const priorRoundSessions = new Set(workerRoundFacts
@@ -608,22 +617,19 @@ export function summarizeAudit(db) {
       priorRoundSessions.has(persistedWorkerSessionID);
     const currentWorkerSessionID = evidenceCurrent && typeof evidenceSessionID === "string"
       ? evidenceSessionID
-      : currentRoundSessions.size === 1
-        ? [...currentRoundSessions][0]
-        : currentRoundSessions.size === 0 && typeof persistedWorkerSessionID === "string" &&
+      : currentRoundWorkerSessions.size === 1
+        ? [...currentRoundWorkerSessions][0]
+        : currentRoundWorkerSessions.size === 0 && typeof persistedWorkerSessionID === "string" &&
           (!persistedSessionIsPrior || state.phase === "running" && record.checkpoint === "run-failed")
           ? persistedWorkerSessionID
           : undefined;
-    const currentWorkerStarted = !!evidenceCurrent || currentRoundSessions.size > 0 ||
-      typeof currentWorkerSessionID === "string";
+    const currentWorkerStarted = !!evidenceCurrent || currentRoundWorkerSessions.size > 0 ||
+      currentRoundFailureObservations.length > 0 || typeof currentWorkerSessionID === "string";
     const expectedAgent = state.executor?.agent ?? record.selection?.agent;
     const expectedModel = state.executor?.model ?? record.selection?.model;
-    const failureKinds = ["provider-error", "throttle", "quota-limit", "context-overflow", "operational-failure"];
-    const failureDomains = ["provider", "quota", "context", "execution", "operational"];
-    const hasGovernedFailure = runObservations.some(item =>
-      item.role === "worker" && item.round === state.round && item.sessionID === currentWorkerSessionID &&
-      item.agent === expectedAgent && item.model === expectedModel &&
-      failureKinds.includes(item.kind) && failureDomains.includes(item.failureDomain));
+    const hasGovernedFailure = currentRoundFailureObservations.some(item =>
+      item.sessionID === currentWorkerSessionID &&
+      item.agent === expectedAgent && item.model === expectedModel);
     const ambiguousInterrupt = runObservations.some(item =>
       ["worker", "critic", "orchestrator"].includes(item.role) && item.errorCode === "interrupt-unconfirmed");
     const currentVerdictApplied = history.some(entry => entry?.round === state.round && entry.verdict) ||
