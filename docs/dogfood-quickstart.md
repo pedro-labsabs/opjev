@@ -37,7 +37,7 @@ While the TUI is open, in another terminal:
 opjev status
 ```
 
-`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled synthetic TUI run completed with a linked EvidencePacket, critic result, live Jev verdict, accepted outcome, and persistence after restart. Later runs exposed contradictory live Jev verdicts, correctly rejected without fabricating an outcome. The latest pinned gateway E2E was 55/60: seven provider 429 throttle observations caused the Resource Governor to deny further Jev spend; follow-up consumption and preterminal summary assertions did not pass. See the dated report. This is BLOCKED, not dogfood-ready.
+`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled synthetic TUI run completed with linked EvidencePacket, critic result, live Jev verdict, accepted outcome, and persistence after restart. Later live Jev responses were contradictory and correctly rejected without fabricating outcomes. The pinned gateway E2E now passes 60/60 using 45 completions from an ephemeral local model fixture; it verifies the real OpenCode 2.0.11 TUI/gateway path, single admission/dispatch, bounded summary RPC, and visible result. Its Jev is mocked; it is not the live-Jev smoke or natural dogfood. See the dated report.
 
 For a sanitized, read-only aggregate of collection quality:
 
