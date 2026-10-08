@@ -172,6 +172,20 @@ test("audit requires current round and request identity after evidence even befo
   assert.equal(summary.auditFailed, true);
 });
 
+test("audit preserves requested and observed model identities before a verdict", t => {
+  const run = auditRun("before-verdict-model-substitution", { phase: "failed", model: "observed-model", evidence: true, verdict: false });
+  run.record.checkpoint = "run-failed";
+  const observations = [
+    { kind: "round", runID: run.id, role: "worker", round: 1, model: "requested-model", agent: "build", sessionID: run.record.workerSessionID, route: "fast-coding" },
+    { kind: "request", runID: run.id, role: "worker", round: 1, model: "requested-model", agent: "build", sessionID: run.record.workerSessionID, route: "fast-coding" },
+  ];
+  const summary = summarizeAudit(createAuditDb(t, observations, [run]));
+
+  assert.equal(summary.postEvidencePreVerdictFailures, 1);
+  assert.equal(summary.linked, 0);
+  assert.equal(summary.missingLinks, 0);
+  assert.equal(summary.auditFailed, false);
+});
 test("audit classifies evidence without an applied verdict as a post-evidence failure", t => {
   const run = auditRun("before-verdict", { phase: "failed", evidence: true, verdict: false });
   run.record.checkpoint = "run-failed";

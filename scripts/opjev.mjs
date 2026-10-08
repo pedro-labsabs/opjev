@@ -581,13 +581,12 @@ export function summarizeAudit(db) {
     const currentEvidenceRoundGroup = Number.isInteger(workerRound) && typeof evidenceSessionID === "string"
       ? workerRoundGroups.get(JSON.stringify([workerRound, evidenceSessionID]))
       : undefined;
+    // OpenCode may substitute the observed model; the scheduled round and request must agree with each other.
     const currentEvidenceRoundFactsLinked = !!worker && workerSessionConsistent &&
       !!currentEvidenceRoundGroup &&
       currentEvidenceRoundGroup.counts.round === 1 &&
       currentEvidenceRoundGroup.counts.request === 1 &&
       currentEvidenceRoundGroup.counts.outcome === 0 &&
-      currentEvidenceRoundGroup.round.model === worker.model &&
-      currentEvidenceRoundGroup.request.model === worker.model &&
       currentEvidenceRoundGroup.round.agent === worker.agent &&
       currentEvidenceRoundGroup.request.agent === worker.agent &&
       currentEvidenceRoundGroup.round.model === currentEvidenceRoundGroup.request.model &&
