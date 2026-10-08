@@ -37,7 +37,7 @@ While the TUI is open, in another terminal:
 opjev status
 ```
 
-`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events; its accepted EvidencePacket/verdict/outcome join persisted after restart. Two later TUI runs returned contradictory live Jev verdicts, correctly rejected, and a separate run stopped before verdict. The latest unique smoke also showed exactly one intercept/admission/dispatch with no duplicates or fail-closed events. The gateway E2E passed 60/60; its earlier failure followed a worker operational failure at the configured 120-second deadline before evidence. The environment is for maintainer review, not READY FOR DOGFOOD. See the dated report for gates and risks.
+`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled synthetic TUI run completed with a linked EvidencePacket, critic result, live Jev verdict, accepted outcome, and persistence after restart. Later runs exposed contradictory live Jev verdicts, correctly rejected without fabricating an outcome. The latest pinned gateway E2E was 55/60: seven provider 429 throttle observations caused the Resource Governor to deny further Jev spend; follow-up consumption and preterminal summary assertions did not pass. See the dated report. This is BLOCKED, not dogfood-ready.
 
 For a sanitized, read-only aggregate of collection quality:
 
@@ -55,6 +55,8 @@ Each accepted run is persisted under `orchestration/run/<runID>` with its bounde
 Use ordinary tasks in varied real projects: small implementation changes, tests, debugging, and documentation work. Submit them normally in the TUI; do not add an orchestration prefix, invoke an internal tool, or choose a collection mode. Let a task finish or produce its governed failure, then close the TUI normally. The gateway intercepts each user prompt; worker/critic/orchestrator sessions remain internal and use the existing contract, FREE_POOL, and round limit. Natural tasks, not the controlled smoke, are the dogfood corpus. Keep private project content, prompts, outputs, credentials, and raw database records out of reports.
 
 After a task batch, run `opjev audit`. A nonzero heuristic-selection count means at least one task used the local decision fallback; it is not evidence of a live Jev selection. Known pre-evidence/pre-verdict failures are reported by their stage, not mislabeled as missing links. An unexplained missing link for a run whose canonical state requires an outcome remains a failure; do not infer or fabricate the missing fact.
+Provider throttles and `resource-budget` denials are governed failures, not accepted outcomes. Preserve the ledger; do not clear it or bypass the budget to force an E2E or smoke pass.
+
 
 ## Version and gateway diagnosis
 

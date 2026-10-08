@@ -43,7 +43,7 @@ In `src/orchestration/dispatcher.ts`, `withTimeout` awaits `onTimeout` before re
 
 The audit exposes bounded aggregate counts only. The ledger is the single factual shared store; it overwrites oldest observations at capacity and has no independent counter for observations lost before append or evicted under pressure. Missing run/outcome linkage is an audit failure, not a value to infer.
 
-## Automated gates
+## Automated gates — initial verification (2026-10-07)
 
 | Command | Result |
 |---|---|
@@ -62,7 +62,7 @@ These gates proved the tested boundaries only and did not supersede the failed s
 
 ## Verification on 2026-10-08
 
-**Status: PASS PARA REVISÃO DO MANTENEDOR (not READY FOR DOGFOOD).** Timeout/fencing and audit regressions pass. On this source HEAD, typecheck, 800 tests, routing, matrix, gateway, real multi-round, Context E2E, and `git diff --check` pass. A controlled ordinary-TUI accepted run remains linked and persisted. Three later controlled tasks include two contradictory live Jev responses (rejected fail-closed) and one stopped pre-verdict run. These failures remain visible; no natural dogfood has been collected. This is not maintainer approval.
+**Status: BLOCKED.** Timeout/fencing and audit regressions pass. On the latest code HEAD, typecheck, 800 tests, routing, matrix, real multi-round, and Context E2E passed. The latest pinned gateway E2E failed 5 of 60 checks after seven provider 429 throttle observations triggered the existing `resource-budget:rate-high,adaptive-round-cap` denial. Follow-up consumption and the TUI's preterminal summary were not proven in that run. The earlier accepted ordinary-TUI result remains a persisted controlled synthetic run, but later live Jev contradictions and provider throttling remain unresolved. No natural dogfood was collected. No policy, authority, or budget was weakened.
 
 ### Root causes and corrections
 
@@ -100,12 +100,12 @@ The late audit regression also verifies multi-round history against the runtime-
 | `npm test` | **PASS** — 800 tests, 104 suites; 0 failures |
 | `npm run evaluate:routing` | **PASS** — 11/11, fallback 4/4 |
 | `npm run e2e:matrix` | **PASS** — 17 scenarios |
-| `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **PASS** — 60/60; all follow-up-consumption assertions passed on rerun |
+| `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:gateway` | **FAIL** — 55/60. Seven provider 429 throttle observations caused the existing Resource Governor to reject further Jev spend; follow-up consumption and preterminal summary checks did not pass. |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:multiround-real` | **PASS** — 18/18; live Jev/SystemOne case and controlled timeout boundaries |
 | `OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:context` | **PASS** — OpenCode 2.0.11; 2 turns, 4 requests |
 | `git diff --check` | **PASS** |
 
-The first gateway E2E attempt was 57/60: the two follow-up records remained unconsumed and the worker input lacked the follow-up. Read-only inspection of that isolated run showed `failed`, round 1, no critic/evidence/verdict/history, and a worker `operational-failure` 120,018 ms after its request; persisted and observed worker session/agent/model identities matched. This matches the fixture's configured 120,000 ms worker deadline. The model-side reason is not present in the sanitized ledger. The run ended before it could reach the next worker prompt, so that attempt did not prove a follow-up-delivery defect. A rerun on this HEAD passed 60/60, including all 13 follow-up assertions, durable consumption, and exactly-once delivery to the real OpenCode 2.0.11 worker input. Rerun summary: `/tmp/opjev-e2e/runs/2026-10-08T16-50-24-811Z/e2e-result.json`.
+The latest pinned gateway E2E is reproducible at `/tmp/opjev-e2e/runs/2026-10-08T17-25-15-521Z/e2e-result.json`. It recorded seven bounded `throttle` observations with `failureDomain=provider`, `signal=throttle`, and `statusCode=429`, plus two provider retry observations. Two attached follow-ups remained unconsumed because their runs stopped at the Jev-decision budget check after worker evidence and critic checks; no verdict/outcome was invented. The TUI scenario was also denied before a canonical run record existed, so all 17 summary RPC responses for its session were unavailable and no preterminal projection was observed. The admission failure notice was still shown; this proves fail-closed reporting, not completion. No production policy or budget was changed and no storage was cleared.
 
 These automated gates are distinct from the controlled ordinary-TUI smoke and from future natural dogfood. The stable executable is `/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11`, SHA-256 `0ed7d8546cf24acc41e6371ec30928ed931ec1474e1a54bbecdde8e0dd801d2f`; the global OpenCode 2.0.18 installation remains untouched.
 
