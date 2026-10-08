@@ -34,6 +34,7 @@ const KINDS = new Set<ObservationKind>([
 ]);
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
+const MAX_IDENTITY = 200; // Matches the bounded run/session identity contracts.
 const SAFE_ERROR_CODES = new Set(["FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "429", "529"]);
 const TOKEN_KEYS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 const ROUTES = new Set(["fast-coding", "heavy-reasoning", "research-docs"]);
@@ -50,7 +51,8 @@ export function sanitizeObservation(value: unknown): UsageObservation {
   if (typeof x.at === "number" && Number.isFinite(x.at)) out.at = x.at;
   for (const key of STRINGS) if (typeof x[key] === "string" && (x[key] as string).length) {
     if (key === "errorCode" && !SAFE_ERROR_CODES.has(x[key] as string)) continue;
-    (out as any)[key] = (x[key] as string).slice(0, MAX_TEXT);
+    const limit = key === "runID" || key === "sessionID" ? MAX_IDENTITY : MAX_TEXT;
+    (out as any)[key] = (x[key] as string).slice(0, limit);
   }
   if (ROUTES.has(String(x.route))) out.route = x.route as UsageObservation["route"];
   if (["worker", "critic", "orchestrator", "jev", "provider", "unknown"].includes(String(x.role))) out.role = x.role as UsageObservation["role"];

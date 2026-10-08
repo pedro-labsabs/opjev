@@ -80,6 +80,24 @@ describe("execution summary", () => {
     assert.notEqual(limited.outcome, failed.outcome);
   });
 
+  it("includes the bounded worker result in the completed TUI summary", () => {
+    const result = summarizeExecutionRun({
+      updatedAt: 1000,
+      state: state("completed", {
+        evidence: { resultSummary: "OPJEV_SMOKE_RESULT" },
+        contract: { objective: "private objective", maxRounds: 4 },
+      }),
+    }, 1000);
+    assert.equal(result.detail, "Result: OPJEV_SMOKE_RESULT");
+    assert.equal(JSON.stringify(result).includes("private objective"), false);
+
+    const bounded = summarizeExecutionRun({
+      updatedAt: 1000,
+      state: state("completed", { evidence: { resultSummary: "R".repeat(500) } }),
+    }, 1000);
+    assert.equal(bounded.detail.length, 200);
+  });
+
   it("gracefully reports missing, malformed, stale, and changing state as unavailable", () => {
     const summarize = (record, now = 1000) => {
       assert.doesNotThrow(() => summarizeExecutionRun(record, now));

@@ -1,0 +1,83 @@
+# OPJEV dogfood quickstart
+> **BLOCKED:** the installed runtime and gateway reach OPJEV, but a live worker wait can exceed its 60-second deadline because the dispatcher waits for `session.interrupt()` before persisting timeout. Do not use this launcher for daily project work until that dispatcher issue is fixed and a completed operational smoke is verified.
+
+## Start and resume
+
+From any project directory, run the dedicated command:
+
+```sh
+cd /path/to/project
+opjev
+```
+
+`opjev` uses the pinned OpenCode 2.0.11 binary and a private profile under `~/.local/share/opjev-dogfood/profile`. It starts one loopback OpenCode server and one local gateway, connects the TUI with `--server <gateway>`, and stops both children when the TUI exits. The gateway default is explicitly `orchestrate`; ordinary prompts need no prefix or internal tool call. The server/TUI plugin is installed into the isolated profile, not into global OpenCode or the project. The project's files and `opencode.json` are not modified.
+
+To continue the last session after restarting:
+
+```sh
+cd /path/to/project
+opjev --continue
+```
+
+To resume a known OpenCode session:
+
+```sh
+opjev --session SESSION_ID
+```
+
+The session database persists at `~/.local/share/opjev-dogfood/profile/.local/share/opencode/opencode.db`. Closing the TUI normally, or pressing Ctrl-C, stops only processes launched by this foreground command. No daemon or systemd service is installed.
+
+The launcher checks the pinned CLI SHA-256/version, server `/api/info`, admission RPC registration, and an authenticated structured Jev response before opening the TUI. It reads `OPENCODE_API_KEY` from the current environment or the existing private `~/.config/opencode/env`; it never copies the key into the profile, configuration, command arguments, or logs. A failed Jev check blocks startup. The server plugin is configured for `jev-1.13-free` at `https://opencode.ai/zen/v1/systemone`, and Context Management is explicitly `observe`; Model Intelligence remains in its existing observe-only behavior. The plugin's separate auto-route hook is disabled so the gateway is the only user-prompt admission path.
+
+## Confirm operation
+
+While the TUI is open, in another terminal:
+
+```sh
+opjev status
+```
+
+While the TUI is open, `opjev status` in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. A successful smoke must show one interception, one admission, one dispatch, and zero duplicates/fail-closed events. Completed-run notices include a bounded worker result summary; the projection is covered by unit tests, but a completed live TUI smoke is still required. This environment remains blocked by the worker-interrupt timeout and missing verdict/outcome linkage documented in `docs/reports/dogfood-operational-readiness-2026-10-07.md`.
+
+For a sanitized, read-only aggregate of collection quality:
+
+```sh
+opjev audit
+```
+
+The audit reads only the canonical `resource/usage-ledger/v1` and canonical run records. It reports the latest 100 runs by update time, ledger schema/capacity and size, live Jev versus heuristic selection, evidence/critic/verdict status, round-limit violations, per-kind observation counts, distinct session count, agent/model/route names, acceptance/failure-class aggregates, recovery counts, and runtime-provided token totals. It emits no prompts, result text, session IDs, or run IDs. A missing ledger, invalid schema/record, completed run without EvidencePacket/verdict/full linked round-request-outcome join, failed run with an observed worker round lacking that join, evidence without a complete join, orphaned ledger run ID, or round-limit violation is an audit failure. A failed run with no observed worker round is reported separately as a pre-worker failure, not misclassified as evidence loss. Lookups are bounded by the ledger's validated capacity (currently 2,048 run IDs) and the latest 100 canonical runs. The ledger is the single shared factual store; its fixed capacity can evict older observations under pressure.
+Missing linkage or incomplete round/request/outcome counts expose persisted gaps; the bounded ledger has no independent durable counter for facts lost before append or evicted under pressure, so an audit cannot prove zero silent loss.
+
+Each accepted run is persisted under `orchestration/run/<runID>` with its bounded EvidencePacket/verdict and the initial executor-decision provenance (`selection.via` distinguishes `jev` from the deterministic heuristic). Resource observations use the same `runID` and round, permitting the audit to check the join. Storage inspection is read-only; do not dump the database or clear the ledger.
+
+## Daily dogfood
+
+Use ordinary tasks in varied real projects: small implementation changes, tests, debugging, and documentation work. Submit them normally in the TUI; do not add an orchestration prefix, invoke an internal tool, or choose a collection mode. Let a task finish or produce its governed failure, then close the TUI normally. The gateway intercepts each user prompt; worker/critic/orchestrator sessions remain internal and use the existing contract, FREE_POOL, and round limit. Natural tasks, not the controlled smoke, are the dogfood corpus. Keep private project content, prompts, outputs, credentials, and raw database records out of reports.
+
+After a task batch, run `opjev audit`. A nonzero heuristic-selection count means at least one task used the local decision fallback; it is not evidence of a live Jev selection. Missing linkage means the outcome cannot be joined to its canonical run/evidence and must be treated as lost observation, not inferred.
+
+## Version and gateway diagnosis
+
+Use `opjev`, not the global `opencode`, for instrumented work. The global command remains unchanged and is not routed through OPJEV. Verify the installed binary without exposing credentials:
+
+```sh
+~/.local/share/opjev-dogfood/runtime/opencode-2.0.11 --version
+sha256sum ~/.local/share/opjev-dogfood/runtime/opencode-2.0.11
+opjev status
+```
+The version-pinned executable was installed from the official `@opencode/cli-linux-x64@2.0.11` package. Expected SHA-256: `0ed7d8546cf24acc41e6371ec30928ed931ec1474e1a54bbecdde8e0dd801d2f`. The `opjev` wrapper lives at `~/.local/bin/opjev`; the global `opencode` executable is untouched.
+
+
+Expected CLI output is `opencode v2.0.11`; the server is independently checked at `/api/info` before TUI startup. A `BLOCKED` startup message identifies the failing preflight without printing process logs or credential contents. Gateway interception/dispatch counts of zero mean no ordinary prompt passed through the gateway. A heuristic-selection count means Jev was not used for that run; inspect only sanitized audit aggregates and resolve authentication/connectivity before continuing dogfood.
+
+The gateway and server bind to `127.0.0.1` on dynamically allocated ports. `opjev status` reports a running session or refuses an additional launcher while one is active. A normal TUI close releases the launcher lock; after a forced shutdown, the launcher fails closed if any recorded PID is active. A stale lock is never removed automatically: if `opjev status` reports a stale lock and all managed PIDs are confirmed absent, remove only `~/.local/share/opjev-dogfood/active.json` before restarting. Do not kill the global OpenCode processes.
+
+## Restore
+
+The existing global OpenCode binary, configuration, plugins, sessions, and credentials are not changed. To disable the dedicated launcher while preserving its session history and evidence, close the TUI and rename only its wrapper:
+
+```sh
+mv ~/.local/bin/opjev ~/.local/bin/opjev.disabled
+```
+
+The global `opencode` command then remains available as before, but is uninstrumented and does not collect OPJEV observations. Keep the isolated profile/database as a backup. If removing the dogfood installation later, first close the launcher and move `~/.local/share/opjev-dogfood` to a backup location; do not delete it until its sessions and evidence are no longer needed. The generated isolated OpenCode config refuses unexpected edits instead of overwriting them.

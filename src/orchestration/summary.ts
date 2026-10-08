@@ -89,9 +89,13 @@ export function summarizeExecutionRun(record: unknown, now = Date.now()): Execut
       : phase === "failed" ? "failed"
       : phase === "stopped" ? "stopped"
       : limitReached ? "limit-reached" : undefined;
+    const evidence = run.evidence && typeof run.evidence === "object" && !Array.isArray(run.evidence)
+      ? run.evidence as Record<string, unknown> : undefined;
+    const resultSummary = phase === "completed" ? text(evidence?.resultSummary, 192) : undefined;
     const detail = limitReached ? "Round limit reached; awaiting human review"
       : phase === "awaiting-human" ? "Awaiting human review"
       : phase === "stopped" ? "Execution safely stopped"
+      : phase === "completed" ? (resultSummary ? `Result: ${resultSummary}` : undefined)
       : lastError || (pendingHuman ? text(pendingHuman.reason, 200) : undefined);
     const recoveryEvents = history.slice(-20).flatMap((entry: unknown) => {
       if (!entry || typeof entry !== "object") return [];

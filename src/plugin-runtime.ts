@@ -2,7 +2,7 @@ import { FREE_POOL, isFreeModel, splitModelRef, type FreeModel, type RouteKind, 
 
 import { chainFor, decideGeneric, decideRoute } from "./router.ts";
 
-import { type CriticRuntime, type DispatcherDecisions, type DispatcherDeps, type OrchestratorRuntime, type WorkerRuntime, type WorkerSessionView } from "./orchestration/dispatcher.ts";
+import { type CriticRuntime, type DispatcherDecisions, type DispatcherDeps, type ExecutorSelection, type OrchestratorRuntime, type WorkerRuntime, type WorkerSessionView } from "./orchestration/dispatcher.ts";
 import { OrchestrationError, type ExecutionContract } from "./orchestration/types.ts";
 import { createFollowupTakeSeam } from "./orchestration/followup.ts";
 
@@ -793,6 +793,24 @@ export function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>,
 }
 
 /** Persistencia minima bounded: orchestration/run/<runID>. Best-effort. */
+function projectExecutorSelection(value: unknown): Pick<ExecutorSelection, "agent" | "model" | "via" | "route" | "confidence" | "overridden"> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const x = value as Record<string, unknown>;
+  if (
+    typeof x.agent !== "string" ||
+    typeof x.model !== "string" ||
+    (x.via !== "jev" && x.via !== "heuristic")
+  ) return undefined;
+  return {
+    agent: x.agent.slice(0, 120),
+    model: x.model.slice(0, 160),
+    via: x.via,
+    ...(typeof x.route === "string" ? { route: x.route.slice(0, 80) } : {}),
+    ...(typeof x.confidence === "number" && Number.isFinite(x.confidence) ? { confidence: x.confidence } : {}),
+    ...(typeof x.overridden === "boolean" ? { overridden: x.overridden } : {}),
+  };
+}
+
 export async function persistOrchestrationRun(
   ctx: any,
   input: {
@@ -803,12 +821,15 @@ export async function persistOrchestrationRun(
     orchestratorSessionID?: string;
     state: any;
     at: number;
+    selection?: ExecutorSelection;
   },
 ): Promise<void> {
   const key = `orchestration/run/${input.runID}`;
   const prior: any = await safeStorageGet(ctx, key);
+  const selection = projectExecutorSelection(input.selection) ?? projectExecutorSelection(prior?.selection);
   await ctx.storage.set(key, {
     ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior : {}),
+    ...(selection ? { selection } : {}),
     checkpoint: input.kind,
     state: input.state,
     workerSessionID: input.workerSessionID,
@@ -820,12 +841,19 @@ export async function persistOrchestrationRun(
 
 export function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDeps {
   const dir = orchestrationDirectory(ctx);
+  const decisions = makeDispatcherDecisions(ctx, opts, getKey);
+  let selection: ExecutorSelection | undefined;
+  const selectExecutor = decisions.selectExecutor;
+  decisions.selectExecutor = async (input) => {
+    selection = await selectExecutor(input);
+    return selection;
+  };
   return {
     runtime: makeWorkerRuntime(ctx),
     critic: makeCriticRuntime(ctx),
     orchestrator: makeOrchestratorRuntime(ctx),
-    decisions: makeDispatcherDecisions(ctx, opts, getKey),
-    persist: (p) => persistOrchestrationRun(ctx, p),
+    decisions,
+    persist: (p) => persistOrchestrationRun(ctx, { ...p, ...(selection ? { selection } : {}) }),
     resourceBudget: (input) => evaluateResourceBudget(ctx.storage, input),
     observeResource: createBoundedStorageObservationSink(ctx, {
       get: async (key) => await safeStorageGet(ctx, key),
@@ -855,6 +883,7 @@ export function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, g
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
   };
 }
+
 
 export function recordRuntimeResource(ctx: any, observation: Record<string, unknown>): Promise<void> {
   // Ordinary retry telemetry is best effort; hard policy branches may await this bounded sink.

@@ -42,6 +42,18 @@ test("sanitizer only keeps factual scalar fields and observed token counters", (
   assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "token=secret" }), false);
 });
 
+test("sanitizer preserves contract-sized run and session identities", () => {
+  const runID = "r".repeat(200);
+  const sessionID = "s".repeat(200);
+  const exact = sanitizeObservation({ kind: "request", runID, sessionID });
+  const over = sanitizeObservation({ kind: "request", runID: `${runID}x`, sessionID: `${sessionID}x` });
+
+  assert.equal(exact.runID, runID);
+  assert.equal(exact.sessionID, sessionID);
+  assert.equal(over.runID, runID);
+  assert.equal(over.sessionID, sessionID);
+});
+
 test("pressure dimensions keep provenance/confidence separate; quota is unknown without official limit evidence", () => {
   const empty = estimateResourcePressure(aggregateUsage([], { from: 0, to: 100 }));
   assert.equal(empty.quota.level, "unknown");
