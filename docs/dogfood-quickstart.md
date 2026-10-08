@@ -1,5 +1,5 @@
 # OPJEV dogfood quickstart
-> **Operational smoke verified 2026-10-08; submitted for maintainer review.** A controlled ordinary-TUI task completed through live Jev, kernel, critic, and the canonical ledger. This does not count as natural dogfood or auto-approve dogfood readiness; see `docs/reports/dogfood-operational-readiness-2026-10-07.md`.
+> **Controlled accepted TUI smoke verified 2026-10-08; live-judge reliability remains BLOCKED.** Three earlier synthetic runs have linked accepted outcomes, but later ordinary TUI attempts exposed a contradictory live Jev verdict and a stopped run. See `docs/reports/dogfood-operational-readiness-2026-10-07.md`. This is not natural dogfood or maintainer approval.
 
 ## Start and resume
 
@@ -37,7 +37,7 @@ While the TUI is open, in another terminal:
 opjev status
 ```
 
-While the TUI is open, `opjev status` in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. A controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events. The terminal result notice is retried until the parent TUI session is idle, then displays the completion, route, round, outcome, and bounded result. The 2026-10-08 operational smoke verified this presentation and a persisted accepted evidence/verdict/outcome join; it was synthetic, not natural dogfood. See the dated report for gates and limitations.
+`opjev` status in another terminal reports the active launcher and loopback ports. When the TUI closes, the foreground `opjev` terminal prints sanitized gateway totals: orchestrate interceptions, admissions, RPC dispatches, duplicate suppression, and fail-closed requests. An earlier controlled successful run showed one interception, one admission, one dispatch, and zero duplicates/fail-closed events, and its accepted EvidencePacket/verdict/outcome join persisted after restart. Later ordinary TUI attempts show that a live Jev judgement can still return contradictory verdict fields; the kernel rejects these without fabricating acceptance. The environment remains blocked for unattended dogfood until that reliability issue is resolved. See the dated report for gates and limitations.
 
 For a sanitized, read-only aggregate of collection quality:
 
