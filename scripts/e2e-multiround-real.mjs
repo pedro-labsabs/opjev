@@ -1442,7 +1442,7 @@ async function main() {
     const workerSession = runState.workerSessionID && getSessionsForRun(homeDir, runID).find((s) => s.id === runState.workerSessionID);
     const timeoutDiagnostic = String(runState.state.lastError ?? "").includes("excedeu 60000ms");
     const outcomeInterrupted = workerSession?.outcome === "interrupted";
-    const interruptObserved = /interrompido best-effort/i.test(String(runState.state.lastError ?? ""));
+    const interruptObserved = /interrupcao confirmada/i.test(String(runState.state.lastError ?? ""));
     const workerCount = getSessionsForRun(homeDir, runID).filter((s) => s.role === "worker").length;
     const noExtraRounds = runState.state.round === 1;
     const noExtraWorker = workerCount === 1;

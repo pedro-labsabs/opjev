@@ -51,6 +51,16 @@ export async function composeExecutionNoticeFromLookup(
   }
 }
 
+/** Only publish a terminal notice when the parent TUI can render it. */
+export function renderExecutionNoticeIfReady(
+  status: unknown,
+  render: () => void,
+): "shown" | "retry" {
+  if (status !== "idle") return "retry";
+  render();
+  return "shown";
+}
+
 /** Applies the same display text to each route retry and the scheduled refresh. */
 export async function deliverExecutionNoticeWithRetry(input: {
   displayNotice: string;

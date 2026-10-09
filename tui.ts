@@ -31,7 +31,7 @@ import { ExecutionSummaryRpc } from "./src/orchestration/execution-summary-rpc.t
 import { createActiveSummaryPoller } from "./src/orchestration/active-summary-poller.ts";
 import { selectUnpresentedNotices } from "./src/orchestration/presentation-reconcile.ts";
 import type { ExecutionSummary } from "./src/orchestration/summary.ts";
-import { composeExecutionNoticeFromLookup, deliverExecutionNoticeWithRetry, formatActiveExecutionSummary } from "./src/orchestration/summary-presentation.ts";
+import { composeExecutionNoticeFromLookup, deliverExecutionNoticeWithRetry, formatActiveExecutionSummary, renderExecutionNoticeIfReady } from "./src/orchestration/summary-presentation.ts";
 
 /** Cap do dedupe client-side (bounded; FIFO). */
 const SEEN_CAP = 64;
@@ -207,21 +207,21 @@ export default Plugin.define({
         status = "unknown";
       }
       trace("render", { sessionID, status, currentSessionID });
-
       const outcome = phase === "completed" ? "Completed"
         : phase === "failed" ? "Failed"
         : phase === "stopped" ? "Safely stopped"
         : phase === "limit-reached" ? "Limit reached"
         : phase === "awaiting-human" ? "Human review required"
         : "Execution update";
-      ctx.ui.toast.show({
-        title: `Orchestration · ${outcome}`,
-        message: String(notice ?? "").slice(0, 2000),
-        variant: phase === "failed" || phase === "stopped" ? "error"
-          : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
-        duration: TOAST_DURATION_MS,
+      return renderExecutionNoticeIfReady(status, () => {
+        ctx.ui.toast.show({
+          title: `Orchestration · ${outcome}`,
+          message: String(notice ?? "").slice(0, 2000),
+          variant: phase === "failed" || phase === "stopped" ? "error"
+            : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
+          duration: TOAST_DURATION_MS,
+        });
       });
-      return "shown";
     };
 
     /**
@@ -241,20 +241,23 @@ export default Plugin.define({
           try {
             const route = ctx.ui.router.current();
             if (route?.type !== "session" || String(route.sessionID) !== sessionID) return;
+            const status = String(ctx.data.session.status(sessionID));
             const outcome = phase === "completed" ? "Completed"
               : phase === "failed" ? "Failed"
               : phase === "stopped" ? "Safely stopped"
               : phase === "limit-reached" ? "Limit reached"
         : phase === "awaiting-human" ? "Human review required"
               : "Execution update";
-            ctx.ui.toast.show({
-              title: `Orchestration · ${outcome}`,
-              message: String(notice ?? "").slice(0, 2000),
-              variant: phase === "failed" || phase === "stopped" ? "error"
-                : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
-              duration: TOAST_DURATION_MS,
+            const delivered = renderExecutionNoticeIfReady(status, () => {
+              ctx.ui.toast.show({
+                title: `Orchestration · ${outcome}`,
+                message: String(notice ?? "").slice(0, 2000),
+                variant: phase === "failed" || phase === "stopped" ? "error"
+                  : phase === "awaiting-human" || phase === "limit-reached" ? "warning" : "success",
+                duration: TOAST_DURATION_MS,
+              });
             });
-            trace("toast-refreshed", { sessionID, attempt: i });
+            if (delivered === "shown") trace("toast-refreshed", { sessionID, attempt: i });
           } catch {
             // refresh best-effort: nunca propaga
           }

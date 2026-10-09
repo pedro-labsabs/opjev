@@ -747,7 +747,7 @@ describe("RESUME: runOrchestrationResume (scheduler compartilhado, seam unico)",
     expectCode(() => validateResumableRunState(pauseByHuman(), "outro-run"), "invalid-resumable-run");
   });
 
-  it("RESUME4: falha apos o resume persiste run-failed (storage nunca mostra ready enquanto a API falha)", async () => {
+  it("RESUME4: failed prompt checkpoint preserves a running worker when completion is unconfirmed", async () => {
     const { t, state } = await pausedRun({ maxRounds: 3, judgeSeq: [humanAnswers()], promptErrorAt: 1 });
     const res = await resume(t, state, resumeDecision(state));
     assert.equal(res.phase, "failed", "resultado comunica a falha");
@@ -758,7 +758,7 @@ describe("RESUME: runOrchestrationResume (scheduler compartilhado, seam unico)",
     assert.equal(t.persistCalls[hd].state.phase, "ready", "autoridade aplicada antes de executar");
     const last = t.persistCalls[t.persistCalls.length - 1];
     assert.equal(last.kind, "run-failed", "ultima verdade do store e run-failed");
-    assert.equal(last.state.phase, "failed", "store em failed, nunca ready");
+    assert.equal(last.state.phase, "running", "worker state remains ambiguous rather than falsely interrupted or finished");
     assert.ok(!t.persistCalls.some((c, i) => i > hd && c.state.phase === "ready"), "nenhuma escrita ready apos a falha");
   });
 

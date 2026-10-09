@@ -433,9 +433,56 @@ async function main() {
   await new Promise((resolve) => jevServer.listen(0, "127.0.0.1", resolve));
   const jevPort = jevServer.address().port;
   log(`Jev SystemOne mock deterministico em :${jevPort}`);
+  // Keep the isolated gateway E2E independent of external model capacity while
+  // still exercising the real OpenCode 2.0.11 worker/critic sessions.
+  let modelProviderCompletions = 0;
+  const providerServer = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url?.includes("/models")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: "nemotron-3.5-lightning-free", object: "model" }] }));
+      return;
+    }
+    if (!req.url?.includes("/chat/completions")) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "gateway E2E fixture endpoint not found" }));
+      return;
+    }
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", async () => {
+      const rawBody = Buffer.concat(chunks).toString("utf8");
+      let body = {};
+      try { body = JSON.parse(rawBody); } catch {}
+      modelProviderCompletions += 1;
+      const isCritic = rawBody.includes("verifier/critic") || rawBody.includes("findings") || rawBody.includes("critic");
+      if (!isCritic) await sleep(3000);
+      const content = isCritic ? JSON.stringify({ findings: [] }) : "Implementation completed with objective evidence.";
+      const id = `chatcmpl-gateway-${modelProviderCompletions}`;
+      const created = Math.floor(Date.now() / 1000);
+      const chunk = (delta, finishReason = null) => JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: body.model ?? "gateway-e2e",
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+      });
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      res.write(`data: ${chunk({ role: "assistant" })}\n\n`);
+      res.write(`data: ${chunk({ content })}\n\n`);
+      res.write(`data: ${chunk({}, "stop")}\n\n`);
+      res.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise((resolve, reject) => {
+    providerServer.once("error", reject);
+    providerServer.listen(0, "127.0.0.1", resolve);
+  });
+  const providerPort = providerServer.address().port;
+  log(`OpenCode local completion fixture em :${providerPort}`);
 
   const opencodeConfig = {
     $schema: "https://opencode.ai/config.json",
+    provider: { opencode: { options: { baseURL: `http://127.0.0.1:${providerPort}` } } },
     plugins: [
       {
         package: "./plugins/opencode-jev-free-router",
@@ -450,19 +497,20 @@ async function main() {
       },
     ],
   };
+
   fs.writeFileSync(path.join(projectDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
   installServerPluginToProject(projectDir, REPO);
 
   // ---------------------------------------------------- 1. upstream serve
   const upPort = await freePort();
   const upstreamEnv = {
+    OPENCODE_API_KEY: "local-gateway-e2e-only",
     PATH: process.env.PATH ?? "",
     HOME: homeDir,
     OPJEV_JEV_ENDPOINT: `http://127.0.0.1:${jevPort}/v1/systemone`,
     OPJEV_WORKER_TIMEOUT_MS: process.env.OPJEV_WORKER_TIMEOUT_MS ?? "120000",
     // Trace da apresentacao (lado server: registro do RPC e resultado do emit).
     OPJEV_TUI_TRACE: tuiTracePath,
-    ...(process.env.OPENCODE_API_KEY ? { OPENCODE_API_KEY: process.env.OPENCODE_API_KEY } : {}),
   };
   log(`subindo upstream v2.0.11 em :${upPort} (HOME ${homeDir})`);
   const up = spawnCapture(
@@ -1534,6 +1582,7 @@ async function main() {
       failClosed: gwCount("rpc-failed") + gwCount("admission-unknown"),
       rejected: gwCount("rejected"),
       execEvents: sseEvents.filter((e) => e.type.includes("execution.")).length,
+      modelProviderCompletions,
       sniff: {
         reqs: sniffCount((e) => e.dir === "req"),
         patchInbox: sniffCount(
@@ -1588,6 +1637,8 @@ async function main() {
   try {
     jevServer.closeAllConnections?.();
     jevServer.close();
+    providerServer.closeAllConnections?.();
+    providerServer.close();
   } catch {
     // ja fechado
   }

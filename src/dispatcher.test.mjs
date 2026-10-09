@@ -906,7 +906,7 @@ function fakeDeps(over = {}) {
       effects.push("context");
       return over.messages ?? [{ type: "assistant", content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }] }];
     },
-    interrupt: async () => { effects.push("interrupt"); },
+    interrupt: async () => { effects.push("interrupt"); return true; },
     ...over.runtime,
   };
   // Critic isolado: sessao distinta, efeitos observaveis e configuravel. O
@@ -955,7 +955,7 @@ function fakeDeps(over = {}) {
       effects.push("critic-context");
       return nextCriticMessages();
     },
-    interrupt: async () => { effects.push("critic-interrupt"); },
+    interrupt: async () => { effects.push("critic-interrupt"); return true; },
     ...over.critic,
   };
   let judgeSeq = 0;
@@ -1053,7 +1053,7 @@ function fakeDeps(over = {}) {
       effects.push("orchestrator-context");
       return nextOrchestratorMessages();
     },
-    interrupt: async () => { effects.push("orchestrator-interrupt"); },
+    interrupt: async () => { effects.push("orchestrator-interrupt"); return true; },
     ...over.orchestrator,
   };
   const persistCalls = [];
@@ -1411,6 +1411,101 @@ describe("runOrchestrationOnce: failed worker / verdicts nao-accept / timeout / 
     assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhum loop de nova sessao");
   });
 
+  it("P3b: timeout bounded when interrupt never resolves; worker remains ambiguous and run does not continue", async () => {
+    const t = fakeDeps({ waitBlocks: true });
+    let interruptCalls = 0;
+    t.runtime.interrupt = async () => {
+      interruptCalls += 1;
+      return await new Promise(() => {});
+    };
+    const observations = [];
+    const resultOrTimeout = await Promise.race([
+      runOrchestrationOnce(contract(), {
+        runtime: t.runtime,
+        critic: t.critic,
+        decisions: t.decisions,
+        workerTimeoutMs: 20,
+        persist: t.persist,
+        observeResource: (item) => observations.push(item),
+      }),
+      new Promise((resolve) => setTimeout(() => resolve("still-pending"), 1500)),
+    ]);
+
+    assert.notEqual(resultOrTimeout, "still-pending", "timeout must not await a non-settling interrupt");
+    assert.equal(resultOrTimeout.phase, "failed");
+    assert.equal(resultOrTimeout.worker, undefined, "unknown worker outcome must not be reported as interrupted");
+    assert.match(resultOrTimeout.error, /interrupcao nao confirmada/i);
+    assert.equal(interruptCalls, 1);
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.includes("judge"), false, "no judgment or follow-up dispatch after unresolved worker");
+    assert.equal(observations.some((item) => item.kind === "outcome"), false);
+    const failureCheckpoint = t.persistCalls.findLast((item) => item.kind === "run-failed");
+    assert.equal(failureCheckpoint.state.phase, "running", "unconfirmed worker is not recorded as interrupted/finished");
+    assert.equal(failureCheckpoint.workerSessionID, "w1");
+  });
+
+  it("P3c: confirmed timeout records interruption and still stops before recovery dispatch", async () => {
+    const t = fakeDeps({ waitBlocks: true });
+    t.runtime.interrupt = async () => true;
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      workerTimeoutMs: 20,
+      persist: t.persist,
+    });
+
+    assert.equal(result.phase, "failed");
+    assert.equal(result.worker.outcome, "interrupted");
+    assert.equal(result.round, 1);
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
+  it("C6b: critic interrupt pending blocks Jev judgment and later worker dispatch", async () => {
+    const t = fakeDeps({ criticWaitBlocks: true });
+    t.critic.interrupt = async () => await new Promise(() => {});
+    const resultOrTimeout = await Promise.race([
+      runOrchestrationOnce(contract({ maxRounds: 2 }), {
+        runtime: t.runtime,
+        critic: t.critic,
+        decisions: t.decisions,
+        criticTimeoutMs: 20,
+        persist: t.persist,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve("still-pending"), 1500)),
+    ]);
+
+    assert.notEqual(resultOrTimeout, "still-pending", "critic timeout must remain bounded");
+    assert.equal(resultOrTimeout.phase, "failed");
+    assert.equal(resultOrTimeout.verdict, undefined);
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.includes("judge"), false);
+    assert.equal(t.effects.filter((effect) => effect === "critic-create").length, 1);
+  });
+
+  it("O-timeout: orchestrator interrupt pending is bounded and never dispatches another worker", async () => {
+    const t = fakeDeps({ judgeAnswers: replanAnswers() });
+    t.orchestrator.wait = async () => await new Promise(() => {});
+    t.orchestrator.interrupt = async () => await new Promise(() => {});
+    const resultOrTimeout = await Promise.race([
+      runOrchestrationOnce(contract({ maxRounds: 2 }), {
+        runtime: t.runtime,
+        critic: t.critic,
+        orchestrator: t.orchestrator,
+        decisions: t.decisions,
+        orchestratorTimeoutMs: 20,
+        persist: t.persist,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve("still-pending"), 1500)),
+    ]);
+
+    assert.notEqual(resultOrTimeout, "still-pending", "orchestrator timeout must remain bounded");
+    assert.equal(resultOrTimeout.phase, "failed");
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.includes("orchestrator-get"), false);
+    assert.equal(t.effects.includes("orchestrator-context"), false);
+  });
   it("P4: createWorker falha -> phase failed, judge nunca chamado", async () => {
     const t = fakeDeps({ createError: new Error("session.create quebrou") });
     const result = await runOrchestrationOnce(contract(), { runtime: t.runtime, critic: t.critic, decisions: t.decisions });

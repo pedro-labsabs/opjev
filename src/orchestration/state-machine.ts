@@ -28,6 +28,8 @@ import {
 } from "./types.ts";
 import { buildHumanRequest, validateHumanDecision } from "./human-gate.ts";
 
+
+export type TransitionCommands = TransitionResult["commands"];
 // ───────────────────────── politica de rodadas ─────────────────────────
 //
 // Regra documentada de incremento de `round`:

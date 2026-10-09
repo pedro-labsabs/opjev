@@ -28,7 +28,7 @@ import {
   type NextAction,
   type RunState,
 } from "./types.ts";
-import { createRunState, transitionRun } from "./state-machine.ts";
+import { createRunState, transitionRun, type TransitionCommands } from "./state-machine.ts";
 import { validateResumableRunState } from "./human-gate.ts";
 import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
@@ -65,7 +65,7 @@ export interface WorkerRuntime {
   wait(input: { sessionID: string }): Promise<void>;
   get(input: { sessionID: string }): Promise<WorkerSessionView>;
   context(input: { sessionID: string }): Promise<unknown[]>;
-  interrupt?(input: { sessionID: string }): Promise<void>;
+  interrupt?(input: { sessionID: string }): Promise<boolean>;
 }
 
 export interface WorkerSessionView {
@@ -92,7 +92,7 @@ export interface OrchestratorRuntime {
   wait(input: { sessionID: string }): Promise<void>;
   get(input: { sessionID: string }): Promise<OrchestratorSessionView>;
   context(input: { sessionID: string }): Promise<unknown[]>;
-  interrupt?(input: { sessionID: string }): Promise<void>;
+  interrupt?(input: { sessionID: string }): Promise<boolean>;
 }
 
 export interface OrchestratorSessionView {
@@ -120,7 +120,7 @@ export interface CriticRuntime {
   wait(input: { sessionID: string }): Promise<void>;
   get(input: { sessionID: string }): Promise<CriticSessionView>;
   context(input: { sessionID: string }): Promise<unknown[]>;
-  interrupt?(input: { sessionID: string }): Promise<void>;
+  interrupt?(input: { sessionID: string }): Promise<boolean>;
 }
 
 export interface CriticSessionView {
@@ -252,6 +252,9 @@ async function observeResource(deps: DispatcherDeps, observation: Record<string,
 function resourceErrorObservation(error: unknown, at: number, identity: Record<string, unknown>): Record<string, unknown> {
   const e = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const rawCode = typeof e.code === "string" ? e.code : typeof e.name === "string" ? e.name : "";
+  if (rawCode.endsWith("-interrupt-unconfirmed")) {
+    return { ...identity, at, kind: "operational-failure", errorCode: "interrupt-unconfirmed", failureDomain: "operational" };
+  }
   const code = /freeusagelimit/i.test(rawCode) ? "FreeUsageLimitError" : "";
   const response = e.response && typeof e.response === "object" ? e.response as Record<string, unknown> : {};
   const status = Number(e.status ?? e.statusCode ?? response.status);
@@ -365,29 +368,72 @@ export function extractFinalAssistantText(messages: unknown[]): string {
   return "";
 }
 
+const INTERRUPT_CONFIRMATION_TIMEOUT_MS = 1_000;
+
+function isInterruptUnconfirmed(error: unknown): boolean {
+  return error instanceof OrchestrationError && error.code.endsWith("-interrupt-unconfirmed");
+}
+
 function withTimeout<T>(
   op: () => Promise<T>,
   timeoutMs: number,
-  onTimeout?: () => Promise<void> | void,
+  onTimeout?: () => Promise<boolean> | boolean,
   opts?: { code?: string; label?: string },
 ): Promise<T> {
   const code = opts?.code ?? "worker-timeout";
   const label = opts?.label ?? "worker";
   return new Promise<T>((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let confirmationTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     let settled = false;
-    const cleanup = () => { if (timer) clearTimeout(timer); };
-    timer = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearTimeout(confirmationTimer);
+    };
+    const finishTimeout = (confirmed: boolean) => {
       if (settled) return;
       settled = true;
-      Promise.resolve()
-        .then(() => (onTimeout ? onTimeout() : undefined))
-        .catch(() => undefined)
-        .finally(() => reject(new OrchestrationError(code, `execucao do ${label} excedeu ${timeoutMs}ms; ${label} interrompido best-effort`)));
+      cleanup();
+      reject(new OrchestrationError(
+        confirmed ? code : `${code}-interrupt-unconfirmed`,
+        `execucao do ${label} excedeu ${timeoutMs}ms; ${
+          confirmed ? "interrupcao confirmada" : "interrupcao nao confirmada; sessao cercada contra novas tools"
+        }`,
+      ));
+    };
+    timer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      let interruption: Promise<boolean>;
+      try {
+        interruption = Promise.resolve(onTimeout ? onTimeout() : false).then(
+          (confirmed) => confirmed === true,
+          () => false,
+        );
+      } catch {
+        interruption = Promise.resolve(false);
+      }
+      if (!onTimeout) {
+        finishTimeout(false);
+        return;
+      }
+      confirmationTimer = setTimeout(() => finishTimeout(false), INTERRUPT_CONFIRMATION_TIMEOUT_MS);
+      void interruption.then(finishTimeout);
     }, timeoutMs);
-    op().then(
-      (v) => { if (!settled) { settled = true; cleanup(); resolve(v); } },
-      (e) => { if (!settled) { settled = true; cleanup(); reject(e); } },
+    void Promise.resolve().then(op).then(
+      (value) => {
+        if (settled || timedOut) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled || timedOut) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
     );
   });
 }
@@ -496,9 +542,9 @@ async function failRun(
     orchestratorSessionID?: string;
   },
 ): Promise<OrchestrationRunResult> {
-  // Blocker B (#11 fix): planning tambem transita (kernel aceita COMMAND_FAILED
-  // em planning — RP8). Sem transicao quando a phase nao suporta, exatamente
-  // como antes (outros fail paths inalterados sem o 5o argumento).
+  // COMMAND_FAILED is kernel-legal only in supported phases. A running worker
+  // with unconfirmed interruption stays `running`; its failed checkpoint and
+  // fenced session expose ambiguity without asserting completion/interruption.
   let failed: RunState = state;
   let failedPhase: RunState["phase"] = "failed";
   try {
@@ -510,8 +556,7 @@ async function failRun(
     }
   } catch { /* kernel barrier */ }
   if (persistFailure) {
-    // Estado failed persistido explicitamente: store nunca fica em planning/
-    // ready apos failure observavel. Clock injetado (deps.now ?? Date.now).
+    // Preserve the canonical state when the kernel cannot safely transition it.
     const at = persistFailure.deps.now?.() ?? Date.now();
     await persist(persistFailure.deps, {
       kind: persistFailure.kind,
@@ -681,7 +726,7 @@ async function executeSchedule(
         critic: NonNullable<OrchestrationRunResult["critic"]>;
         evidence: EvidencePacket;
         verdict: JevVerdict;
-        transition: { commands: ReturnType<typeof transitionRun>["commands"] };
+        transition: { commands: TransitionCommands };
       }
   > {
     try {
@@ -828,6 +873,7 @@ async function executeSchedule(
     // 4. EXECUTION_STARTED + prompt (initial ou correction) + wait/get/context
     let view: WorkerSessionView;
     let messages: unknown[];
+    let workerWaitCompleted = false;
     try {
       state = transitionRun(state, {
         type: "EXECUTION_STARTED",
@@ -933,20 +979,18 @@ async function executeSchedule(
         }
         throw promptErr;
       }
-      await withTimeout(() => deps.runtime.wait({ sessionID: workerSessionID }), timeoutMs, () => deps.runtime.interrupt?.({ sessionID: workerSessionID }));
+      await withTimeout(() => deps.runtime.wait({ sessionID: workerSessionID }), timeoutMs, () => deps.runtime.interrupt?.({ sessionID: workerSessionID }) ?? false);
+      workerWaitCompleted = true;
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
-      // running -> interrupted -> evaluating -> COMMAND_FAILED -> failed.
-      // Persiste run-failed: storage nunca fica em ready quando a API falha.
-      let interrupted = false;
-      try {
-        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "interrupted" }).state;
-        interrupted = true;
-      } catch { /* kernel barrier */ }
-      if (interrupted) {
-        try { state = transitionRun(state, { type: "COMMAND_FAILED", command: "dispatch", error: bounded(err) }).state; } catch {}
+      const interruptionConfirmed = err instanceof OrchestrationError && err.code === "worker-timeout";
+      if (interruptionConfirmed || workerWaitCompleted) {
+        try {
+          state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: interruptionConfirmed ? "interrupted" : "failed" }).state;
+          state = transitionRun(state, { type: "COMMAND_FAILED", command: "dispatch", error: bounded(err) }).state;
+        } catch { /* kernel barrier */ }
       }
       return {
         abort: true,
@@ -955,7 +999,7 @@ async function executeSchedule(
           contract.runID,
           err,
           {
-            worker: { sessionID: workerSessionID, agent: roundAgent, model: roundModel, outcome: "interrupted", finalText: "" },
+            ...(interruptionConfirmed ? { worker: { sessionID: workerSessionID, agent: roundAgent, model: roundModel, outcome: "interrupted" as const, finalText: "" } } : {}),
             rounds,
           },
           { deps, kind: "run-failed", workerSessionID },
@@ -1031,6 +1075,8 @@ async function executeSchedule(
       outcome: "failed",
       findingsCount: 0,
     };
+    let criticInterruptUnconfirmed = false;
+    let criticInterruptError: unknown;
     try {
       const created = await deps.critic.createCritic({
         agent,
@@ -1066,7 +1112,7 @@ async function executeSchedule(
       await withTimeout(
         () => deps.critic.wait({ sessionID: createdSessionID }),
         criticTimeoutMs,
-        () => deps.critic.interrupt?.({ sessionID: createdSessionID }),
+        () => deps.critic.interrupt?.({ sessionID: createdSessionID }) ?? false,
         { code: "critic-timeout", label: "critic" },
       );
       const cView = await deps.critic.get({ sessionID: createdSessionID });
@@ -1110,15 +1156,11 @@ async function executeSchedule(
       }
     } catch (err) {
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round }));
-      criticProj = {
-        sessionID: criticSessionID ?? "",
-        agent,
-        model,
-        outcome: "failed",
-        findingsCount: 0,
-      };
-      // Sem loop, sem segunda sessao, sem finding fabricado: falha bounded, o
-      // Jev ainda recebe a evidence final (com critic-session-outcome=fail).
+      criticInterruptUnconfirmed = isInterruptUnconfirmed(err);
+      criticInterruptError = err;
+      if (!criticInterruptUnconfirmed && criticSessionID) {
+        criticProj = { sessionID: criticSessionID, agent, model, outcome: "failed", findingsCount: 0 };
+      }
       criticCheck = criticOutcomeCheck("fail", `critic ${bounded(err)}`);
     }
 
@@ -1148,6 +1190,18 @@ async function executeSchedule(
       };
     }
     await persist(deps, { kind: "evidence-ready", runID: contract.runID, workerSessionID, criticSessionID, state, at: now() });
+    if (criticInterruptUnconfirmed) {
+      return {
+        abort: true,
+        result: await failRun(
+          state,
+          contract.runID,
+          criticInterruptError,
+          { evidence, worker: { sessionID: workerSessionID, agent, model, outcome, finalText }, rounds },
+          { deps, kind: "run-failed", workerSessionID, criticSessionID },
+        ),
+      };
+    }
 
     // 6. judge + fencing / revision check
     let answers: unknown;
@@ -1686,7 +1740,8 @@ async function executeSchedule(
         await withTimeout(
           () => deps.orchestrator.wait({ sessionID: orchestratorSessionID }),
           orchestratorTimeoutMs,
-          () => deps.orchestrator.interrupt?.({ sessionID: orchestratorSessionID }),
+          () => deps.orchestrator.interrupt?.({ sessionID: orchestratorSessionID }) ?? false,
+          { code: "orchestrator-timeout", label: "orchestrator" },
         );
         // Blocker A (#11 fix): outcome da sessao real governa. failed/
         // interrupted NUNCA instalam residual JSON — falha bounded antes de

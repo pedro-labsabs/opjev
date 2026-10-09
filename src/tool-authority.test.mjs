@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import {
   PROVIDER_COMPATIBILITY_PERMISSIONS,
   enforceInternalToolAuthority,
+  fenceInternalToolSession,
   registerInternalToolSession,
   resolveInternalToolRole,
 } from "./orchestration/tool-authority.ts";
+import { makeWorkerRuntime } from "./plugin-runtime.ts";
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
 
 const INTERNAL = "orchestration-internal";
@@ -114,5 +116,131 @@ describe("separação entre tool visibility e local authority", () => {
   it("não confunde uma sessão externa sem metadata opcional com role interno", async () => {
     const ctx = { session: { get: async () => ({ id: "plain-session" }) } };
     assert.equal(await simulateToolCall(ctx, "plain-session", "edit"), 1);
+  });
+
+  it("fences a worker before a non-settling runtime interrupt so no later tool runs", async () => {
+    const sessionID = `fenced-worker-${Date.now()}`;
+    const ctx = {
+      session: {
+        create: async () => ({ id: sessionID }),
+        get: async () => sessionInfo("worker", "implementer"),
+        interrupt: async () => await new Promise(() => {}),
+      },
+    };
+    const runtime = makeWorkerRuntime(ctx);
+    await runtime.createWorker({
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      metadata: {},
+    });
+    void runtime.interrupt({ sessionID });
+
+    let toolSideEffects = 0;
+    await assert.rejects(
+      (async () => {
+        await enforceInternalToolAuthority(ctx, { sessionID, tool: "edit" });
+        toolSideEffects += 1;
+      })(),
+      /interrupt|fenced/i,
+    );
+    assert.equal(toolSideEffects, 0);
+  });
+  it("revoca uma autorização cujo metadata lookup termina depois do fencing", async () => {
+    const sessionID = `fenced-during-get-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker");
+    let finishGet;
+    let getStarted;
+    const started = new Promise(resolve => { getStarted = resolve; });
+    const ctx = {
+      session: {
+        get: async () => {
+          getStarted();
+          return await new Promise(resolve => { finishGet = resolve; });
+        },
+      },
+    };
+    const authorization = enforceInternalToolAuthority(ctx, { sessionID, tool: "edit" });
+    await started;
+    fenceInternalToolSession(sessionID);
+    finishGet(sessionInfo("worker", "implementer"));
+
+    await assert.rejects(authorization, /session fenced/);
+  });
+
+  it("recusa reutilizar um ID de sessão já fenced", async () => {
+    const sessionID = `reused-fenced-${Date.now()}`;
+    let createCalls = 0;
+    const ctx = {
+      session: {
+        create: async () => {
+          createCalls += 1;
+          return { id: sessionID };
+        },
+        get: async () => sessionInfo("worker", "implementer"),
+        interrupt: async () => ({ interrupted: false }),
+      },
+    };
+    const runtime = makeWorkerRuntime(ctx);
+    const input = { agent: "build", model: { providerID: "opencode", id: "big-pickle" }, metadata: {} };
+    await runtime.createWorker(input);
+    assert.equal(await runtime.interrupt({ sessionID }), false);
+
+    await assert.rejects(runtime.createWorker(input), /fenced|reuse/i);
+    assert.equal(createCalls, 2);
+  });
+
+
+  it("reports interruption only when the OpenCode response confirms it", async () => {
+    let response;
+    let sequence = 0;
+    const ctx = {
+      session: {
+        create: async () => ({ id: `interrupt-confirm-${Date.now()}-${++sequence}` }),
+        get: async () => sessionInfo("worker", "implementer"),
+        interrupt: async () => response,
+      },
+    };
+    const expected = [
+      [{ interrupted: true }, true],
+      [{ interrupted: false }, false],
+      [undefined, false],
+      [{ interrupted: "true" }, false],
+    ];
+
+    for (const [apiResponse, confirmed] of expected) {
+      response = apiResponse;
+      const runtime = makeWorkerRuntime(ctx);
+      const { sessionID } = await runtime.createWorker({
+        agent: "build",
+        model: { providerID: "opencode", id: "big-pickle" },
+        metadata: {},
+      });
+      assert.equal(await runtime.interrupt({ sessionID }), confirmed);
+    }
+  });
+  it("does not let internal-registry saturation disable tools for external TUI sessions", async () => {
+    for (let index = 0; index < 5000; index += 1) {
+      const sessionID = `saturation-${Date.now()}-${index}`;
+      try {
+        registerInternalToolSession(sessionID, "worker");
+      } catch (error) {
+        assert.match(String(error), /saturat/i);
+        break;
+      }
+      fenceInternalToolSession(sessionID);
+      fenceInternalToolSession(sessionID);
+    }
+    const ctx = { session: { get: async ({ sessionID }) => sessionID === "external-after-saturation"
+      ? { metadata: {} }
+      : sessionInfo("worker", "implementer") } };
+
+    await assert.doesNotReject(enforceInternalToolAuthority(ctx, {
+      sessionID: "external-after-saturation",
+      tool: "edit",
+    }));
+    await assert.rejects(enforceInternalToolAuthority(ctx, {
+      sessionID: "internal-after-saturation",
+      tool: "edit",
+    }), /fenced|saturat/i);
   });
 });

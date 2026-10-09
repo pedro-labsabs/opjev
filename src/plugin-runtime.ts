@@ -2,12 +2,12 @@ import { FREE_POOL, isFreeModel, splitModelRef, type FreeModel, type RouteKind, 
 
 import { chainFor, decideGeneric, decideRoute } from "./router.ts";
 
-import { type CriticRuntime, type DispatcherDecisions, type DispatcherDeps, type OrchestratorRuntime, type WorkerRuntime, type WorkerSessionView } from "./orchestration/dispatcher.ts";
+import { type CriticRuntime, type DispatcherDecisions, type DispatcherDeps, type ExecutorSelection, type OrchestratorRuntime, type WorkerRuntime, type WorkerSessionView } from "./orchestration/dispatcher.ts";
 import { OrchestrationError, type ExecutionContract } from "./orchestration/types.ts";
 import { createFollowupTakeSeam } from "./orchestration/followup.ts";
 
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
-import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
+import { assertInternalToolRegistryAvailable, fenceInternalToolSession, registerInternalToolSession } from "./orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -455,21 +455,16 @@ export async function orchestrationRoleOf(ctx: any, sessionID: string, event: an
 export function makeWorkerRuntime(ctx: any): WorkerRuntime {
   return {
     async createWorker(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
         location: input.location,
-        // Logical role separada de jev-role (session kind continua worker):
-        // toda worker do dispatcher atua como implementer do ExecutionContract.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "implementer" },
-        // Implementer executa, nao delega: nega spawn arbitrario de subagents
-        // sem tocar nas demais permissoes da sessao (V2: "subagent").
         permissions: buildImplementerPermissionRules(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
-      }
+      if (!sessionID) throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
       registerInternalToolSession(sessionID, "worker");
       return { sessionID };
     },
@@ -494,7 +489,9 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
@@ -508,18 +505,16 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
 export function makeCriticRuntime(ctx: any): CriticRuntime {
   return {
     async createCritic(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
         location: input.location,
-        // Critic logico: mesma sessao kind critic, papel auditavel separado.
         metadata: { ...input.metadata, [JEV_AGENT_ROLE]: "critic" },
         permissions: buildCriticProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
-      }
+      if (!sessionID) throw new OrchestrationError("critic-create-failed", "ctx.session.create nao retornou id (critic)");
       registerInternalToolSession(sessionID, "critic");
       return { sessionID };
     },
@@ -544,7 +539,9 @@ export function makeCriticRuntime(ctx: any): CriticRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
@@ -560,6 +557,7 @@ export function makeCriticRuntime(ctx: any): CriticRuntime {
 export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
   return {
     async createOrchestrator(input) {
+      assertInternalToolRegistryAvailable();
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
@@ -568,9 +566,7 @@ export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
         permissions: buildOrchestratorProviderPermissions(),
       });
       const sessionID = String(info?.id ?? "");
-      if (!sessionID) {
-        throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
-      }
+      if (!sessionID) throw new OrchestrationError("orchestrator-create-failed", "ctx.session.create nao retornou id (orchestrator)");
       registerInternalToolSession(sessionID, "orchestrator");
       return { sessionID };
     },
@@ -595,10 +591,13 @@ export function makeOrchestratorRuntime(ctx: any): OrchestratorRuntime {
       return Array.isArray(out) ? out : [];
     },
     async interrupt({ sessionID }) {
-      await ctx.session.interrupt?.({ sessionID });
+      fenceInternalToolSession(sessionID);
+      const response: unknown = await ctx.session.interrupt?.({ sessionID });
+      return typeof response === "object" && response !== null && "interrupted" in response && response.interrupted === true;
     },
   };
 }
+
 
 export function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDecisions {
   return {
@@ -793,6 +792,24 @@ export function makeDispatcherDecisions(ctx: any, opts: Required<RouterOptions>,
 }
 
 /** Persistencia minima bounded: orchestration/run/<runID>. Best-effort. */
+function projectExecutorSelection(value: unknown): Pick<ExecutorSelection, "agent" | "model" | "via" | "route" | "confidence" | "overridden"> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const x = value as Record<string, unknown>;
+  if (
+    typeof x.agent !== "string" ||
+    typeof x.model !== "string" ||
+    (x.via !== "jev" && x.via !== "heuristic")
+  ) return undefined;
+  return {
+    agent: x.agent.slice(0, 120),
+    model: x.model.slice(0, 160),
+    via: x.via,
+    ...(typeof x.route === "string" ? { route: x.route.slice(0, 80) } : {}),
+    ...(typeof x.confidence === "number" && Number.isFinite(x.confidence) ? { confidence: x.confidence } : {}),
+    ...(typeof x.overridden === "boolean" ? { overridden: x.overridden } : {}),
+  };
+}
+
 export async function persistOrchestrationRun(
   ctx: any,
   input: {
@@ -803,12 +820,15 @@ export async function persistOrchestrationRun(
     orchestratorSessionID?: string;
     state: any;
     at: number;
+    selection?: ExecutorSelection;
   },
 ): Promise<void> {
   const key = `orchestration/run/${input.runID}`;
   const prior: any = await safeStorageGet(ctx, key);
+  const selection = projectExecutorSelection(input.selection) ?? projectExecutorSelection(prior?.selection);
   await ctx.storage.set(key, {
     ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior : {}),
+    ...(selection ? { selection } : {}),
     checkpoint: input.kind,
     state: input.state,
     workerSessionID: input.workerSessionID,
@@ -820,12 +840,19 @@ export async function persistOrchestrationRun(
 
 export function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, getKey: () => Promise<string | undefined>): DispatcherDeps {
   const dir = orchestrationDirectory(ctx);
+  const decisions = makeDispatcherDecisions(ctx, opts, getKey);
+  let selection: ExecutorSelection | undefined;
+  const selectExecutor = decisions.selectExecutor;
+  decisions.selectExecutor = async (input) => {
+    selection = await selectExecutor(input);
+    return selection;
+  };
   return {
     runtime: makeWorkerRuntime(ctx),
     critic: makeCriticRuntime(ctx),
     orchestrator: makeOrchestratorRuntime(ctx),
-    decisions: makeDispatcherDecisions(ctx, opts, getKey),
-    persist: (p) => persistOrchestrationRun(ctx, p),
+    decisions,
+    persist: (p) => persistOrchestrationRun(ctx, { ...p, ...(selection ? { selection } : {}) }),
     resourceBudget: (input) => evaluateResourceBudget(ctx.storage, input),
     observeResource: createBoundedStorageObservationSink(ctx, {
       get: async (key) => await safeStorageGet(ctx, key),
@@ -855,6 +882,7 @@ export function makeOrchestrationDeps(ctx: any, opts: Required<RouterOptions>, g
     ...(dir !== undefined ? { location: { directory: dir } } : {}),
   };
 }
+
 
 export function recordRuntimeResource(ctx: any, observation: Record<string, unknown>): Promise<void> {
   // Ordinary retry telemetry is best effort; hard policy branches may await this bounded sink.
