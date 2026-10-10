@@ -24,6 +24,7 @@ export interface UsageObservation {
   signal?: "rate-limit" | "throttle" | "overload" | "unknown";
   errorCode?: string;
   failureDomain?: "provider" | "quota" | "context" | "execution" | "operational" | "unknown";
+  usageStatus?: "partial" | "terminal";
   tokens?: { input?: number; output?: number; reasoning?: number; cacheRead?: number; cacheWrite?: number };
 }
 
@@ -62,7 +63,10 @@ export function sanitizeObservation(value: unknown): UsageObservation {
   if (RECOVERY_ACTIONS.has(String(x.recoveryAction))) out.recoveryAction = x.recoveryAction as UsageObservation["recoveryAction"];
   if (["provider", "quota", "context", "execution", "operational", "unknown"].includes(String(x.failureDomain))) out.failureDomain = x.failureDomain as UsageObservation["failureDomain"];
   if (["rate-limit", "throttle", "overload", "unknown"].includes(String(x.signal))) out.signal = x.signal as UsageObservation["signal"];
-  for (const key of ["round", "retry", "statusCode"] as const) if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
+  if (["partial", "terminal"].includes(String(x.usageStatus))) out.usageStatus = x.usageStatus as UsageObservation["usageStatus"];
+  for (const key of ["round", "retry", "statusCode"] as const) {
+    if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
+  }
   const tokens = x.tokens && typeof x.tokens === "object" ? x.tokens as Record<string, unknown> : {};
   const observed: NonNullable<UsageObservation["tokens"]> = {};
   for (const key of TOKEN_KEYS) if (Number.isFinite(tokens[key]) && Number(tokens[key]) >= 0) observed[key] = Number(tokens[key]);
@@ -124,19 +128,45 @@ export function aggregateUsage(values: readonly unknown[], window: { from: numbe
     fanouts: 0, compactions: 0, throttles: 0, quotaLimits: 0, contextOverflows: 0,
     providerFailures: 0, operationalFailures: 0, tokens: {}, observations: 0,
   };
+  const snapshots = new Map<string, Array<{ at: number; tokens: NonNullable<UsageObservation["tokens"]> }>>();
+  const key: Partial<Record<ObservationKind, keyof UsageWindow>> = {
+    request: "requests", round: "rounds", retry: "retries", recovery: "recoveries", escalation: "escalations",
+    fanout: "fanouts", compaction: "compactions", throttle: "throttles", "quota-limit": "quotaLimits",
+    "context-overflow": "contextOverflows", "provider-error": "providerFailures", "operational-failure": "operationalFailures",
+  };
   for (const raw of values) {
     const x = sanitizeObservation(raw);
     if (x.at === undefined) continue; // timestamp unknown: never fabricate window membership
-    if (x.at < window.from || x.at > window.to) continue;
-    out.observations++;
-    const key: Partial<Record<ObservationKind, keyof UsageWindow>> = {
-    request: "requests", round: "rounds", retry: "retries", recovery: "recoveries", escalation: "escalations",
-      fanout: "fanouts", compaction: "compactions", throttle: "throttles", "quota-limit": "quotaLimits",
-      "context-overflow": "contextOverflows", "provider-error": "providerFailures", "operational-failure": "operationalFailures",
-    };
-    const count = key[x.kind];
-    if (count) (out[count] as number)++;
-    for (const token of TOKEN_KEYS) if (x.tokens?.[token] !== undefined) out.tokens[token] = (out.tokens[token] ?? 0) + x.tokens[token]!;
+    const inWindow = x.at >= window.from && x.at <= window.to;
+    if (inWindow) {
+      out.observations++;
+      const count = key[x.kind];
+      if (count) (out[count] as number)++;
+    }
+    if (x.kind === "token-usage" && x.sessionID && x.tokens) {
+      const session = snapshots.get(x.sessionID) ?? [];
+      session.push({ at: x.at, tokens: x.tokens });
+      snapshots.set(x.sessionID, session);
+    } else if (inWindow) {
+      for (const token of TOKEN_KEYS) if (x.tokens?.[token] !== undefined) out.tokens[token] = (out.tokens[token] ?? 0) + x.tokens[token]!;
+    }
+  }
+  // Runtime session usage is a cumulative snapshot: charge only the increase
+  // from the preceding observation for that session.
+  for (const session of snapshots.values()) {
+    session.sort((a, b) => a.at - b.at);
+    const previous: Partial<Record<keyof NonNullable<UsageObservation["tokens"]>, number>> = {};
+    for (const snapshot of session) {
+      const inWindow = snapshot.at >= window.from && snapshot.at <= window.to;
+      for (const token of TOKEN_KEYS) {
+        const current = snapshot.tokens[token];
+        if (current === undefined) continue;
+        const prior = previous[token];
+        const next = prior === undefined ? current : Math.max(prior, current);
+        previous[token] = next;
+        if (inWindow && next > (prior ?? 0)) out.tokens[token] = (out.tokens[token] ?? 0) + next - (prior ?? 0);
+      }
+    }
   }
   return out;
 }

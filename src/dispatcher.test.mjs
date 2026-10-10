@@ -1411,37 +1411,144 @@ describe("runOrchestrationOnce: failed worker / verdicts nao-accept / timeout / 
     assert.equal(t.effects.filter((e) => e === "create").length, 1, "nenhum loop de nova sessao");
   });
 
-  it("P3b: timeout bounded when interrupt never resolves; worker remains ambiguous and run does not continue", async () => {
-    const t = fakeDeps({ waitBlocks: true });
+  it("P3b: timeout with unconfirmed interrupt and hung diagnostic read remains bounded", async () => {
+    const t = fakeDeps({
+      waitBlocks: true,
+      runtime: { get: async () => await new Promise(() => {}) },
+    });
     let interruptCalls = 0;
     t.runtime.interrupt = async () => {
       interruptCalls += 1;
       return await new Promise(() => {});
     };
     const observations = [];
+    const persistCalls = [];
+    let timer;
     const resultOrTimeout = await Promise.race([
       runOrchestrationOnce(contract(), {
         runtime: t.runtime,
         critic: t.critic,
         decisions: t.decisions,
         workerTimeoutMs: 20,
-        persist: t.persist,
+        persist: async (item) => persistCalls.push(item),
         observeResource: (item) => observations.push(item),
       }),
-      new Promise((resolve) => setTimeout(() => resolve("still-pending"), 1500)),
+      new Promise((resolve) => { timer = setTimeout(() => resolve("still-pending"), 1500); }),
     ]);
+    clearTimeout(timer);
 
-    assert.notEqual(resultOrTimeout, "still-pending", "timeout must not await a non-settling interrupt");
+    assert.notEqual(resultOrTimeout, "still-pending", "diagnostic read cannot extend the failed run indefinitely");
     assert.equal(resultOrTimeout.phase, "failed");
-    assert.equal(resultOrTimeout.worker, undefined, "unknown worker outcome must not be reported as interrupted");
+    assert.equal(resultOrTimeout.worker, undefined, "unconfirmed worker outcome remains ambiguous");
     assert.match(resultOrTimeout.error, /interrupcao nao confirmada/i);
     assert.equal(interruptCalls, 1);
     assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
-    assert.equal(t.effects.includes("judge"), false, "no judgment or follow-up dispatch after unresolved worker");
-    assert.equal(observations.some((item) => item.kind === "outcome"), false);
-    const failureCheckpoint = t.persistCalls.findLast((item) => item.kind === "run-failed");
-    assert.equal(failureCheckpoint.state.phase, "running", "unconfirmed worker is not recorded as interrupted/finished");
-    assert.equal(failureCheckpoint.workerSessionID, "w1");
+    assert.equal(t.effects.includes("judge"), false);
+    assert.equal(observations.some((item) => item.kind === "token-usage"), false);
+    assert.equal(observations.some((item) => item.kind === "operational-failure"), true);
+    assert.equal(persistCalls.some((item) => item.kind === "run-failed"), true);
+  });
+
+  it("P3e: confirmed timeout with a never-resolving diagnostic read persists run-failed", async () => {
+    const t = fakeDeps({
+      waitBlocks: true,
+      runtime: { get: async () => await new Promise(() => {}) },
+    });
+    t.runtime.interrupt = async () => true;
+    const observations = [];
+    const persistCalls = [];
+    let timer;
+    const resultOrTimeout = await Promise.race([
+      runOrchestrationOnce(contract(), {
+        runtime: t.runtime,
+        critic: t.critic,
+        decisions: t.decisions,
+        workerTimeoutMs: 20,
+        persist: async (item) => persistCalls.push(item),
+        observeResource: (item) => observations.push(item),
+      }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve("still-pending"), 1500); }),
+    ]);
+    clearTimeout(timer);
+
+    assert.notEqual(resultOrTimeout, "still-pending", "diagnostic read cannot block fail-run");
+    assert.equal(resultOrTimeout.phase, "failed");
+    assert.equal(resultOrTimeout.worker.outcome, "interrupted");
+    assert.equal(persistCalls.some((item) => item.kind === "run-failed"), true);
+    assert.equal(observations.some((item) => item.kind === "token-usage"), false);
+    assert.equal(resultOrTimeout.evidence, undefined);
+    assert.equal(resultOrTimeout.verdict, undefined);
+  });
+
+  it("P3f: diagnostic read errors fail closed without partial usage or fabricated evidence", async () => {
+    const t = fakeDeps({
+      waitBlocks: true,
+      runtime: { get: async () => { throw new Error("session unavailable"); } },
+    });
+    t.runtime.interrupt = async () => true;
+    const observations = [];
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      workerTimeoutMs: 20,
+      persist: t.persist,
+      observeResource: (item) => observations.push(item),
+    });
+
+    assert.equal(result.phase, "failed");
+    assert.equal(t.persistCalls.some((item) => item.kind === "run-failed"), true);
+    assert.equal(observations.some((item) => item.kind === "operational-failure"), true);
+    assert.equal(observations.some((item) => item.kind === "token-usage"), false);
+    assert.equal(result.evidence, undefined);
+    assert.equal(result.verdict, undefined);
+  });
+
+  it("P3g: diagnostic read without structured usage preserves unknown rather than zero", async () => {
+    const t = fakeDeps({
+      waitBlocks: true,
+      runtime: { get: async () => ({ metadata: { unrelated: true } }) },
+    });
+    t.runtime.interrupt = async () => true;
+    const observations = [];
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      workerTimeoutMs: 20,
+      persist: t.persist,
+      observeResource: (item) => observations.push(item),
+    });
+
+    assert.equal(result.phase, "failed");
+    assert.equal(observations.some((item) => item.kind === "token-usage"), false);
+    assert.equal(result.evidence, undefined);
+    assert.equal(result.verdict, undefined);
+  });
+
+  it("P3d: confirmed worker timeout records structured partial usage once, without verdict", async () => {
+    const t = fakeDeps({
+      waitBlocks: true,
+      runtime: { get: async () => ({ usage: { input: 23_335, output: 0 } }) },
+    });
+    t.runtime.interrupt = async () => true;
+    const storage = makeStorage();
+    const result = await runOrchestrationOnce(contract({ maxRounds: 3 }), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      workerTimeoutMs: 20,
+      observeResource: createBoundedStorageObservationSink(storage, storage),
+    });
+
+    assert.equal(result.phase, "failed");
+    assert.equal(result.evidence, undefined);
+    assert.equal(result.verdict, undefined);
+    const tokenUsage = storage._map.get(RESOURCE_LEDGER_KEY).observations.filter((item) => item.kind === "token-usage");
+    assert.equal(tokenUsage.length, 1);
+    assert.deepEqual(tokenUsage[0].tokens, { input: 23_335, output: 0 });
+    assert.equal(tokenUsage[0].usageStatus, "partial");
+    assert.equal(t.effects.includes("judge"), false);
   });
 
   it("P3c: confirmed timeout records interruption and still stops before recovery dispatch", async () => {

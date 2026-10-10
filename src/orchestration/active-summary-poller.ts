@@ -32,11 +32,12 @@ const ACTIVE_PHASES = new Set([
 ]);
 const TERMINAL_PHASES = new Set(["completed", "stopped", "failed"]);
 
-/** Polls a session's read-only summary surface and presents changed active snapshots only. */
+/** Polls a session's read-only summary surface and presents changed active or terminal snapshots. */
 export function createActiveSummaryPoller(deps: {
   getSummary(sessionID: string): Promise<ActiveSummarySnapshot>;
   currentSessionID(): string | undefined;
   present(sessionID: string, summary: ExecutionSummary): void;
+  presentTerminal?(sessionID: string, summary: ExecutionSummary, runID: string): boolean | void | Promise<boolean | void>;
   scheduler?: ActiveSummaryPollerScheduler;
 }, options: {
   intervalMs?: number;
@@ -51,11 +52,13 @@ export function createActiveSummaryPoller(deps: {
   let generation = 0;
   let pollingGeneration: number | undefined;
   let lastSnapshot = "";
+  let lastTerminalRunID: string | undefined;
 
   const stop = (): void => {
     generation += 1;
     sessionID = undefined;
     lastSnapshot = "";
+    lastTerminalRunID = undefined;
     if (interval !== undefined) scheduler.clearInterval(interval);
     if (timeout !== undefined) scheduler.clearTimeout(timeout);
     interval = undefined;
@@ -105,7 +108,14 @@ export function createActiveSummaryPoller(deps: {
         const runID = typeof result.runID === "string" ? result.runID : "";
         const phase = summary.taskState;
         if (typeof phase !== "string" || !ACTIVE_PHASES.has(phase)) {
-          if (typeof phase === "string" && TERMINAL_PHASES.has(phase)) lastSnapshot = `${runID}:${JSON.stringify(summary)}`;
+          if (typeof phase === "string" && TERMINAL_PHASES.has(phase)) {
+            lastSnapshot = `${runID}:${JSON.stringify(summary)}`;
+            if (runID && runID !== lastTerminalRunID) {
+              const presented = await deps.presentTerminal?.(normalized, summary, runID);
+              if (ownGeneration !== generation || sessionID !== normalized) return;
+              if (presented !== false) lastTerminalRunID = runID;
+            }
+          }
           return;
         }
         const snapshot = `${runID}:${JSON.stringify(summary)}`;

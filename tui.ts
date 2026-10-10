@@ -78,6 +78,51 @@ function trace(event: string, detail?: Record<string, unknown>): void {
     // trace nunca pode derrubar a apresentacao
   }
 }
+function traceSessionSnapshot(ctx: any, sessionID: string): void {
+  try {
+    const info = ctx.data.session.get(sessionID);
+    if (!isPresentableSession({
+      currentSessionID: sessionID,
+      eventSessionID: sessionID,
+      metadata: info?.metadata as Record<string, unknown> | undefined,
+      parentID: typeof info?.parentID === "string" ? info.parentID : undefined,
+    })) return;
+    let status = "unknown";
+    try {
+      const observed = ctx.data.session.status(sessionID);
+      if (observed === "idle" || observed === "running") status = observed;
+    } catch {}
+    let inboxAvailable = false;
+    let userSteerCount = 0;
+    let syntheticSteerCount = 0;
+    let inboxCount = 0;
+    let inboxTruncated = false;
+    try {
+      const pending = ctx.data.session.pending.list(sessionID);
+      if (Array.isArray(pending)) {
+        inboxAvailable = true;
+        inboxCount = Math.min(pending.length, 64);
+        inboxTruncated = pending.length > inboxCount;
+        for (const item of pending.slice(0, 64)) {
+          if (item?.delivery !== "steer") continue;
+          if (item.type === "user") userSteerCount++;
+          if (item.type === "synthetic") syntheticSteerCount++;
+        }
+      }
+    } catch {}
+    trace("session-snapshot", {
+      sessionID: sessionID.slice(0, 200),
+      status,
+      inboxAvailable,
+      inboxCount,
+      inboxTruncated,
+      userSteerCount,
+      syntheticSteerCount,
+    });
+  } catch {
+    // Diagnostic-only; missing host state must not affect presentation.
+  }
+}
 
 export default Plugin.define({
   id: "jev-free-router-presentation",
@@ -101,6 +146,7 @@ export default Plugin.define({
     let activeSummarySessionID: string | undefined;
     let activeSummaryPoller: ReturnType<typeof createActiveSummaryPoller> | undefined;
     let summaryClient: any;
+    let presentPersistedTerminal: ((sessionID: string, summary: ExecutionSummary, runID: string) => Promise<boolean>) | undefined;
     try {
       summaryClient = (ctx.client as any).rpc(ExecutionSummaryRpc);
       activeSummaryPoller = createActiveSummaryPoller({
@@ -143,14 +189,16 @@ export default Plugin.define({
           });
           trace("active-summary-shown", { sessionID, taskState: summary.taskState, recovering });
         },
+        presentTerminal: (sessionID, summary, runID) => presentPersistedTerminal?.(sessionID, summary, runID),
       });
       const route = ctx.ui.router.current();
       if (route?.type === "session") {
         activeSummarySessionID = String(route.sessionID);
-        activeSummaryPoller.start(activeSummarySessionID);
+
+        traceSessionSnapshot(ctx, activeSummarySessionID);
       }
-    } catch (err) {
-      trace("active-summary-unavailable", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+    } catch {
+      // Diagnostic trace excludes runtime error text.
     }
 
     /**
@@ -285,10 +333,10 @@ export default Plugin.define({
       sessionID: string,
       phase: string,
       notice: string,
-      source: "event" | "reconcile",
+      source: "event" | "reconcile" | "summary",
     ): Promise<boolean> => {
       if (disposed || runID === "" || sessionID === "") return false;
-      if (seen.has(runID)) return false;
+      if (seen.has(runID)) return true;
       if (inflight.has(runID)) return false;
       inflight.add(runID);
       try {
@@ -326,6 +374,12 @@ export default Plugin.define({
         inflight.delete(runID);
       }
     };
+    presentPersistedTerminal = (sessionID, summary, runID) => {
+      const phase = summary.taskState;
+      if (phase !== "completed" && phase !== "failed" && phase !== "stopped") return Promise.resolve(true);
+      return present(runID, sessionID, phase, `Persisted terminal phase: ${phase}.`, "summary");
+    };
+    if (activeSummarySessionID && activeSummaryPoller) activeSummaryPoller.start(activeSummarySessionID);
 
     let unsubscribe: (() => void) | undefined;
     try {
@@ -348,11 +402,11 @@ export default Plugin.define({
         },
       );
       trace("subscribed", { event: ORCHESTRATION_RESULT_EVENT, unsubscribeType: typeof unsubscribe });
-    } catch (err) {
-      trace("subscribe-failed", { error: String((err as Error)?.message ?? err).slice(0, 300) });
       // Barramento/SDK indisponivel nesta superficie: apresentacao fica
       // desligada (degradacao bounded). O resultado continua duravel no
       // inbox (synthetic resume:false) e no record/binding do opjev.
+    } catch {
+      // Terminal inbox replay remains available if the event bus is unavailable.
     }
 
     // ─────────────── reconciliacao DURAVEL ───────────────
@@ -397,8 +451,8 @@ export default Plugin.define({
           if (toPresent.length > 0) {
             trace("reconcile-recovered", { sessionID, recovered: toPresent.length });
           }
-        } catch (err) {
-          trace("reconcile-error", { error: String((err as Error)?.message ?? err).slice(0, 200) });
+        } catch {
+          // Next bounded reconciliation poll retries; never log error payloads.
         } finally {
           reconciling = false;
         }

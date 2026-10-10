@@ -5,7 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { acquireLock, parseSessionArgs, summarizeAudit } from "../scripts/opjev.mjs";
+import { acquireLock, baseEnvironment, parseSessionArgs, summarizeAudit } from "../scripts/opjev.mjs";
 import { sanitizeObservation } from "../src/resource-governor/usage-ledger.ts";
 const OPJEV_STORAGE_PREFIX = "plugin:006a00650076002d0066007200650065002d0072006f0075007400650072:";
 
@@ -16,6 +16,18 @@ test("launcher allows session continuation without permitting a gateway bypass",
   assert.throws(() => parseSessionArgs(["--server", "http://127.0.0.1:9999"]), /unsupported/);
   assert.throws(() => parseSessionArgs(["--prompt", "run outside the TUI"]), /unsupported/);
   assert.throws(() => parseSessionArgs(["--continue", "--session", "id"]), /combine/);
+});
+test("launcher forwards an explicit TUI diagnostic path and leaves it off by default", () => {
+  const previous = process.env.OPJEV_TUI_TRACE;
+  try {
+    delete process.env.OPJEV_TUI_TRACE;
+    assert.equal(baseEnvironment().OPJEV_TUI_TRACE, undefined);
+    process.env.OPJEV_TUI_TRACE = "/tmp/opjev-tui-trace.jsonl";
+    assert.equal(baseEnvironment().OPJEV_TUI_TRACE, "/tmp/opjev-tui-trace.jsonl");
+  } finally {
+    if (previous === undefined) delete process.env.OPJEV_TUI_TRACE;
+    else process.env.OPJEV_TUI_TRACE = previous;
+  }
 });
 
 test("launcher preserves a stale lock instead of racing to reap it", t => {

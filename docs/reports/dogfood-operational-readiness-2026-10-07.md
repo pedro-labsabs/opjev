@@ -138,3 +138,55 @@ RED→GREEN: the exact regression now requires post-evidence count 0, evidence i
 Verification on this audit-only change: typecheck PASS; routing 11/11 (fallback 4/4); matrix E2E 17/17; `git diff --check` PASS. No gateway, multiround-real, or context E2E exercises `summarizeAudit`, and no dispatcher/gateway/runtime source changed, so those real E2Es were not repeated; the unchanged runtime gates remain recorded above. No quota-consuming smoke was run.
 
 `opjev audit` ran read-only against the existing persistent profile. Before/after SHA-256 of the database was identical; no records were rewritten. It reports 57/2,048 observations and 10 runs (3 completed/accepted, 6 failed, 1 pending), 2 governed pre-evidence failures, 4 governed post-evidence/pre-verdict failures, 0 ambiguous interruptions/runs, 0 evidence inconsistencies/missing links/orphans/invalid records/round violations/round-limit violations, 7 EvidencePackets and critic checks, 3 verdicts linked to 3 outcomes, and 0 recoveries. The in-memory regression fixture was not written to the profile. Existing accepted records remain synthetic, not natural dogfood.
+
+## Issue #49 follow-up — 2026-10-10
+
+**Current status: BLOCKED for daily dogfood.** The confirmed ledger and timeout defects are corrected. A controlled TUI reopen now presents the persisted terminal failure once, but OpenCode 2.0.11 still shows its native spinner while its session-status API reports idle. The live Jev response also remained inconsistent; no verdict or outcome was fabricated.
+
+### Corrections and boundaries
+
+- Restored nonnegative integer sanitization for `round`, `retry`, and `statusCode`, while preserving `usageStatus=partial|terminal` and the ledger privacy allowlist. The previous edit had dropped these numeric facts; existing long-ID correlations and 429 status observations failed before restoration.
+- Bounded the post-timeout diagnostic `runtime.get` to 250 ms, independent of the 60,000 ms worker deadline. It is read-only and best-effort; failures or missing usage do not block canonical `run-failed`, create zero-token facts, or create EvidencePacket/verdict/outcome. Timeout still means wall-clock expiration, not inactivity. No worker deadline, budget, round, retry, or authority policy changed.
+- Token usage from a session is cumulative snapshots; aggregation now counts only positive per-token deltas. A terminal snapshot does not add the earlier partial snapshot again. These facts remain in `resource/usage-ledger/v1`; absent counters remain unknown.
+- The launcher forwards `OPJEV_TUI_TRACE` only when explicitly set; tracing is off by default. It records allowlisted session-status and inbox counts, never prompt/output text or credentials.
+- Persisted terminal summaries are now replayed through the existing read-only summary RPC and the existing deduplicated, idle-gated notice path. Reopen performs no parent wake, inbox write, dispatch, or synthetic assistant message.
+
+### Runtime evidence and unresolved causes
+
+- Reopening the failed parent on the isolated OpenCode 2.0.11 profile produced `ctx.data.session.status="idle"` and a visible terminal toast (`source=summary`, one `shown` trace for the persisted run); the server snapshot reported `inboxCount=0` at that point. The screen simultaneously retained the native `New session` spinner. Thus the OPJEV terminal notice/status gate was not the spinner cause. No supported plugin API was identified that can safely clear this host-owned visual state without waking or forging a parent response; the exact host rendering component remains unconfirmed.
+- The toast distinguished parent from worker: parent UI model `Claude Haiku 5.5 OpenCode Go`; Jev-selected and observed worker model `opencode/nemotron-3.5-lightning-free`. No model switch occurred in this smoke. The historical `nemotron-3-ultra-free → nemotron-3.5-lightning-free` event still has no confirmed emitter. OPJEV creates workers with the selected model and only calls `ctx.session.switchModel` from an explicit control-plane decision; it does not observe or attribute that historical host event. No model-pool policy or fallback was changed.
+- `decideGeneric` sends bounded state and the four-question schema to SystemOne, returns `res.answers` unchanged, and performs no retry. `parseRoundVerdict` parses the response; `validateVerdict` correctly rejects `done=true` with a non-`none` failure class. The independent `failure_class` instruction did not explicitly cross-constrain `done`; the exact raw answer was not persisted, so evidence cannot distinguish provider/model inconsistency from an instruction-sensitive response. Validation remains strict; no second live call was made for the same run.
+- Two unique ordinary TUI runs reached EvidencePacket and critic; Jev's contradictory terminal fields caused `JevVerdict invalido: done=true exige failureClass=none` in each. No verdict/outcome exists for either run. Read-only audit after both reported 10/2,048 observations, two failed runs, two packets and two critic checks, zero verdicts/outcomes, and 70,407 input / 3,681 output / 4,124 reasoning tokens reported by the runtime (not billing evidence). The audit also reported historic missing `round` values and consistency violations from rows written before numeric sanitization was restored; those old rows were not rewritten. New observations preserve the numeric fields.
+- Two earlier real timeout records showed substantial worker activity before the 60,000 ms wall-clock deadline: respectively 5/6 assistant messages, 9/13 tool calls (8/12 completed), and about 23,335/103,117 structured host tokens. These figures do not prove provider billing and do not distinguish productive work from provider waiting. A new deadline/progress policy needs explicit limits, accounting and interruption/fencing design; it was not implemented without human authority.
+- On reopening without submitting a prompt or making a Jev request, two historical inbox rows had been persisted before startup; the session snapshot reported `inboxCount=0` after host startup, and the summary replay remained visible exactly once (`source=summary`). This exercised baseline/replay ordering without another task.
+- The host’s native spinner remained visible even though the supported session API reported `idle`; no safe plugin API to clear it was demonstrated. The terminal notice is contextually visible, but does not satisfy the no-spinner acceptance criterion.
+- A historical `model-switched` event still lacks a confirmed emitter. The current smoke had no switch; no automatic fallback or switch was authorized or observed in it.
+- Usage aggregation treats per-session snapshots cumulatively and records positive deltas only. Missing structured usage remains unknown; a terminal snapshot does not double-count the earlier partial snapshot.
+
+### RED → GREEN follow-up
+
+- The reviewer’s poller regressions reproduced two presentation races: marking a terminal run delivered before async rendering succeeded prevented retry; marking old inbox notices seen during initial baseline could suppress a later summary response. Both tests were RED before correction. The poller now records delivery only after successful presentation and retries within its existing bounded lifetime; reconciliation ignores pre-start notices without marking them delivered. The summary callback reports presentation success, preserving retry and exactly-once dedupe.
+- `node --test src/active-summary-poller.test.mjs`: 5/5; `node --test src/presentation.test.mjs`: 28/28.
+
+### Regression evidence
+
+- RED→GREEN: long-ID audit linkage and router `statusCode=429` failed before numeric field restoration; sanitizer regressions cover all three numeric fields, invalid values, `usageStatus`, and dropped arbitrary/private fields.
+- RED→GREEN: never-resolving timeout diagnostics held dispatch open before the 250 ms cap; throwing, unknown-usage, known-partial, confirmed/unconfirmed interruption, and terminal-vs-partial aggregation regressions pass after the cap.
+- RED→GREEN: the initial replay regression failed with zero terminal presentations; reviewer regressions then showed failed async presentation was not retried and an old baseline notice could pre-mark a summary as seen. Both review cases failed before fixes; afterward the poller retries until successful presentation and baseline filtering no longer suppresses summary replay. The isolated OpenCode screen and sanitized trace confirmed one visible replay after reopen; the native spinner remained.
+
+### Verification gates
+
+| Command | Result |
+|---|---|
+| `npm run typecheck` | PASS |
+| `npm test` | PASS — 814 tests, 104 suites |
+| `npm run evaluate:routing` | PASS — 11/11, fallback 4/4 |
+| `npm run e2e:matrix` | PASS — 17/17 |
+| `OPENCODE_BIN=<disposable OpenCode 2.0.11> npm run e2e:gateway` | PASS — 60/60; real pinned server, local model fixture and Jev mock; synthetic integration only |
+| `OPENCODE_BIN=<disposable OpenCode 2.0.11> npm run e2e:multiround-real` | PASS — 18/18; pinned 2.0.11, live Jev SystemOne plus explicit fault injection |
+| `OPENCODE_BIN=<disposable OpenCode 2.0.11> npm run e2e:context` | PASS — pinned 2.0.11, 2 turns, 4 requests |
+| `git diff --check` | PASS |
+
+Typecheck, the full suite, routing, matrix, pinned gateway, Context E2E, and `git diff --check` were rerun after the final presentation race fixes. `e2e:multiround-real` passed earlier on the same dispatcher/control-plane code; it was not repeated because subsequent changes were limited to terminal presentation and inbox reconciliation, avoiding another live Jev call.
+
+These gates do not override the everyday TUI smoke: it reached worker, EvidencePacket and critic, but Jev's invalid cross-field answer failed the run. Reopening displayed the persisted failure exactly once, yet the native spinner remained. No valid verdict, outcome, post-reopen conversation answer, or completed smoke was observed. The historical model-switch emitter and an inactivity/deadline policy remain unconfirmed. Do not use this result to declare dogfood ready.

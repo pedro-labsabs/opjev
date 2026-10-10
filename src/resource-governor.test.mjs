@@ -31,15 +31,49 @@ test("window aggregation excludes old facts and leaves unavailable measurements 
   assert.equal(a.throttles, 1);
   assert.equal(a.quotaLimits, 0);
 });
+test("cumulative usage snapshots from one session count only their increments", () => {
+  const total = aggregateUsage([
+    { at: 10, kind: "token-usage", usageStatus: "partial", sessionID: "worker-1", tokens: { input: 100, output: 10 } },
+    { at: 20, kind: "token-usage", usageStatus: "terminal", sessionID: "worker-1", tokens: { input: 150, output: 15 } },
+  ], { from: 0, to: 30 });
+  assert.deepEqual(total.tokens, { input: 150, output: 15 });
+});
 
 test("sanitizer only keeps factual scalar fields and observed token counters", () => {
-  const x = sanitizeObservation({ at: 1, kind: "request", tokens: { input: 7, madeUp: 9 }, secret: "x", prompt: "p" });
+  const x = sanitizeObservation({ at: 1, kind: "token-usage", usageStatus: "partial", tokens: { input: 7, madeUp: 9 }, secret: "x", prompt: "p" });
+  assert.equal(x.usageStatus, "partial");
   assert.deepEqual(x.tokens, { input: 7 });
   assert.equal("secret" in x, false);
   assert.equal("prompt" in x, false);
   assert.equal(sanitizeObservation({ at: 1, kind: "made-up-kind" }).kind, "unknown");
   assert.equal("at" in sanitizeObservation({ kind: "request" }), false);
   assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "token=secret" }), false);
+});
+test("sanitizer preserves usage status and nonnegative integer ledger fields only", () => {
+  const safe = sanitizeObservation({
+    kind: "token-usage",
+    usageStatus: "partial",
+    round: 1,
+    retry: 2,
+    statusCode: 429,
+    prompt: "private prompt",
+    secret: "private secret",
+    arbitrary: "discard",
+  });
+  assert.deepEqual(
+    { round: safe.round, retry: safe.retry, statusCode: safe.statusCode, usageStatus: safe.usageStatus },
+    { round: 1, retry: 2, statusCode: 429, usageStatus: "partial" },
+  );
+  for (const invalid of [-1, 1.5, "2", null]) {
+    const rejected = sanitizeObservation({ kind: "retry", round: invalid, retry: invalid, statusCode: invalid });
+    assert.equal("round" in rejected, false);
+    assert.equal("retry" in rejected, false);
+    assert.equal("statusCode" in rejected, false);
+  }
+  assert.equal(sanitizeObservation({ kind: "token-usage", usageStatus: "terminal" }).usageStatus, "terminal");
+  assert.equal("usageStatus" in sanitizeObservation({ kind: "token-usage", usageStatus: "unknown" }), false);
+  assert.equal(JSON.stringify(safe).includes("private"), false);
+  assert.equal("arbitrary" in safe, false);
 });
 
 test("sanitizer preserves contract-sized run and session identities", () => {

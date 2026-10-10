@@ -287,6 +287,24 @@ function observedTokenCounts(usage: unknown): Record<string, number> | undefined
   }
   return Object.keys(out).length ? out : undefined;
 }
+// Local diagnostics only: allow 250ms for host metadata, independent of worker deadline.
+const PARTIAL_USAGE_READ_TIMEOUT_MS = 250;
+
+async function readPartialSessionView(
+  read: () => Promise<WorkerSessionView>,
+): Promise<WorkerSessionView | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(read),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), PARTIAL_USAGE_READ_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 async function resolveFrontier(deps: DispatcherDeps, runID: string): Promise<InputFrontier> {
   const followupsAny = deps.followups as any;
@@ -984,6 +1002,26 @@ async function executeSchedule(
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
+      const timedOut = err instanceof OrchestrationError && err.code.startsWith("worker-timeout");
+      if (timedOut) {
+        try {
+          const partialView = await readPartialSessionView(() => deps.runtime.get({ sessionID: workerSessionID }));
+          const partialTokens = observedTokenCounts(partialView?.usage ?? partialView?.metadata?.usage ?? partialView?.metadata?.tokens);
+          if (partialTokens) await observeResource(deps, {
+            at: now(),
+            kind: "token-usage",
+            usageStatus: "partial",
+            runID: contract.runID,
+            sessionID: workerSessionID,
+            route: selection?.route,
+            ...(partialView?.model?.trim() ? { model: partialView.model.trim() } : {}),
+            ...(partialView?.agent?.trim() ? { agent: partialView.agent.trim() } : {}),
+            role: "worker",
+            round: state.round,
+            tokens: partialTokens,
+          });
+        } catch { /* usage is unknown unless the runtime confirms structured values */ }
+      }
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
       const interruptionConfirmed = err instanceof OrchestrationError && err.code === "worker-timeout";
       if (interruptionConfirmed || workerWaitCompleted) {
@@ -1014,7 +1052,7 @@ async function executeSchedule(
     const agent = view.agent?.trim() || roundAgent;
     const model = view.model?.trim() || roundModel;
     const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
-    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
+    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
 
     // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
     // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
@@ -1117,7 +1155,7 @@ async function executeSchedule(
       );
       const cView = await deps.critic.get({ sessionID: createdSessionID });
       const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
-      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
+      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
       const ownOutcome = cView.outcome;
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
@@ -1750,7 +1788,7 @@ async function executeSchedule(
         // nao troca agent/model/executor, nao aprova, nao corrige output.
         const orchView = await deps.orchestrator.get({ sessionID: orchestratorSessionID });
         const orchestratorTokens = observedTokenCounts(orchView?.usage ?? orchView?.metadata?.usage ?? orchView?.metadata?.tokens);
-        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
+        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
         const orchOutcome = orchView?.outcome;
         if (orchOutcome === "failed" || orchOutcome === "interrupted") {
           throw new OrchestrationError(
