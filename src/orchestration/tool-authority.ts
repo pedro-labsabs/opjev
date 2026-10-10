@@ -21,18 +21,91 @@ const TOOL_READ_ALLOWLIST = { read: true, glob: true, grep: true } as const;
 const INTERNAL_ROLES = { worker: true, critic: true, orchestrator: true } as const;
 const AGENT_ROLES = { implementer: true, critic: true, orchestrator: true } as const;
 const MAX_REGISTERED_INTERNAL_SESSIONS = 4096;
-const registeredInternalSessions = new Map<string, { role: Exclude<InternalToolRole, "external" | "ambiguous">; fenced: boolean }>();
+export interface InternalWorkerBinding {
+  runID: string;
+  round: number;
+  model: string;
+}
+interface InternalToolSessionEntry {
+  role: Exclude<InternalToolRole, "external" | "ambiguous">;
+  fenced: boolean;
+  binding?: InternalWorkerBinding;
+}
+const registeredInternalSessions = new Map<string, InternalToolSessionEntry>();
+
+const MODEL_REF = /^[A-Za-z0-9._-]{1,80}\/[A-Za-z0-9._:-]{1,120}$/;
+
+function validWorkerBinding(value: unknown): value is InternalWorkerBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const binding = value as Record<string, unknown>;
+  return typeof binding.runID === "string" &&
+    binding.runID.length > 0 && binding.runID.length <= 200 &&
+    binding.runID.trim() === binding.runID &&
+    Number.isSafeInteger(binding.round) && Number(binding.round) > 0 &&
+    typeof binding.model === "string" && MODEL_REF.test(binding.model);
+}
+export function assertInternalWorkerBinding(value: unknown): asserts value is InternalWorkerBinding {
+  if (!validWorkerBinding(value)) throw new Error("invalid worker session binding");
+}
+
+function sameBinding(left: InternalWorkerBinding, right: InternalWorkerBinding): boolean {
+  return left.runID === right.runID && left.round === right.round && left.model === right.model;
+}
+
+function runtimeModelRef(info: unknown): string | undefined {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return undefined;
+  const model = (info as Record<string, unknown>).model;
+  if (typeof model === "string") return MODEL_REF.test(model) ? model : undefined;
+  if (!model || typeof model !== "object" || Array.isArray(model)) return undefined;
+  const value = model as Record<string, unknown>;
+  if (typeof value.providerID !== "string" || typeof value.id !== "string") return undefined;
+  const ref = `${value.providerID}/${value.id}`;
+  return MODEL_REF.test(ref) ? ref : undefined;
+}
+
+const TOOL_SESSION_LOOKUP_TIMEOUT_MS = 250;
+
+async function readSessionBounded(
+  ctx: { session: { get: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      ctx.session.get({ sessionID }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("session lookup timed out")), TOOL_SESSION_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 let internalToolRegistrySaturated = false;
 
 /** Track sessions created by this control plane, bounded for long-lived hosts. */
 export function registerInternalToolSession(
   sessionID: string,
   role: Exclude<InternalToolRole, "external" | "ambiguous">,
+  binding?: InternalWorkerBinding,
 ): void {
   if (!sessionID || sessionID.length > 256) throw new Error("invalid internal session identity");
+  if (role === "worker" && binding !== undefined) assertInternalWorkerBinding(binding);
+  if (role !== "worker" && binding !== undefined) throw new Error("only workers may have executor bindings");
   const existing = registeredInternalSessions.get(sessionID);
   if (existing) {
     if (existing.fenced) throw new Error("internal session fenced; refusing reuse");
+    if (existing.role !== role) {
+      existing.fenced = true;
+      throw new Error("internal session role conflict; session fenced");
+    }
+    if (binding && role === "worker") {
+      if (existing.binding && !sameBinding(existing.binding, binding)) {
+        existing.fenced = true;
+        throw new Error("worker session binding conflict; session fenced");
+      }
+      existing.binding ??= { ...binding };
+    }
     return;
   }
   if (internalToolRegistrySaturated) throw new Error("internal tool registry saturated; fail-closed");
@@ -46,7 +119,29 @@ export function registerInternalToolSession(
       throw new Error("internal tool registry saturated; fail-closed");
     }
   }
-  registeredInternalSessions.set(sessionID, { role, fenced: false });
+  registeredInternalSessions.set(sessionID, { role, fenced: false, ...(binding ? { binding: { ...binding } } : {}) });
+}
+
+/** Advance a reused worker only to the next same-model round approved by its caller. */
+export function bindInternalWorkerSession(sessionID: string, binding: InternalWorkerBinding): void {
+  if (!validWorkerBinding(binding)) throw new Error("invalid worker session binding");
+  const entry = registeredInternalSessions.get(sessionID);
+  if (!entry || entry.role !== "worker" || entry.fenced) throw new Error("worker session unavailable or fenced");
+  if (!entry.binding) {
+    entry.binding = { ...binding };
+    return;
+  }
+  if (sameBinding(entry.binding, binding)) return;
+  if (
+    entry.binding.runID === binding.runID &&
+    entry.binding.model === binding.model &&
+    binding.round === entry.binding.round + 1
+  ) {
+    entry.binding = { ...binding };
+    return;
+  }
+  entry.fenced = true;
+  throw new Error("worker session binding transition denied; session fenced");
 }
 
 /** Revoke all future tools before requesting runtime interruption. */
@@ -87,15 +182,20 @@ export function resolveInternalToolRole(metadata: unknown, sessionID?: string): 
   return resolved;
 }
 
-function deny(reason: "session state unavailable" | "role metadata ambiguous" | "local read-only authority" | "session fenced"): never {
+function deny(reason:
+  | "session state unavailable"
+  | "role metadata ambiguous"
+  | "worker model contract unavailable"
+  | "worker model mismatch"
+  | "local read-only authority"
+  | "session fenced"
+): never {
   throw new Tool.Error({ message: `OPJEV_INTERNAL_TOOL_DENIED: ${reason}` });
 }
 
 /**
- * Called by OpenCode's `tool.execute.before` hook. Reject with OpenCode's
- * typed Tool.Error so its Promise adapter can carry the failure through the
- * Effect hook contract without converting an arbitrary Error into a defect.
- * Unknown internal roles and unreadable session state fail closed.
+ * Called by OpenCode's `tool.execute.before` hook. Worker tools require a
+ * control-plane binding and an exact model read from the host session state.
  */
 export async function enforceInternalToolAuthority(
   ctx: { session: { get: (input: { sessionID: string }) => Promise<unknown> } },
@@ -103,24 +203,47 @@ export async function enforceInternalToolAuthority(
 ): Promise<void> {
   const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
   if (!sessionID) deny("session state unavailable");
-  if (registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
+  const registered = registeredInternalSessions.get(sessionID);
+  if (registered?.fenced) deny("session fenced");
 
+  let info: unknown;
   let role: InternalToolRole;
   try {
-    const info = await ctx.session.get({ sessionID });
+    info = await readSessionBounded(ctx, sessionID);
     const metadata = info && typeof info === "object" && !Array.isArray(info) && "metadata" in info
       ? info.metadata
       : undefined;
     role = resolveInternalToolRole(metadata, sessionID);
   } catch {
+    if (registered?.role === "worker") registered.fenced = true;
     deny("session state unavailable");
   }
 
-  if (registeredInternalSessions.get(sessionID)?.fenced) deny("session fenced");
+  const entry = registeredInternalSessions.get(sessionID);
+  if (entry?.fenced) deny("session fenced");
   if (role === "external") return;
   if (internalToolRegistrySaturated) deny("session fenced");
-  if (role === "worker") return;
-  if (role === "ambiguous") deny("role metadata ambiguous");
+  if (role === "worker") {
+    if (!entry || entry.role !== "worker") deny("role metadata ambiguous");
+    if (!entry.binding) {
+      entry.fenced = true;
+      deny("worker model contract unavailable");
+    }
+    const observedModel = runtimeModelRef(info);
+    if (!observedModel) {
+      entry.fenced = true;
+      deny("worker model contract unavailable");
+    }
+    if (observedModel !== entry.binding.model) {
+      entry.fenced = true;
+      deny("worker model mismatch");
+    }
+    return;
+  }
+  if (role === "ambiguous") {
+    if (entry?.role === "worker") entry.fenced = true;
+    deny("role metadata ambiguous");
+  }
 
   const tool = typeof event.tool === "string" ? event.tool : "";
   if (!Object.hasOwn(TOOL_READ_ALLOWLIST, tool)) deny("local read-only authority");

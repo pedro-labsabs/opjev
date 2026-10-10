@@ -47,6 +47,7 @@ import {
 import { withKeyedLock } from "../lock.ts";
 import { sessionBindingKey } from "./admission.ts";
 import type { ResourceBudgetDecision, BudgetStage } from "../resource-governor/budget-policy.ts";
+import type { InternalWorkerBinding } from "./tool-authority.ts";
 
 export const WORKER_TIMEOUT_MS = Number(process?.env?.OPJEV_WORKER_TIMEOUT_MS) > 0 ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS) : 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -58,13 +59,16 @@ export interface WorkerRuntime {
   createWorker(input: {
     agent: string;
     model: { providerID: string; id: string };
+    binding: InternalWorkerBinding;
     location?: { directory?: string };
     metadata: Record<string, unknown>;
   }): Promise<{ sessionID: string }>;
-  prompt(input: { sessionID: string; text: string; metadata?: Record<string, unknown> }): Promise<void>;
+  prompt(input: { sessionID: string; text: string; binding: InternalWorkerBinding; metadata?: Record<string, unknown> }): Promise<void>;
   wait(input: { sessionID: string }): Promise<void>;
   get(input: { sessionID: string }): Promise<WorkerSessionView>;
   context(input: { sessionID: string }): Promise<unknown[]>;
+  /** Synchronously fences all future worker tools before any interrupt request. */
+  fence(input: { sessionID: string }): void;
   interrupt?(input: { sessionID: string }): Promise<boolean>;
 }
 
@@ -492,6 +496,53 @@ function withTimeout<T>(
     );
   });
 }
+async function fenceAndInterruptWorker(runtime: WorkerRuntime, sessionID: string): Promise<boolean> {
+  let fenced = false;
+  try {
+    runtime.fence({ sessionID });
+    fenced = true;
+  } catch { /* fencing failure remains unconfirmed; still attempt host interruption */ }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const interruption = Promise.resolve()
+    .then(() => runtime.interrupt?.({ sessionID }))
+    .then((confirmed) => confirmed === true, () => false);
+  try {
+    const confirmed = await Promise.race([
+      interruption,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), INTERRUPT_CONFIRMATION_TIMEOUT_MS);
+      }),
+    ]);
+    return fenced && confirmed;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+async function terminateUnauthorizedWorker(
+  deps: DispatcherDeps,
+  input: {
+    sessionID: string;
+    failureCode: "executor-model-mismatch" | "executor-model-unobserved";
+    identity: Record<string, unknown>;
+    at: number;
+  },
+): Promise<boolean> {
+  const confirmed = await fenceAndInterruptWorker(deps.runtime, input.sessionID);
+  if (!confirmed) {
+    await observeResource(deps, resourceErrorObservation(
+      new OrchestrationError(
+        `${input.failureCode}-interrupt-unconfirmed`,
+        `${input.failureCode}: worker interruption was not confirmed`,
+      ),
+      input.at,
+      input.identity,
+    ));
+  }
+  return confirmed;
+}
+
+
 
 function bounded(msg: unknown): string {
   const s = msg instanceof Error ? msg.message : String(msg ?? "");
@@ -885,6 +936,7 @@ async function executeSchedule(
         const created = await deps.runtime.createWorker({
           agent: workerAgent,
           model: workerModel,
+          binding: { runID: contract.runID, round: state.round, model: roundModel },
           location: deps.location ? { directory: deps.location.directory } : undefined,
           metadata: {
             "jev-orchestration": true,
@@ -1005,7 +1057,12 @@ async function executeSchedule(
       let promptDelivered = false;
       try {
         await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
-        await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+        await deps.runtime.prompt({
+          sessionID: workerSessionID,
+          text: promptText,
+          binding: { runID: contract.runID, round: state.round, model: roundModel },
+          metadata: promptMeta,
+        });
         promptDelivered = true;
         if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
           try {
@@ -1120,6 +1177,12 @@ async function executeSchedule(
     // Missing executor evidence is not permission to inherit the selected
     // model; only structured runtime/message identity can substantiate it.
     if (!model) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-model-unobserved",
+        identity: { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, agent, role: "worker", round: state.round },
+        at: now(),
+      });
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
       } catch { /* kernel barrier */ }
@@ -1162,6 +1225,20 @@ async function executeSchedule(
       (runtimeModel !== undefined && runtimeModel !== contractedModel) ||
       modelTrail.mismatch;
     if (modelMismatch) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-model-mismatch",
+        identity: {
+          runID: contract.runID,
+          sessionID: workerSessionID,
+          route: selection?.route,
+          ...(runtimeModel ? { model: runtimeModel } : {}),
+          agent,
+          role: "worker",
+          round: state.round,
+        },
+        at: now(),
+      });
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
       } catch { /* kernel barrier */ }

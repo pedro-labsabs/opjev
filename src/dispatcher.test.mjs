@@ -28,6 +28,11 @@ import {
 import { buildCriticProviderPermissions } from "./orchestration/readonly-policy.ts";
 import * as workerHooks from "./worker-hooks.ts";
 import * as readonlyPolicy from "./orchestration/readonly-policy.ts";
+import {
+  enforceInternalToolAuthority,
+  fenceInternalToolSession,
+  registerInternalToolSession,
+} from "./orchestration/tool-authority.ts";
 import { aggregateUsage } from "./resource-governor/usage-ledger.ts";
 import { estimateResourcePressure } from "./resource-governor/pressure-estimator.ts";
 import { decideResourceBudget } from "./resource-governor/budget-policy.ts";
@@ -1280,6 +1285,7 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.equal(result.phase, "completed");
     assert.equal(created.agent, "build");
     assert.deepEqual(created.model, { providerID: "opencode", id: "big-pickle" });
+    assert.deepEqual(created.binding, { runID: "test-run-1", round: 1, model: "opencode/big-pickle" });
     assert.deepEqual(created.location, { directory: "/proj/sub" });
     assert.equal(created.metadata["jev-orchestration"], true);
     assert.equal(created.metadata["jev-run-id"], "test-run-1");
@@ -2925,6 +2931,122 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.deepEqual(result.rounds.map((round) => round.action), ["initial", "switch-model"]);
     assert.equal(t.effects.filter((effect) => effect === "create").length, 2);
   });
+
+  it("RCV28: confirmed mismatch interruption is bounded and terminal before critic or judgement", async () => {
+    const sessionID = `mismatch-interrupt-confirmed-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "test-run-1",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const t = fakeDeps({
+      workerSessionIDs: [sessionID],
+      view: { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+    });
+    const persisted = [];
+    const observations = [];
+    let interruptCalls = 0;
+    t.runtime.fence = ({ sessionID: fenced }) => fenceInternalToolSession(fenced);
+    t.runtime.interrupt = async ({ sessionID: interrupted }) => {
+      interruptCalls += 1;
+      fenceInternalToolSession(interrupted);
+      return true;
+    };
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      persist: async (record) => persisted.push(record),
+      observeResource: async (observation) => observations.push(observation),
+    });
+    assert.equal(interruptCalls, 1);
+    assert.equal(result.phase, "failed");
+    assert.match(result.error, /executor-model-mismatch/);
+    assert.equal(observations.some((x) => x.errorCode === "executor-model-mismatch"), true);
+    assert.equal(observations.some((x) => x.errorCode === "interrupt-unconfirmed"), false);
+    assert.equal(persisted.at(-1)?.kind, "run-failed");
+    assert.equal(result.evidence, undefined);
+    assert.equal(t.effects.includes("critic-create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
+  it("RCV29: stalled mismatch interruption stays bounded, records unknown confirmation, and fences late tools", async () => {
+    const sessionID = `mismatch-interrupt-stalled-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "test-run-1",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const t = fakeDeps({
+      workerSessionIDs: [sessionID],
+      view: { agent: "build", model: "opencode/mimo-v2.5-free", outcome: "succeeded" },
+    });
+    const observations = [];
+    const persisted = [];
+    let interruptCalls = 0;
+    t.runtime.fence = ({ sessionID: fenced }) => fenceInternalToolSession(fenced);
+    t.runtime.interrupt = async ({ sessionID: interrupted }) => {
+      interruptCalls += 1;
+      fenceInternalToolSession(interrupted);
+      return await new Promise(() => {});
+    };
+    const start = Date.now();
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      persist: async (record) => persisted.push(record),
+      observeResource: async (observation) => observations.push(observation),
+    });
+    assert.ok(Date.now() - start < 2000, "hung interrupt must not pin the terminal run");
+    assert.equal(interruptCalls, 1);
+    assert.equal(result.phase, "failed");
+    assert.equal(persisted.at(-1)?.kind, "run-failed");
+    assert.equal(observations.some((x) => x.errorCode === "interrupt-unconfirmed"), true);
+    const ctx = { session: { get: async () => ({
+      metadata: { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-agent-role": "implementer" },
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /fenced/i);
+    assert.equal(t.effects.includes("critic-create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
+  it("RCV30: unobserved worker model also interrupts and reports unconfirmed state", async () => {
+    const sessionID = `unobserved-interrupt-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "test-run-1",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const t = fakeDeps({
+      workerSessionIDs: [sessionID],
+      view: { agent: "build", outcome: "succeeded" },
+      messages: [],
+    });
+    const observations = [];
+    let interruptCalls = 0;
+    t.runtime.fence = ({ sessionID: fenced }) => fenceInternalToolSession(fenced);
+    t.runtime.interrupt = async ({ sessionID: interrupted }) => {
+      interruptCalls += 1;
+      fenceInternalToolSession(interrupted);
+      return false;
+    };
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      observeResource: async (observation) => observations.push(observation),
+    });
+    assert.equal(interruptCalls, 1);
+    assert.equal(result.phase, "failed");
+    assert.match(result.error, /executor-model-unobserved/);
+    assert.equal(observations.some((x) => x.errorCode === "executor-model-unobserved"), true);
+    assert.equal(observations.some((x) => x.errorCode === "interrupt-unconfirmed"), true);
+    assert.equal(t.effects.includes("critic-create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
 
   it("RCV22: out-of-pool nunca repair — nenhum segundo prompt, nenhuma round2", async () => {
     const t = fakeDeps({

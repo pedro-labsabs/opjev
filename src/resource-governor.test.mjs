@@ -75,6 +75,33 @@ test("sanitizer preserves usage status and nonnegative integer ledger fields onl
   assert.equal(JSON.stringify(safe).includes("private"), false);
   assert.equal("arbitrary" in safe, false);
 });
+test("persists only the two controlled executor model failure codes", () => {
+  const ledger = new UsageLedger({ capacity: 4 });
+  const allowed = ["executor-model-mismatch", "executor-model-unobserved"];
+  for (const errorCode of allowed) {
+    ledger.append({
+      at: 1,
+      kind: "operational-failure",
+      errorCode,
+      prompt: "private prompt",
+      credential: "secret-token",
+      arbitrary: { output: "private result" },
+    });
+  }
+  const rows = ledger.snapshot();
+  assert.deepEqual(rows.map((row) => row.errorCode), allowed);
+  for (const row of rows) {
+    assert.equal("prompt" in row, false);
+    assert.equal("credential" in row, false);
+    assert.equal("arbitrary" in row, false);
+  }
+  assert.equal("errorCode" in ledger.append({
+    at: 2,
+    kind: "operational-failure",
+    errorCode: "executor-model-mismatch: token=secret",
+    prompt: "private prompt",
+  }), false);
+});
 
 test("sanitizer preserves contract-sized run and session identities", () => {
   const runID = "r".repeat(200);

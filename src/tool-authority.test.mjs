@@ -76,12 +76,173 @@ describe("separação entre tool visibility e local authority", () => {
       await assert.rejects(simulateToolCall(ctx, "orch-1", tool), /local read-only authority/);
     }
   });
+  it("requires a valid control-plane binding before creating a worker session", async () => {
+    let createCalls = 0;
+    const runtime = makeWorkerRuntime({ session: { create: async () => {
+      createCalls += 1;
+      return { id: `unbound-create-${Date.now()}` };
+    } } });
+    await assert.rejects(runtime.createWorker({
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      metadata: {},
+    }), /binding/i);
+    assert.equal(createCalls, 0);
+  });
 
-  it("não transfere read-only ao worker, cuja permission payload segue independente", async () => {
-    const ctx = { session: { get: async () => sessionInfo("worker", "implementer") } };
-    assert.equal(resolveInternalToolRole(sessionInfo("worker", "implementer").metadata), "worker");
-    assert.equal(await simulateToolCall(ctx, "worker-1", "edit"), 1);
-    assert.equal(await simulateToolCall(ctx, "worker-1", "bash"), 1);
+  it("advances a reused worker only to the next same-model round", async () => {
+    const sessionID = `repair-binding-${Date.now()}`;
+    const model = { providerID: "opencode", id: "big-pickle" };
+    const prompts = [];
+    const ctx = {
+      session: {
+        create: async () => ({ id: sessionID }),
+        prompt: async (input) => prompts.push(input),
+        get: async () => ({ ...sessionInfo("worker", "implementer"), model }),
+      },
+    };
+    const runtime = makeWorkerRuntime(ctx);
+    const binding = { runID: "repair-binding-run", round: 1, model: "opencode/big-pickle" };
+    await runtime.createWorker({
+      agent: "build",
+      model,
+      binding,
+      metadata: {},
+    });
+    await runtime.prompt({ sessionID, text: "round one", binding, metadata: {} });
+    await runtime.prompt({
+      sessionID,
+      text: "round two",
+      binding: { ...binding, round: 2 },
+      metadata: {},
+    });
+    assert.equal(prompts.length, 2);
+    await assert.rejects(runtime.prompt({
+      sessionID,
+      text: "unauthorized switch",
+      binding: { ...binding, round: 3, model: "opencode/mimo-v2.5-free" },
+      metadata: {},
+    }), /binding transition/i);
+    assert.equal(prompts.length, 2);
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /fenced/i);
+  });
+
+
+  it("worker tools require a control-plane model binding and an exact runtime model", async () => {
+    const sessionID = `bound-worker-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "run-model-bound",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const ctx = { session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.doesNotReject(enforceInternalToolAuthority(ctx, { sessionID, tool: "edit" }));
+  });
+
+  it("denies and fences a worker whose runtime model diverges from its contract", async () => {
+    const sessionID = `divergent-worker-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "run-model-divergent",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    let model = { providerID: "opencode", id: "mimo-v2.5-free" };
+    const ctx = { session: { get: async () => ({ ...sessionInfo("worker", "implementer"), model }) } };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /model/i);
+    model = { providerID: "opencode", id: "big-pickle" };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /fenced/i);
+  });
+
+  it("denies and fences a worker with a missing or ambiguous model contract", async () => {
+    const missing = `missing-contract-${Date.now()}`;
+    registerInternalToolSession(missing, "worker");
+    const missingCtx = { session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(missingCtx, { sessionID: missing, tool: "edit" }), /contract|model/i);
+
+    const ambiguous = `ambiguous-model-${Date.now()}`;
+    registerInternalToolSession(ambiguous, "worker", {
+      runID: "run-model-ambiguous",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const ambiguousCtx = { session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model: { providerID: "opencode" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(ambiguousCtx, { sessionID: ambiguous, tool: "edit" }), /model/i);
+  });
+  it("bounds a non-settling runtime model lookup and fences the worker", async () => {
+    const sessionID = `hung-model-lookup-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "hung-model-lookup-run",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const ctx = { session: { get: async () => await new Promise(() => {}) } };
+    const start = Date.now();
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /session state unavailable/);
+    assert.ok(Date.now() - start < 1000);
+    const readable = { session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(readable, { sessionID, tool: "bash" }), /fenced/i);
+  });
+
+
+  it("does not grant worker authority from unregistered session metadata", async () => {
+    const ctx = { session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID: "unregistered-worker", tool: "bash" }), /role|contract|authority/i);
+  });
+
+  it("accepts Jev-authorized model changes only in a newly bound worker session", async () => {
+    const roundOne = `switch-round-1-${Date.now()}`;
+    const roundTwo = `switch-round-2-${Date.now()}`;
+    registerInternalToolSession(roundOne, "worker", {
+      runID: "run-governed-switch",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    registerInternalToolSession(roundTwo, "worker", {
+      runID: "run-governed-switch",
+      round: 2,
+      model: "opencode/mimo-v2.5-free",
+    });
+    const ctxFor = (model) => ({ session: { get: async () => ({
+      ...sessionInfo("worker", "implementer"),
+      model,
+    }) } });
+    await assert.doesNotReject(enforceInternalToolAuthority(ctxFor({ providerID: "opencode", id: "big-pickle" }), {
+      sessionID: roundOne, tool: "bash",
+    }));
+    await assert.doesNotReject(enforceInternalToolAuthority(ctxFor({ providerID: "opencode", id: "mimo-v2.5-free" }), {
+      sessionID: roundTwo, tool: "bash",
+    }));
+  });
+
+  it("blocks a tool on observed A→B→A before the model returns to A", async () => {
+    const sessionID = `a-b-a-worker-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "run-a-b-a",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    let model = { providerID: "opencode", id: "big-pickle" };
+    const ctx = { session: { get: async () => ({ ...sessionInfo("worker", "implementer"), model }) } };
+    await assert.doesNotReject(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }));
+    model = { providerID: "opencode", id: "mimo-v2.5-free" };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /model/i);
+    model = { providerID: "opencode", id: "big-pickle" };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /fenced/i);
   });
 
   it("nega sem side effect quando metadata confiável é parcial ou estado não pode ser lido", async () => {
@@ -123,7 +284,7 @@ describe("separação entre tool visibility e local authority", () => {
     const ctx = {
       session: {
         create: async () => ({ id: sessionID }),
-        get: async () => sessionInfo("worker", "implementer"),
+        get: async () => ({ ...sessionInfo("worker", "implementer"), model: { providerID: "opencode", id: "big-pickle" } }),
         interrupt: async () => await new Promise(() => {}),
       },
     };
@@ -131,6 +292,7 @@ describe("separação entre tool visibility e local authority", () => {
     await runtime.createWorker({
       agent: "build",
       model: { providerID: "opencode", id: "big-pickle" },
+      binding: { runID: "fenced-worker-run", round: 1, model: "opencode/big-pickle" },
       metadata: {},
     });
     void runtime.interrupt({ sessionID });
@@ -181,7 +343,12 @@ describe("separação entre tool visibility e local authority", () => {
       },
     };
     const runtime = makeWorkerRuntime(ctx);
-    const input = { agent: "build", model: { providerID: "opencode", id: "big-pickle" }, metadata: {} };
+    const input = {
+      agent: "build",
+      model: { providerID: "opencode", id: "big-pickle" },
+      binding: { runID: "reused-fenced-run", round: 1, model: "opencode/big-pickle" },
+      metadata: {},
+    };
     await runtime.createWorker(input);
     assert.equal(await runtime.interrupt({ sessionID }), false);
 
@@ -213,6 +380,7 @@ describe("separação entre tool visibility e local authority", () => {
       const { sessionID } = await runtime.createWorker({
         agent: "build",
         model: { providerID: "opencode", id: "big-pickle" },
+        binding: { runID: "interrupt-confirmation-run", round: 1, model: "opencode/big-pickle" },
         metadata: {},
       });
       assert.equal(await runtime.interrupt({ sessionID }), confirmed);

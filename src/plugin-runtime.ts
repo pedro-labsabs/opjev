@@ -7,7 +7,13 @@ import { OrchestrationError, type ExecutionContract } from "./orchestration/type
 import { createFollowupTakeSeam } from "./orchestration/followup.ts";
 
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
-import { assertInternalToolRegistryAvailable, fenceInternalToolSession, registerInternalToolSession } from "./orchestration/tool-authority.ts";
+import {
+  assertInternalToolRegistryAvailable,
+  assertInternalWorkerBinding,
+  bindInternalWorkerSession,
+  fenceInternalToolSession,
+  registerInternalToolSession,
+} from "./orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -456,6 +462,7 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
   return {
     async createWorker(input) {
       assertInternalToolRegistryAvailable();
+      assertInternalWorkerBinding(input.binding);
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
@@ -465,11 +472,15 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
-      registerInternalToolSession(sessionID, "worker");
+      registerInternalToolSession(sessionID, "worker", input.binding);
       return { sessionID };
     },
-    async prompt({ sessionID, text, metadata }) {
+    async prompt({ sessionID, text, metadata, binding }) {
+      bindInternalWorkerSession(sessionID, binding);
       await ctx.session.prompt({ sessionID, text, metadata });
+    },
+    fence({ sessionID }) {
+      fenceInternalToolSession(sessionID);
     },
     async wait({ sessionID }) {
       await ctx.session.wait({ sessionID });

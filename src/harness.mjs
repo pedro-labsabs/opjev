@@ -2,6 +2,7 @@
 // Permite executar o plugin real (index.ts) contra um runtime simulado e
 // observar os efeitos (switches, storage, hook calls, bodies enviados ao Jev).
 
+let workerSessionSequence = 0;
 export function makeStorage(seed = {}) {
   const map = new Map(Object.entries(seed));
   // Historico de escritas (append-only): preserva TODOS os valores por chave,
@@ -87,7 +88,6 @@ export function makeCtx({
   // jev-role para variar comportamento default por role.
   const workerSessions = new Map();
   const workerCalls = { create: [], prompt: [], wait: [], get: [], context: [], interrupt: [] };
-  let workerSeq = 0;
   const defaultWorkerMessages = [
     {
       id: "wmsg-1",
@@ -116,8 +116,7 @@ export function makeCtx({
   const roleOf = (input = {}) => input?.metadata?.["jev-role"] === "critic" ? "critic" : "worker";
 
   function workerInfo(input = {}) {
-    workerSeq += 1;
-    const id = `worker-${workerSeq}`;
+    const id = `worker-${++workerSessionSequence}`;
     const role = roleOf(input);
     return {
       id,
