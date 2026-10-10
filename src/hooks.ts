@@ -5,7 +5,7 @@ import { buildSnapshot } from "./snapshot.ts";
 import { buildDecisionRecord } from "./sanitize.ts";
 import { buildToolRecoverQuestions } from "./jev-client.ts";
 
-import { enforceInternalToolAuthority, resolveInternalToolRole } from "./orchestration/tool-authority.ts";
+import { enforceInternalToolAuthority, resolveInternalToolRole, type InternalToolRole } from "./orchestration/tool-authority.ts";
 
 import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { latchQuotaLimit } from "./resource-governor/enforcement-state.ts";
@@ -15,19 +15,45 @@ import { buildCriticContextInstruction, buildOrchestratorContextInstruction, bui
 
 import { applySwitch, errorClassOf, firstAvailable, freeCandidates, isModelAvailable, isContextOverflow, isGlobalThrottle, isTrivialFollowUp, modelRefString, orchestrationRoleOf, pruneKeys, recordRuntimeResource, safeStorageGet, switchExecutor, switchToModel, switchToAgent, validAgents, type IntentionRecord, type RouteState, TOOL_ERROR_WINDOW_MS, TOOL_ERROR_REPEAT_THRESHOLD, TOOL_DECIDE_COOLDOWN_MS, SWITCH_COOLDOWN_MS, RECOVERY_ACTIONS, toolErrorMayBeUnviable } from "./plugin-runtime.ts";
 
+const HOOK_ROLE_LOOKUP_TIMEOUT_MS = 250;
+
+async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalToolRole> {
+  if (!sessionID) return "ambiguous";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const info: any = await Promise.race([
+      ctx.session.get({ sessionID }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("session role lookup timed out")), HOOK_ROLE_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+    if (!info || typeof info !== "object" || Array.isArray(info)) return "ambiguous";
+    return resolveInternalToolRole(info.metadata, sessionID);
+  } catch {
+    return "ambiguous";
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
+  if (isContextOverflow(error)) {
+    await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
+  } else if (isGlobalThrottle(error)) {
+    const status = Number((error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status);
+    await recordRuntimeResource(ctx, {
+      ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
+      ...(Number.isInteger(status) && status >= 0 ? { statusCode: status } : {}),
+    });
+  } else {
+    await recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
+  }
+}
+
 async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number; getKey: () => Promise<string | undefined>; jevModel: string; jevEndpoint: string }): Promise<void> {
   if (event?.status !== "error") return;
   const sessionID = String(event?.sessionID ?? "");
   if (!sessionID) return;
-  // Critic/orchestrator are evaluators/planners, never Jev decision clients.
-  // A local read-only denial must not turn into a Jev retry/recovery loop.
-  try {
-    const info: any = await ctx.session.get({ sessionID });
-    const role = resolveInternalToolRole(info?.metadata, sessionID);
-    if (role === "critic" || role === "orchestrator" || role === "ambiguous") return;
-  } catch {
-    return;
-  }
   const tool = String(event?.tool ?? "unknown");
   const message = String(event?.error?.message ?? event?.error ?? "");
   const errorClass = errorClassOf(message);
@@ -50,6 +76,10 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
     counter.count >= TOOL_ERROR_REPEAT_THRESHOLD || toolErrorMayBeUnviable(message);
   if (!material) return;
 
+  // Factual counting above is retained even for internal/ambiguous roles.
+  // Only the external parent may use this legacy advisory recovery hook.
+  const role = await lookupHookRole(ctx, sessionID);
+  if (role !== "external") return;
   // Cooldown: mesma assinatura decidida recentemente nao re-consulta o Jev.
   const decidedKey = `tool-decided/${sessionID}/${tool}/${errorClass}`;
   const lastDecided: any = await safeStorageGet(ctx, decidedKey);
@@ -195,12 +225,12 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
     // Jev indisponivel: fallback determinístico — apenas registra; nao vira acao.
   }
 }
-
 // Recomendacao de recuperacao one-shot: se existe `pending-recovery/<sessionID>`
 // (decisao do Jev apos erro material, nao executada pelo plugin), injeta uma
 // mensagem ENXUTA no proximo context do agente e CONSONE a chave na hora —
 // chega uma unica vez, nunca cresce, nunca roda em loop. Sem acao destrutiva
 // automatica: o agente decide se segue a recomendacao.
+
 async function injectPendingRecovery(ctx: any, sessionID: string, event: any): Promise<void> {
   if (!sessionID || !event?.system || !Array.isArray(event.system)) return;
   try {
@@ -267,13 +297,24 @@ export async function registerSessionHooks(
       };
       const errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
       if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
-        // Set the runtime boundary first, then establish the authoritative latch
-        // before this hook returns. The observation ledger remains best-effort.
+        // Quota is a global deny and must latch before role lookup.
         event.decision = { retry: false };
         try { await latchQuotaLimit(ctx.storage, Date.now()); } catch { /* in-process emergency latch stays active */ }
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
+        await recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
         return;
-      } else if (isContextOverflow(event?.error)) {
+      }
+
+      // Global hooks may recover only an unambiguously external parent. Worker,
+      // critic, orchestrator, and unavailable/ambiguous session state are owned
+      // by the control plane or denied; preserve facts but do not retry/switch.
+      const role = await lookupHookRole(ctx, sessionID);
+      if (role !== "external") {
+        event.decision = { retry: false };
+        await observeRetryFailure(ctx, resourceBase, event?.error);
+        return;
+      }
+
+      if (isContextOverflow(event?.error)) {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
       } else if (isGlobalThrottle(event?.error)) {

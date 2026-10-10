@@ -158,9 +158,23 @@ export function makeCtx({
 
   const roundMessagesFor = (w, behavior, role) => {
     const round = lastRoundOf(w);
-    return role === "critic"
+    const isDefault = behavior.messagesByRound === undefined && behavior.messages === undefined;
+    const messages = role === "critic"
       ? pickSeq(behavior.messagesByRound, round, behavior.messages ?? defaultCriticMessages)
       : pickSeq(behavior.messagesByRound, round, behavior.messages ?? defaultWorkerMessages);
+    if (!Array.isArray(messages)) return messages;
+    const observedModel = pickSeq(behavior.modelByRound, round, w.model);
+    const modelRef = typeof observedModel === "string"
+      ? (() => {
+          const separator = observedModel.indexOf("/");
+          return separator > 0 ? { providerID: observedModel.slice(0, separator), id: observedModel.slice(separator + 1) } : undefined;
+        })()
+      : observedModel;
+    return messages.map((message) =>
+      message?.type === "assistant" && modelRef && (isDefault || message.model === undefined)
+        ? { ...message, model: modelRef }
+        : message,
+    );
   };
   const roundOutcomeFor = (w, behavior, role) => {
     const round = lastRoundOf(w);

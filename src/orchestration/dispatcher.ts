@@ -287,6 +287,43 @@ function observedTokenCounts(usage: unknown): Record<string, number> | undefined
   }
   return Object.keys(out).length ? out : undefined;
 }
+
+const MAX_MODEL_TRAIL = 4;
+const MAX_MODEL_REF_LENGTH = 256;
+
+function structuredModelRef(value: unknown): string | undefined {
+  const ref = typeof value === "string"
+    ? value.trim()
+    : value && typeof value === "object" &&
+        typeof (value as any).providerID === "string" &&
+        typeof (value as any).id === "string"
+      ? `${(value as any).providerID}/${(value as any).id}`
+      : "";
+  return ref && ref.length <= MAX_MODEL_REF_LENGTH && !/[\u0000-\u001f]/.test(ref) ? ref : undefined;
+}
+
+function assistantModelTrail(messages: unknown[], contractedModel: string): { models: string[]; mismatch: boolean; truncated: boolean } {
+  const models: string[] = [];
+  let last: string | undefined;
+  let mismatch = false;
+  let truncated = false;
+  if (!Array.isArray(messages)) return { models, mismatch, truncated };
+  for (const raw of messages) {
+    if (!raw || typeof raw !== "object" || (raw as any).type !== "assistant") continue;
+    const model = structuredModelRef((raw as any).model);
+    if (!model) continue;
+    if (model !== contractedModel) mismatch = true;
+    if (model === last) continue;
+    last = model;
+    if (models.length < MAX_MODEL_TRAIL) models.push(model);
+    else truncated = true;
+  }
+  return { models, mismatch, truncated };
+}
+
+function diagnosticModel(model: string | undefined): string {
+  return (model ?? "unknown").replace(/[\u0000-\u001f]/g, "?").slice(0, 64);
+}
 // Local diagnostics only: allow 250ms for host metadata, independent of worker deadline.
 const PARTIAL_USAGE_READ_TIMEOUT_MS = 250;
 
@@ -1050,14 +1087,56 @@ async function executeSchedule(
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
     const agent = view.agent?.trim() || roundAgent;
-    const model = view.model?.trim() || roundModel;
+    const jevSelectedModel = mode === "initial"
+      ? selection?.model
+      : mode === "switch-model"
+        ? prev?.switchTo?.model
+        : roundModel;
+    const contractedModel = state.executor?.model ?? roundModel;
+    const runtimeModel = structuredModelRef(view.model);
+    const modelTrail = assistantModelTrail(messages, contractedModel);
+    const model = runtimeModel ?? modelTrail.models.at(-1);
+    const hasMultipleObservedModels = modelTrail.truncated ||
+      modelTrail.models.length > 1 ||
+      (runtimeModel !== undefined && modelTrail.models.length > 0 && runtimeModel !== modelTrail.models.at(-1));
     const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
-    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
+    if (tokenCounts) {
+      const tokenModel = hasMultipleObservedModels
+        ? undefined
+        : modelTrail.models[0] ?? runtimeModel ?? undefined;
+      await observeResource(deps, {
+        at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID,
+        sessionID: workerSessionID, route: selection?.route,
+        ...(tokenModel ? { model: tokenModel } : {}),
+        agent, role: "worker", round: state.round, tokens: tokenCounts,
+      });
+    }
 
-    // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
-    // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
-    // critic, judge e recovery — sem fallback para selection, sem routing
-    // alternativo (validation != routing).
+    const diagnostic = (code: string) =>
+      `${code}: selected=${diagnosticModel(jevSelectedModel)} contracted=${diagnosticModel(contractedModel)} ` +
+      `runtime=${diagnosticModel(runtimeModel)} observed=${modelTrail.models.map(diagnosticModel).join("→") || "unknown"}` +
+      (modelTrail.truncated ? "→…" : "");
+
+    // Missing executor evidence is not permission to inherit the selected
+    // model; only structured runtime/message identity can substantiate it.
+    if (!model) {
+      try {
+        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
+      } catch { /* kernel barrier */ }
+      const error = new OrchestrationError("executor-model-unobserved", diagnostic("executor-model-unobserved"));
+      await observeResource(deps, {
+        at: now(), kind: "operational-failure", runID: contract.runID, sessionID: workerSessionID,
+        route: selection?.route, agent, role: "worker", round: state.round,
+        errorCode: "executor-model-unobserved", failureDomain: "operational",
+      });
+      return {
+        abort: true,
+        result: await failRun(state, contract.runID, error, { rounds }, { deps, kind: "run-failed", workerSessionID }),
+      };
+    }
+
+    // A FREE_POOL model is still unauthorized unless the runtime and every
+    // structured assistant-message model match the current kernel contract.
     if (!isFreeModel(model)) {
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
@@ -1074,6 +1153,28 @@ async function executeSchedule(
           },
           { deps, kind: "run-failed", workerSessionID },
         ),
+      };
+    }
+
+    const modelMismatch =
+      jevSelectedModel !== contractedModel ||
+      roundModel !== contractedModel ||
+      (runtimeModel !== undefined && runtimeModel !== contractedModel) ||
+      modelTrail.mismatch;
+    if (modelMismatch) {
+      try {
+        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
+      } catch { /* kernel barrier */ }
+      const error = new OrchestrationError("executor-model-mismatch", diagnostic("executor-model-mismatch"));
+      await observeResource(deps, {
+        at: now(), kind: "operational-failure", runID: contract.runID, sessionID: workerSessionID,
+        route: selection?.route, ...(runtimeModel ? { model: runtimeModel } : {}),
+        agent, role: "worker", round: state.round,
+        errorCode: "executor-model-mismatch", failureDomain: "operational",
+      });
+      return {
+        abort: true,
+        result: await failRun(state, contract.runID, error, { rounds }, { deps, kind: "run-failed", workerSessionID }),
       };
     }
 
