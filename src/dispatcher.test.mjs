@@ -2869,6 +2869,100 @@ describe("runtime recovery same-executor: repair-same e fresh-same (multi-round 
     assert.equal(t.effects.filter((e) => e === "prompt").length, 1, "so a round1 executou prompt");
     assert.equal(t.effects.filter((e) => e === "create").length, 1, "so a worker inicial criada");
   });
+  it("RCV31: out-of-pool worker is fenced before run-failed and late tools are denied", async () => {
+    const sessionID = `out-of-pool-fence-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "test-run-1",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const t = fakeDeps({
+      workerSessionIDs: [sessionID],
+      view: { agent: "build", model: "openai/gpt-paid-test", outcome: "succeeded" },
+    });
+    const events = [];
+    const persisted = [];
+    let interruptCalls = 0;
+    t.runtime.fence = ({ sessionID: fenced }) => {
+      events.push("fence");
+      fenceInternalToolSession(fenced);
+    };
+    t.runtime.interrupt = async ({ sessionID: interrupted }) => {
+      events.push("interrupt");
+      interruptCalls += 1;
+      fenceInternalToolSession(interrupted);
+      return true;
+    };
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      persist: async (record) => {
+        persisted.push(record);
+        if (record.kind === "run-failed") events.push("run-failed");
+      },
+    });
+    assert.equal(result.phase, "failed");
+    assert.match(result.error, /executor-not-free/);
+    assert.equal(interruptCalls, 1);
+    assert.deepEqual(events, ["fence", "interrupt", "run-failed"]);
+    assert.equal(persisted.at(-1)?.kind, "run-failed");
+    assert.match(persisted.at(-1)?.state.lastError ?? "", /executor-not-free/);
+    assert.equal(persisted.some((record) => record.kind === "evidence-ready"), false);
+    assert.equal(result.evidence, undefined);
+    assert.equal(result.worker, undefined);
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.filter((effect) => effect === "prompt").length, 1);
+    assert.equal(t.effects.includes("critic-create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+
+    const ctx = { session: { get: async () => ({
+      metadata: { "jev-router": "orchestration-internal", "jev-role": "worker", "jev-agent-role": "implementer" },
+      model: { providerID: "opencode", id: "big-pickle" },
+    }) } };
+    await assert.rejects(enforceInternalToolAuthority(ctx, { sessionID, tool: "bash" }), /fenced/i);
+  });
+
+  it("RCV32: out-of-pool worker with a hung interrupt remains bounded and records unconfirmed interruption", async () => {
+    const sessionID = `out-of-pool-hung-interrupt-${Date.now()}`;
+    registerInternalToolSession(sessionID, "worker", {
+      runID: "test-run-1",
+      round: 1,
+      model: "opencode/big-pickle",
+    });
+    const t = fakeDeps({
+      workerSessionIDs: [sessionID],
+      view: { agent: "build", model: "openai/gpt-paid-test", outcome: "succeeded" },
+    });
+    const observations = [];
+    const persisted = [];
+    let interruptCalls = 0;
+    t.runtime.fence = ({ sessionID: fenced }) => fenceInternalToolSession(fenced);
+    t.runtime.interrupt = async () => {
+      interruptCalls += 1;
+      return await new Promise(() => {});
+    };
+    const start = Date.now();
+    const result = await runOrchestrationOnce(contract({ maxRounds: 2 }), {
+      runtime: t.runtime,
+      critic: t.critic,
+      decisions: t.decisions,
+      persist: async (record) => persisted.push(record),
+      observeResource: async (observation) => observations.push(observation),
+    });
+    assert.ok(Date.now() - start < 2000, "hung interruption must not pin the terminal run");
+    assert.equal(interruptCalls, 1);
+    assert.equal(result.phase, "failed");
+    assert.match(result.error, /executor-not-free/);
+    assert.equal(persisted.at(-1)?.kind, "run-failed");
+    assert.equal(observations.some((observation) => observation.errorCode === "interrupt-unconfirmed"), true);
+    assert.equal(t.effects.filter((effect) => effect === "create").length, 1);
+    assert.equal(t.effects.filter((effect) => effect === "prompt").length, 1);
+    assert.equal(t.effects.includes("critic-create"), false);
+    assert.equal(t.effects.includes("judge"), false);
+  });
+
+
 
   it("RCV25: divergent FREE_POOL runtime model fails before packet, critic, or verdict", async () => {
     const t = fakeDeps({

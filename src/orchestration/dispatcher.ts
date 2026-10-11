@@ -523,7 +523,7 @@ async function terminateUnauthorizedWorker(
   deps: DispatcherDeps,
   input: {
     sessionID: string;
-    failureCode: "executor-model-mismatch" | "executor-model-unobserved";
+    failureCode: "executor-not-free" | "executor-model-mismatch" | "executor-model-unobserved";
     identity: Record<string, unknown>;
     at: number;
   },
@@ -1201,19 +1201,34 @@ async function executeSchedule(
     // A FREE_POOL model is still unauthorized unless the runtime and every
     // structured assistant-message model match the current kernel contract.
     if (!isFreeModel(model)) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-not-free",
+        identity: {
+          runID: contract.runID,
+          sessionID: workerSessionID,
+          route: selection?.route,
+          model: diagnosticModel(model),
+          agent,
+          role: "worker",
+          round: state.round,
+        },
+        at: now(),
+      });
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
       } catch { /* kernel barrier */ }
+      const error = new OrchestrationError(
+        "executor-not-free",
+        `executor-not-free: observed model outside FREE_POOL (${diagnosticModel(model)})`,
+      );
       return {
         abort: true,
         result: await failRun(
           state,
           contract.runID,
-          new OrchestrationError("executor-not-free", `modelo observado fora do FREE_POOL: ${model}`),
-          {
-            worker: { sessionID: workerSessionID, agent, model, outcome: "failed", finalText },
-            rounds,
-          },
+          error,
+          { rounds },
           { deps, kind: "run-failed", workerSessionID },
         ),
       };
