@@ -36,8 +36,13 @@ export interface JevNoulAnswer {
 
 export type SystemOneAnswer = JevChoiceAnswer | JevNoulAnswer;
 
-/** Mapa de respostas do Jev para o julgamento de uma rodada. */
-export type RoundJudgementAnswers = Record<string, SystemOneAnswer>;
+/** Four decision values returned by the current SystemOne wire contract. */
+export interface RoundJudgementAnswers {
+  done: JevNoulAnswer;
+  failure_class: JevChoiceAnswer;
+  same_executor_can_repair: JevNoulAnswer;
+  next_action: JevChoiceAnswer;
+}
 
 /** Perguntas SystemOne validas (mesmo schema que o runtime valida em validateQuestions). */
 export type RoundJudgementQuestions = Record<

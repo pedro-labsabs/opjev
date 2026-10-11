@@ -1,9 +1,11 @@
+import { isFailureClass, isNextAction, type FailureClass, type NextAction } from "../orchestration/types.ts";
+
 /** Shared, factual telemetry for resource governance and future model intelligence. */
 export type ObservationKind =
   | "unknown"
   | "request" | "round" | "retry" | "recovery" | "escalation" | "outcome" | "fanout"
   | "compaction" | "token-usage" | "throttle" | "quota-limit" | "context-overflow"
-  | "provider-error" | "operational-failure";
+  | "provider-error" | "operational-failure" | "jev-verdict";
 
 export interface UsageObservation {
   at?: number;
@@ -26,12 +28,20 @@ export interface UsageObservation {
   failureDomain?: "provider" | "quota" | "context" | "execution" | "operational" | "unknown";
   usageStatus?: "partial" | "terminal";
   tokens?: { input?: number; output?: number; reasoning?: number; cacheRead?: number; cacheWrite?: number };
+  decisionAnswers?: {
+    doneNoul: number;
+    failureClass: FailureClass;
+    sameExecutorCanRepairNoul: number;
+    nextAction: NextAction;
+  };
+  decisionStatus?: "valid" | "invalid";
 }
 
 const KINDS = new Set<ObservationKind>([
   "unknown",
   "request", "round", "retry", "recovery", "escalation", "outcome", "fanout", "compaction",
   "token-usage", "throttle", "quota-limit", "context-overflow", "provider-error", "operational-failure",
+  "jev-verdict",
 ]);
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
@@ -64,6 +74,24 @@ export function sanitizeObservation(value: unknown): UsageObservation {
   if (["provider", "quota", "context", "execution", "operational", "unknown"].includes(String(x.failureDomain))) out.failureDomain = x.failureDomain as UsageObservation["failureDomain"];
   if (["rate-limit", "throttle", "overload", "unknown"].includes(String(x.signal))) out.signal = x.signal as UsageObservation["signal"];
   if (["partial", "terminal"].includes(String(x.usageStatus))) out.usageStatus = x.usageStatus as UsageObservation["usageStatus"];
+  if (x.decisionStatus === "valid" || x.decisionStatus === "invalid") out.decisionStatus = x.decisionStatus;
+  const decision = x.decisionAnswers && typeof x.decisionAnswers === "object"
+    ? x.decisionAnswers as Record<string, unknown>
+    : {};
+  if (
+    typeof decision.doneNoul === "number" && Number.isFinite(decision.doneNoul) && decision.doneNoul >= 0 && decision.doneNoul <= 1 &&
+    isFailureClass(decision.failureClass) &&
+    typeof decision.sameExecutorCanRepairNoul === "number" && Number.isFinite(decision.sameExecutorCanRepairNoul) &&
+    decision.sameExecutorCanRepairNoul >= 0 && decision.sameExecutorCanRepairNoul <= 1 &&
+    isNextAction(decision.nextAction)
+  ) {
+    out.decisionAnswers = {
+      doneNoul: decision.doneNoul,
+      failureClass: decision.failureClass,
+      sameExecutorCanRepairNoul: decision.sameExecutorCanRepairNoul,
+      nextAction: decision.nextAction,
+    };
+  }
   for (const key of ["round", "retry", "statusCode"] as const) {
     if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
   }

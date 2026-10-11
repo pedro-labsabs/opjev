@@ -18,6 +18,7 @@
 
 import {
   OrchestrationError,
+  validateVerdict,
   type EvidencePacket,
   type ExecutionContract,
   type ExecutionOutcome,
@@ -30,7 +31,7 @@ import {
 } from "./types.ts";
 import { createRunState, transitionRun, type TransitionCommands } from "./state-machine.ts";
 import { validateResumableRunState } from "./human-gate.ts";
-import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
+import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict, type RoundJudgementAnswers } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { sanitizeDecisionExplanation, type DecisionExplanation } from "./decision-explanation.ts";
@@ -1501,6 +1502,27 @@ async function executeSchedule(
       // 7. parse + verdict
       try {
         verdict = parseRoundVerdict(answers);
+        const structured = answers as RoundJudgementAnswers;
+        let decisionStatus: "valid" | "invalid" = "valid";
+        try {
+          validateVerdict(verdict);
+        } catch {
+          decisionStatus = "invalid";
+        }
+        await observeResource(deps, {
+          at: now(),
+          kind: "jev-verdict",
+          runID: contract.runID,
+          role: "jev",
+          round: state.round,
+          decisionAnswers: {
+            doneNoul: structured.done.noul,
+            failureClass: verdict.failureClass,
+            sameExecutorCanRepairNoul: structured.same_executor_can_repair.noul,
+            nextAction: verdict.nextAction,
+          },
+          decisionStatus,
+        });
       } catch (err) {
         return {
           abort: true,

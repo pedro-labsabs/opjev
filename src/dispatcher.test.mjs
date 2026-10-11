@@ -1069,6 +1069,59 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
     assert.equal(observations.some(x => "prompt" in x || "rawOutput" in x), false);
     assert.equal(result.selection.model, "opencode/big-pickle", "observer does not route");
   });
+  it("O0i: Jev structured answers are recorded bounded even when invariants reject the verdict", async () => {
+    const t = fakeDeps({
+      judgeAnswersSeq: [{
+        done: { type: "noul", noul: 0.1, privateContent: "private prompt" },
+        failure_class: { type: "choice", choice: "environment", privateContent: "private output" },
+        same_executor_can_repair: { type: "noul", noul: 0.3 },
+        next_action: { type: "choice", choice: "accept", confidence: 0.8 },
+      }],
+    });
+    const storage = new Map();
+    const sink = createBoundedStorageObservationSink({}, {
+      get: async key => storage.get(key),
+      set: async (key, value) => storage.set(key, structuredClone(value)),
+    });
+
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions, observeResource: sink,
+    });
+    const ledger = storage.get(RESOURCE_LEDGER_KEY);
+    const judgment = ledger.observations.find(x => x.kind === "jev-verdict");
+
+    assert.equal(result.phase, "failed");
+    assert.deepEqual(judgment.decisionAnswers, {
+      doneNoul: 0.1,
+      failureClass: "environment",
+      sameExecutorCanRepairNoul: 0.3,
+      nextAction: "accept",
+    });
+    assert.equal(judgment.decisionStatus, "invalid");
+    assert.equal(ledger.observations.some(x => x.kind === "outcome"), false);
+    assert.equal(JSON.stringify(ledger).includes("private"), false);
+    assert.equal(t.effects.filter(x => x === "judge").length, 1);
+  });
+
+  it("O0j: a coherent Jev verdict is recorded as valid before terminal transition", async () => {
+    const t = fakeDeps();
+    const observations = [];
+    const result = await runOrchestrationOnce(contract(), {
+      runtime: t.runtime, critic: t.critic, decisions: t.decisions,
+      observeResource: event => observations.push(event),
+    });
+    const judgment = observations.find(x => x.kind === "jev-verdict");
+
+    assert.equal(result.phase, "completed");
+    assert.deepEqual(judgment.decisionAnswers, {
+      doneNoul: 0.9,
+      failureClass: "none",
+      sameExecutorCanRepairNoul: 1,
+      nextAction: "accept",
+    });
+    assert.equal(judgment.decisionStatus, "valid");
+  });
+
 
   it("O0b: broken observer degrades open and cannot add a round or change FREE_POOL", async () => {
     const t = fakeDeps();

@@ -78,6 +78,14 @@ values stay absent; malformed event kinds become `unknown` and do not count as
 operational failures. Observations without a known timestamp are retained as
 facts but excluded from time-window estimates.
 
+For Jev round decisions, the ledger may also retain the four structured wire
+answers (`done`, `failure_class`, `same_executor_can_repair`, `next_action`) as
+bounded numeric/enum values, plus whether the parsed verdict satisfies the
+existing cross-field validator. It records no prompt, evidence text, confidence,
+or arbitrary answer fields. This is diagnostic only: `validateVerdict` and the
+state machine remain authoritative, and the observation cannot repair or
+override a Jev decision.
+
 `aggregateUsage` selects a caller-specified time window and sums observed facts.
 Token counters stay absent if no runtime counter was provided. The dispatcher
 currently observes worker, critic and orchestrator prompt boundaries, rounds,
