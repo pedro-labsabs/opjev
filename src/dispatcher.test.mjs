@@ -1852,6 +1852,41 @@ describe("critic integrado ao pipeline: sessao distinta, ordem, findings, timeou
     assert.ok(result.error && result.error.includes("hard failure"), "erro bounded do gate");
   });
 
+  it("C6a: critic timing records normal, confirmed, and unconfirmed interruption milestones", async () => {
+    const success = fakeDeps();
+    const successful = [];
+    await runOrchestrationOnce(contract(), {
+      runtime: success.runtime, critic: success.critic, decisions: success.decisions,
+      observeResource: event => successful.push(event),
+    });
+    const successTiming = successful.filter(event => event.kind === "critic-timing");
+    assert.deepEqual(successTiming.map(event => event.criticStage), ["created", "prompt-sent", "wait-settled", "session-read"]);
+    const confirmed = fakeDeps({ criticWaitBlocks: true });
+    const confirmationEvents = [];
+    await runOrchestrationOnce(contract(), {
+      runtime: confirmed.runtime, critic: confirmed.critic, decisions: confirmed.decisions,
+      criticTimeoutMs: 10, observeResource: event => confirmationEvents.push(event),
+    });
+    const confirmedTiming = confirmationEvents.filter(event => event.kind === "critic-timing");
+    assert.deepEqual(confirmedTiming.map(event => event.criticStage), ["created", "prompt-sent", "interruption-requested", "interruption-confirmed"]);
+
+
+    const stalled = fakeDeps({ criticWaitBlocks: true, critic: { interrupt: async () => await new Promise(() => {}) } });
+    const interrupted = [];
+    await runOrchestrationOnce(contract(), {
+      runtime: stalled.runtime, critic: stalled.critic, decisions: stalled.decisions,
+      criticTimeoutMs: 10, observeResource: event => interrupted.push(event),
+    });
+    const timeoutTiming = interrupted.filter(event => event.kind === "critic-timing");
+    assert.deepEqual(timeoutTiming.map(event => event.criticStage), ["created", "prompt-sent", "interruption-requested", "interruption-unconfirmed"]);
+    for (const event of [...successTiming, ...confirmedTiming, ...timeoutTiming]) {
+      assert.deepEqual(Object.keys(event).sort(), ["at", "criticStage", "elapsedMs", "kind", "role", "round", "runID", "sessionID"]);
+      assert.equal(event.role, "critic");
+      assert.equal(event.round, 1);
+      assert.ok(Number.isInteger(event.elapsedMs) && event.elapsedMs >= 0 && event.elapsedMs <= 120_000);
+    }
+  });
+
   it("C7: critic output invalido -> failure explicito, sem finding fabricado, Jev chamado", async () => {
     const t = fakeDeps({
       criticMessages: [{ type: "assistant", content: [{ type: "text", text: "not json at all" }] }],

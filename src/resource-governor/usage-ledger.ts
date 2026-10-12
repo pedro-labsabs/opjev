@@ -5,7 +5,7 @@ export type ObservationKind =
   | "unknown"
   | "request" | "round" | "retry" | "recovery" | "escalation" | "outcome" | "fanout"
   | "compaction" | "token-usage" | "throttle" | "quota-limit" | "context-overflow"
-  | "provider-error" | "operational-failure" | "jev-verdict";
+  | "provider-error" | "operational-failure" | "jev-verdict" | "critic-timing";
 
 export interface UsageObservation {
   at?: number;
@@ -35,13 +35,15 @@ export interface UsageObservation {
     nextAction: NextAction;
   };
   decisionStatus?: "valid" | "invalid";
+  criticStage?: "created" | "prompt-sent" | "wait-settled" | "session-read" | "interruption-requested" | "interruption-confirmed" | "interruption-unconfirmed";
+  elapsedMs?: number;
 }
 
 const KINDS = new Set<ObservationKind>([
   "unknown",
   "request", "round", "retry", "recovery", "escalation", "outcome", "fanout", "compaction",
   "token-usage", "throttle", "quota-limit", "context-overflow", "provider-error", "operational-failure",
-  "jev-verdict",
+  "jev-verdict", "critic-timing",
 ]);
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
@@ -51,11 +53,22 @@ const TOKEN_KEYS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] a
 const ROUTES = new Set(["fast-coding", "heavy-reasoning", "research-docs"]);
 const FAILURE_CLASSES = new Set(["none", "implementation", "reasoning", "missing-context", "wrong-agent", "wrong-model", "environment", "bad-contract"]);
 const RECOVERY_ACTIONS = new Set(["repair-same", "fresh-same", "switch-model", "switch-agent", "replan", "human-resume"]);
+const CRITIC_STAGES = new Set(["created", "prompt-sent", "wait-settled", "session-read", "interruption-requested", "interruption-confirmed", "interruption-unconfirmed"]);
 
 /** Strict whitelist: prompts, messages, stack traces, and arbitrary payloads are discarded. */
 export function sanitizeObservation(value: unknown): UsageObservation {
   const x = value && typeof value === "object" ? value as Record<string, unknown> : {};
   const kind = KINDS.has(x.kind as ObservationKind) ? x.kind as ObservationKind : "unknown";
+  if (kind === "critic-timing") {
+    const timing: UsageObservation = { kind };
+    if (typeof x.at === "number" && Number.isFinite(x.at)) timing.at = x.at;
+    for (const key of ["runID", "sessionID"] as const) if (typeof x[key] === "string" && x[key].length) timing[key] = (x[key] as string).slice(0, MAX_IDENTITY);
+    if (x.role === "critic") timing.role = "critic";
+    if (Number.isInteger(x.round) && Number(x.round) > 0) timing.round = Number(x.round);
+    if (CRITIC_STAGES.has(String(x.criticStage))) timing.criticStage = x.criticStage as UsageObservation["criticStage"];
+    if (Number.isInteger(x.elapsedMs) && Number(x.elapsedMs) >= 0 && Number(x.elapsedMs) <= 120_000) timing.elapsedMs = Number(x.elapsedMs);
+    return timing;
+  }
   const out: UsageObservation = {
     kind,
   };

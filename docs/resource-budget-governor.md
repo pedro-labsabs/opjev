@@ -86,6 +86,14 @@ or arbitrary answer fields. This is diagnostic only: `validateVerdict` and the
 state machine remain authoritative, and the observation cannot repair or
 override a Jev decision.
 
+Critic timing is a separate allowlisted fact: `criticStage` records creation,
+prompt, wait, session-read, and interruption-request/confirmation milestones;
+`elapsedMs` is the monotonic integer elapsed time from critic setup, capped at
+120,000 ms. The event stores only run/session/round identity and those timing
+fields, never prompt, response, model, or headers. Interruption is marked
+confirmed only when the runtime returns `true`; telemetry does not alter the
+existing timeout, interrupt, or verdict authority.
+
 `aggregateUsage` selects a caller-specified time window and sums observed facts.
 Token counters stay absent if no runtime counter was provided. The dispatcher
 currently observes worker, critic and orchestrator prompt boundaries, rounds,

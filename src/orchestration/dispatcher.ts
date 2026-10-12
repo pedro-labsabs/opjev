@@ -1309,6 +1309,18 @@ async function executeSchedule(
     };
     let criticInterruptUnconfirmed = false;
     let criticInterruptError: unknown;
+    const criticStartedAt = performance.now();
+    const observeCriticTiming = (
+      criticStage: "created" | "prompt-sent" | "wait-settled" | "session-read" | "interruption-requested" | "interruption-confirmed" | "interruption-unconfirmed",
+      sessionID: string | undefined,
+    ) => {
+      if (!sessionID) return;
+      const elapsedMs = Math.min(120_000, Math.max(0, Math.floor(performance.now() - criticStartedAt)));
+      void observeResource(deps, {
+        at: now(), kind: "critic-timing", runID: contract.runID, sessionID,
+        role: "critic", round: state.round, criticStage, elapsedMs,
+      }).catch(() => {});
+    };
     try {
       const created = await deps.critic.createCritic({
         agent,
@@ -1325,6 +1337,7 @@ async function executeSchedule(
       const createdSessionID = created.sessionID;
       if (!createdSessionID) throw new OrchestrationError("critic-create-failed", "createCritic nao retornou sessionID");
       criticSessionID = createdSessionID;
+      observeCriticTiming("created", criticSessionID);
       const criticPrompt = buildCriticPrompt({
         objective: state.contract.objective,
         acceptanceCriteria: state.contract.acceptanceCriteria,
@@ -1341,17 +1354,39 @@ async function executeSchedule(
         text: criticPrompt,
         metadata: { "jev-router": "orchestration-internal", "jev-role": "critic", "jev-round": state.round },
       });
+      observeCriticTiming("prompt-sent", createdSessionID);
       await withTimeout(
         () => deps.critic.wait({ sessionID: createdSessionID }),
         criticTimeoutMs,
-        () => deps.critic.interrupt?.({ sessionID: createdSessionID }) ?? false,
+        () => {
+          observeCriticTiming("interruption-requested", createdSessionID);
+          try {
+            const interruption = deps.critic.interrupt?.({ sessionID: createdSessionID });
+            if (!interruption) {
+              observeCriticTiming("interruption-unconfirmed", createdSessionID);
+              return false;
+            }
+            return Promise.resolve(interruption).then((confirmed) => {
+              observeCriticTiming(confirmed === true ? "interruption-confirmed" : "interruption-unconfirmed", createdSessionID);
+              return confirmed === true;
+            }, () => {
+              observeCriticTiming("interruption-unconfirmed", createdSessionID);
+              return false;
+            });
+          } catch {
+            observeCriticTiming("interruption-unconfirmed", createdSessionID);
+            return false;
+          }
+        },
         { code: "critic-timeout", label: "critic" },
       );
+      observeCriticTiming("wait-settled", createdSessionID);
       const cView = await deps.critic.get({ sessionID: createdSessionID });
       const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
       if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
       const ownOutcome = cView.outcome;
+      observeCriticTiming("session-read", createdSessionID);
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
       const raw = extractFinalAssistantText(cMessages);
       const parsed = parseCriticOutput(raw);
@@ -1387,6 +1422,7 @@ async function executeSchedule(
         }
       }
     } catch (err) {
+      if (isInterruptUnconfirmed(err)) observeCriticTiming("interruption-unconfirmed", criticSessionID);
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round }));
       criticInterruptUnconfirmed = isInterruptUnconfirmed(err);
       criticInterruptError = err;

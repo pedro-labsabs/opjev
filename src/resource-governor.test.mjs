@@ -49,6 +49,24 @@ test("sanitizer only keeps factual scalar fields and observed token counters", (
   assert.equal("at" in sanitizeObservation({ kind: "request" }), false);
   assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "token=secret" }), false);
 });
+
+test("critic timing observations keep only bounded stage identity and elapsed facts", () => {
+  const safe = sanitizeObservation({
+    at: 50, kind: "critic-timing", runID: "run-1", sessionID: "critic-1", round: 1, role: "critic",
+    criticStage: "wait-settled", elapsedMs: 120_000, prompt: "private prompt",
+    headers: { authorization: "private header" }, response: "private response", model: "secret-model",
+  });
+  assert.deepEqual(safe, {
+    kind: "critic-timing", at: 50, runID: "run-1", sessionID: "critic-1",
+    role: "critic", round: 1, criticStage: "wait-settled", elapsedMs: 120_000,
+  });
+  for (const elapsedMs of [-1, 1.5, 120_001, "1"]) {
+    const invalid = sanitizeObservation({ kind: "critic-timing", criticStage: "not-a-stage", elapsedMs, prompt: "private" });
+    assert.equal("criticStage" in invalid, false);
+    assert.equal("elapsedMs" in invalid, false);
+    assert.equal("prompt" in invalid, false);
+  }
+});
 test("sanitizer preserves usage status and nonnegative integer ledger fields only", () => {
   const safe = sanitizeObservation({
     kind: "token-usage",
