@@ -13,6 +13,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
+import { assertCompletedContextRun, assertContextPairing } from "./e2e-context-contract.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/opencode";
@@ -128,6 +129,7 @@ try {
   installPluginToHome(HOME, REPO);
   const providerPort = await freePort();
   const providerRequests = [];
+  const emittedToolCallIDs = [];
   let jevRequests = 0;
   let toolCallSequence = 0;
   const provider = http.createServer((req, res) => {
@@ -156,10 +158,11 @@ try {
         return;
       }
       const serialized = JSON.stringify(body.messages ?? []);
-      providerRequests.push({ url: req.url, shape: openaiShape(body), messages: body.messages ?? [] });
+      const isCritic = serialized.includes("You are a verifier/critic");
+      providerRequests.push({ url: req.url, shape: openaiShape(body), messages: body.messages ?? [], isCritic });
       let message;
       let finishReason = "stop";
-      if (serialized.includes("You are a verifier/critic")) {
+      if (isCritic) {
         message = { role: "assistant", content: JSON.stringify({ findings: [] }) };
       } else {
         const previousCalls = (body.messages ?? []).reduce((count, item) => count + (item?.role === "assistant" && Array.isArray(item.tool_calls) ? item.tool_calls.length : 0), 0);
@@ -174,8 +177,10 @@ try {
             return;
           }
           toolCallSequence++;
+          const toolCallID = `call_ctx_${toolCallSequence}`;
+          emittedToolCallIDs.push(toolCallID);
           message = { role: "assistant", content: null, tool_calls: [{
-            id: `call_ctx_${toolCallSequence}`, type: "function",
+            id: toolCallID, type: "function",
             function: { name: requestedTool, arguments: JSON.stringify({
               [inputKey]: requestedTool === "shell"
                 ? `printf '%s' '${CANARIES.result}' # ${CANARIES.input}`
@@ -246,24 +251,82 @@ try {
   const runID = admissionResult?.runID;
   assert.ok(typeof runID === "string" && runID.length > 0, `admission RPC did not return runID: ${admission.text}`);
   assert.equal(admissionResult.status, "started", `unexpected admission status: ${admissionResult.status}`);
-  const workerCheckpoint = await waitFor(() => dbRead(HOME, db => {
+  const completedRun = await waitFor(() => dbRead(HOME, db => {
     const checkpoint = kvValue(db, `orchestration/run/${runID}`)?.value;
-    return checkpoint && ["completed", "failed", "awaiting-human"].includes(checkpoint.state?.phase) ? checkpoint : undefined;
-  }), 120000, "terminal orchestration checkpoint");
+    const usageLedger = kvValue(db, "resource/usage-ledger/v1")?.value;
+    if (!checkpoint) return undefined;
+    const phase = checkpoint.state?.phase;
+    if (["failed", "awaiting-human", "stopped"].includes(phase)) return { checkpoint, usageLedger, terminalFailure: phase };
+    const observations = usageLedger?.schema === 1 && Array.isArray(usageLedger.observations) ? usageLedger.observations : [];
+    const outcome = observations.find(item => item.kind === "outcome" && item.runID === runID
+      && item.sessionID === checkpoint.workerSessionID && item.role === "worker" && item.round === 1);
+    return phase === "completed" && checkpoint.checkpoint === "verdict-applied" && outcome
+      ? { checkpoint, usageLedger }
+      : undefined;
+  }), 120000, "completed verdict-applied checkpoint and correlated worker outcome");
+  assert.equal(completedRun.terminalFailure, undefined,
+    `deterministic context run terminated as ${completedRun.terminalFailure}`);
+  const workerCheckpoint = completedRun.checkpoint;
   const sessionID = workerCheckpoint.workerSessionID;
   assert.ok(sessionID, "real run checkpoint did not record worker session");
   const dbEvidence = dbRead(HOME, db => {
     const asset = kvValue(db, "context/asset-ledger/v1");
     const metrics = kvValue(db, "context/metrics/v1");
     const checkpoint = kvValue(db, `orchestration/run/${runID}`);
+    const usageLedger = kvValue(db, "resource/usage-ledger/v1");
     const rows = db.prepare("SELECT type, data FROM session_message WHERE session_id = ? ORDER BY time_created").all(sessionID).map(row => ({ type: String(row.type), data: String(row.data) }));
     const orchestrationKeys = db.prepare("SELECT key FROM kv WHERE key LIKE '%orchestration/run/%'").all().map(row => String(row.key));
     const sessionCount = db.prepare("SELECT COUNT(*) AS n FROM session_v2").get().n;
-    return { asset, metrics, checkpoint, rows, orchestrationKeys, sessionCount };
+    return { asset, metrics, checkpoint, usageLedger, rows, orchestrationKeys, sessionCount };
   });
   assert.equal(dbEvidence.checkpoint?.value.workerSessionID, sessionID, "worker session differs from authoritative checkpoint");
   assert.equal(dbEvidence.checkpoint?.value.state?.round, 1, "E2E exceeded its single-round limit");
-  assert.ok(["completed", "failed"].includes(dbEvidence.checkpoint.value.state.phase), `unexpected run phase: ${dbEvidence.checkpoint.value.state.phase}`);
+  assertCompletedContextRun(dbEvidence.checkpoint.value.state.phase);
+  const runRecord = dbEvidence.checkpoint.value;
+  const state = runRecord.state;
+  assert.equal(runRecord.checkpoint, "verdict-applied", "run checkpoint is not verdict-applied");
+  assert.equal(state.contract.runID, runID);
+  assert.equal(state.contract.sessionID, parentSessionID);
+  assert.equal(state.contract.maxRounds, 1);
+  assert.equal(state.round, 1);
+  assert.equal(state.evidence.round, 1);
+  assert.equal(state.evidence.executor.sessionID, sessionID);
+  assert.equal(state.evidence.outcome, "succeeded");
+  assert.equal(state.executor.agent, state.evidence.executor.agent);
+  assert.equal(state.executor.model, state.evidence.executor.model);
+  assert.equal(runRecord.selection.agent, state.executor.agent);
+  assert.equal(runRecord.selection.model, state.executor.model);
+  assert.equal(state.lastVerdict.done, true);
+  assert.equal(state.lastVerdict.failureClass, "none");
+  assert.equal(state.lastVerdict.nextAction, "accept");
+  assert.equal(state.history.length, 1);
+  assert.equal(state.history[0].round, 1);
+  assert.deepEqual(state.history[0].verdict, state.lastVerdict);
+  assert.deepEqual(state.history[0].executor, { agent: state.evidence.executor.agent, model: state.evidence.executor.model });
+  assert.equal(state.history[0].outcome, "succeeded");
+  const criticSessionID = runRecord.criticSessionID;
+  assert.ok(criticSessionID && criticSessionID !== parentSessionID && criticSessionID !== sessionID,
+    "critic session was not distinct from parent and worker");
+  assert.ok(state.evidence.deterministicChecks.some(check => check.name === "critic-session-outcome" && check.status === "pass"),
+    "critic did not pass the evidence check");
+  assert.equal(dbEvidence.usageLedger?.value?.schema, 1, "usage ledger schema mismatch");
+  assert.ok(Array.isArray(dbEvidence.usageLedger.value.observations), "usage ledger observations missing");
+  const observations = dbEvidence.usageLedger.value.observations;
+  const workerObservations = observations.filter(item => item.runID === runID && item.sessionID === sessionID
+    && item.role === "worker" && item.round === 1);
+  const workerOutcomes = workerObservations.filter(item => item.kind === "outcome");
+  const workerRounds = workerObservations.filter(item => item.kind === "round");
+  const workerRequests = workerObservations.filter(item => item.kind === "request");
+  assert.equal(workerOutcomes.length, 1, "expected exactly one correlated worker outcome");
+  assert.equal(workerOutcomes[0].acceptance, true);
+  assert.equal(workerOutcomes[0].verificationPassed, true);
+  assert.equal(workerOutcomes[0].failureClass, "none");
+  assert.equal(workerRounds.length, 1, "expected exactly one correlated worker round");
+  assert.equal(workerRequests.length, 1, "expected exactly one correlated worker request");
+  const jevVerdicts = observations.filter(item => item.kind === "jev-verdict" && item.runID === runID && item.round === 1);
+  assert.ok(jevVerdicts.some(item => item.decisionStatus === "valid" && item.decisionAnswers?.doneNoul === 1
+    && item.decisionAnswers.failureClass === "none" && item.decisionAnswers.nextAction === "accept"),
+  "valid compatible Jev verdict observation missing");
 
   assert.ok(dbEvidence.asset, "real SQLite context asset ledger key missing");
   assert.ok(dbEvidence.metrics, "real SQLite context metrics key missing");
@@ -298,11 +361,16 @@ try {
   const groups = replay.snapshot();
   const sessionRef = hashStableRef(sessionID);
   const runRef = hashStableRef(runID);
-  assert.ok(groups.length > 0, "real OpenCode context hook did not observe a tool group");
+  assert.ok(groups.length >= 2, `expected at least two persisted tool groups, observed ${groups.length}`);
   assert.ok(groups.length <= 8, `test fixture unexpectedly exceeded the recent-group guard (${groups.length})`);
-  assert.ok(groups.every(group => group.sessionRef === sessionRef && /^[a-f0-9]{64}$/.test(group.messageRef ?? "")
-    && group.call.role === "worker" && group.call.runRef === runRef && group.call.round === 1),
-  "ledger groups did not retain hashed message and live worker/run/round identity");
+  assert.ok(groups.every(group => group.terminal && group.sessionRef === sessionRef && /^[a-f0-9]{64}$/.test(group.messageRef ?? "")
+    && group.call.role === "worker" && group.call.runRef === runRef && group.call.round === 1
+    && group.terminal.role === "worker" && group.terminal.runRef === runRef && group.terminal.round === 1
+    && group.call.groupID === group.groupID && group.terminal.groupID === group.groupID
+    && group.call.sessionRef === sessionRef && group.terminal.sessionRef === sessionRef
+    && group.call.callRef === group.terminal.callRef && group.call.tool === group.terminal.tool
+    && ["tool-result", "tool-failure"].includes(group.terminal.source)),
+  "ledger groups did not retain complete worker/run/round identity and matching call/terminal references");
   const sessionResponse = await api("GET", `/api/session/${sessionID}`);
   const workerSession = sessionResponse.data?.data ?? sessionResponse.data;
   assert.equal(workerSession?.metadata?.["jev-router"], "orchestration-internal");
@@ -310,6 +378,46 @@ try {
   assert.equal(workerSession?.metadata?.["jev-run-id"], runID);
   assert.equal(workerSession?.metadata?.["jev-round"], 1);
   assert.equal(dbEvidence.checkpoint?.value.workerSessionID, sessionID, "worker checkpoint did not come from the real dispatcher");
+  const criticResponse = await api("GET", `/api/session/${criticSessionID}`);
+  const criticSession = criticResponse.data?.data ?? criticResponse.data;
+  assert.equal(criticSession?.metadata?.["jev-role"], "critic");
+  assert.equal(criticSession?.metadata?.["jev-run-id"], runID);
+  assert.equal(criticSession?.metadata?.["jev-round"], 1);
+  const criticRequestCount = observations.filter(item => item.kind === "request" && item.runID === runID
+    && item.sessionID === criticSessionID && item.role === "critic" && item.round === 1).length;
+  assert.equal(criticRequestCount, 1, "expected one correlated critic request");
+  const toolGroups = new Map(groups.map(group => [group.call.tool, group]));
+  const shellGroup = toolGroups.get("shell");
+  const readGroup = toolGroups.get("read");
+  assert.ok(shellGroup && shellGroup.terminal.source === "tool-result", "shell tool-result group missing");
+  assert.ok(readGroup && readGroup.terminal.source === "tool-failure", "read tool-failure group missing");
+  assert.equal(new Set([shellGroup.groupID, readGroup.groupID]).size, 2);
+  const expectedCalls = [[emittedToolCallIDs[0], "shell", "completed"], [emittedToolCallIDs[1], "read", "error"]];
+  assert.equal(emittedToolCallIDs.length, 2, "fixture did not emit exactly two worker tool calls");
+  for (const [callID, tool, runtimeStatus] of expectedCalls) {
+    const group = toolGroups.get(tool);
+    assert.ok(group, `${tool} group missing`);
+    assert.equal(group.call.callRef, hashStableRef(callID), `${tool} group callRef did not join to emitted provider call`);
+  }
+  const workerProviderRequests = providerRequests.filter(item => !item.isCritic);
+  const workerCalls = workerProviderRequests.flatMap(item => item.messages)
+    .flatMap(message => message?.role === "assistant" && Array.isArray(message.tool_calls) ? message.tool_calls : []);
+  const workerToolResults = workerProviderRequests.flatMap(item => item.messages)
+    .filter(message => message?.role === "tool");
+  const runtimeParts = dbEvidence.rows.flatMap(row => {
+    try {
+      const message = JSON.parse(row.data);
+      return (Array.isArray(message.content) ? message.content : []).map(part => ({ ...part, messageType: row.type }));
+    } catch { return []; }
+  });
+  for (const [callID, tool, runtimeStatus] of expectedCalls) {
+    assert.ok(workerCalls.some(call => call.id === callID && call.function?.name === tool),
+      `${tool} call ID missing from worker provider messages`);
+    assert.ok(workerToolResults.some(message => message.tool_call_id === callID),
+      `${tool} result ID missing from worker provider messages`);
+    assert.ok(runtimeParts.some(part => part.type === "tool" && part.id === callID && part.name === tool
+      && part.state?.status === runtimeStatus), `${tool} runtime tool ID/name/status mismatch`);
+  }
   const workerProtection = await projectContextProtection({
     getSessionMetadata: async () => workerSession.metadata,
     getRun: async key => key === runID ? dbEvidence.checkpoint.value : undefined,
@@ -347,7 +455,8 @@ try {
   assert.ok(requestCount >= 2, `real context hook did not observe multiple requests (${requestCount})`);
   assert.ok((metric?.tool?.completed ?? 0) >= 1, "context metrics did not observe a completed tool call");
   assert.ok((metric?.tool?.failed ?? 0) >= 1, "context metrics did not observe a failed tool call");
-  assert.ok(pairing <= groups.length * requestCount, `pairing metric exceeded observed group/request bounds: ${pairing}`);
+  log(`pair diagnostic: ${JSON.stringify({ contextPairs: pairing, contextCallParts: metric.context.toolCallParts, contextTerminalParts: metric.context.terminalParts, toolPairs: metric.tool.pairedGroups, requestCount, groups: groups.length })}`);
+  assertContextPairing(pairing, groups.length, requestCount);
   const planned = metric?.context?.plannedGroups ?? 0;
   assert.ok(planned > 0, "exact OpenCode context hook did not classify a real persisted tool group");
   assert.ok(planned <= groups.length * requestCount, "projection proposal count exceeded request/ledger bounds");

@@ -1,0 +1,148 @@
+{
+  "schema": 1,
+  "date": "2026-10-12",
+  "baseHead": "a1b0a082a9d649f59be0a3204fe9fdd4d5e591fd",
+  "preCommitVerificationSource": {
+    "state": "modified working tree based on baseHead, not the bare commit",
+    "relevantCodeFiles": ["scripts/e2e-context-contract.mjs", "src/e2e-context-contract.test.mjs", "scripts/e2e-context-management.mjs", "scripts/e2e-multiround-real.mjs"],
+    "earlierContextE2EDoesNotInclude": "The final reviewer-added assertion that each call and terminal use the same tool name; post-commit gates will exercise the committed source."
+  },
+  "branch": "fix/issue-49-real-tui-dogfood",
+  "runtime": {
+    "version": "opencode v2.0.11",
+    "sha256": "0ed7d8546cf24acc41e6371ec30928ed931ec1474e1a54bbecdde8e0dd801d2f",
+    "node": "v22.23.2"
+  },
+  "preservation": {
+    "issue49WorktreeArtifactSha256Before": "a82199530994f0d4a1caae88fc9d15054196dfdd086c66da382f9c0ccce30f7c",
+    "originalCheckoutArtifactSha256Before": "48f32df780b2d7d6cb5f7958a59ca24107389455338decc42e889199d1ea97b9",
+    "personalArtifactsWrittenByThisRun": false
+  },
+  "contextGuards": {
+    "red": { "command": "node --test src/e2e-context-contract.test.mjs", "exitCode": 1, "failures": 3, "cause": "The permissive extracted guards did not reject failed phase or 0/1 pairs; upper-bound regression passed." },
+    "green": { "command": "node --test src/e2e-context-contract.test.mjs", "exitCode": 0, "tests": 4, "passed": 4 },
+    "validInputSmoke": { "completedPhaseAccepted": true, "pairing2Of8Accepted": true, "pairing9Of8Rejected": true },
+    "mutationPhasePermissive": { "exitCode": 1, "failedAssertion": "failed deterministic orchestration", "pairingRegressionsStillPassed": true },
+    "mutationPairingLowerBoundRemoved": { "exitCode": 1, "failedAssertions": 2, "phaseRegressionStillPassed": true, "upperBoundRegressionStillPassed": true }
+  },
+  "contextE2E": {
+    "command": "OPENCODE_BIN=/home/pedro/.local/share/opjev-dogfood/runtime/opencode-2.0.11 npm run e2e:context",
+    "finalExitCode": 1,
+    "earlierAssertionCorrection": "Pinned OpenCode 2.0.11 persists runtime tool parts as type=tool with id/name/state.status; the E2E was corrected to assert that host shape instead of tool-call/tool-result on session_message rows.",
+    "completedRunAndIdentityJoinsObservedBeforeFinalGuard": true,
+    "runPhase": "completed",
+    "checkpoint": "verdict-applied",
+    "round": 1,
+    "maxRounds": 1,
+    "workerOutcome": "succeeded",
+    "criticCheck": "pass",
+    "selectionMatchesExecutor": true,
+    "historyVerdictMatchesLastVerdict": true,
+    "workerToolGroups": 2,
+    "workerShellTerminal": "tool-result",
+    "workerReadTerminal": "tool-failure",
+    "contextRequests": 4,
+    "contextPairedGroups": 0,
+    "contextToolCallParts": 0,
+    "contextTerminalParts": 0,
+    "toolObserverPairedGroups": 2,
+    "firstFailingGuard": "assertContextPairing: context must observe at least two valid tool pairs",
+    "interpretation": "The strict context-level lower bound remains unsatisfied. Do not substitute tool.pairedGroups; host/request event provenance for the missing context pair count is not established by this run."
+  },
+  "liveAttempt": {
+    "attemptCount": 1,
+    "launcherDriverExitCode": 0,
+    "taskFilesCreated": false,
+    "independentTestCommand": "node --test add.test.mjs",
+    "independentTestExitCode": 1,
+    "independentTestResult": "Could not find add.test.mjs",
+    "preflight": { "successful": true, "requestsPerLauncherStartup": 1, "attemptTaskRequests": 1 },
+    "runID": "auto-ses_ecfffd2e5ffez4rN4PGqMB6rfm-msg_130002d1e001JSrVr1K6piTWnn-eb4b491fed59",
+    "parentSessionID": "ses_ecfffd2e5ffez4rN4PGqMB6rfm",
+    "parentAssistantMessages": 0,
+    "selection": { "via": "jev", "agent": "build", "model": "opencode/ling-3.0-flash-fin-free" },
+    "rounds": [
+      { "round": 1, "workerSessionID": "ses_ecfffd00dffeIW5oTL7HlIc73d", "criticSessionID": "ses_ecfffcd46ffeFC6A7GuDkNEINY", "model": "opencode/ling-3.0-flash-fin-free", "workerOutcome": "failed", "criticCheck": "fail", "jev": { "decisionStatus": "valid", "doneNoul": 0.03, "failureClass": "environment", "sameExecutorCanRepairNoul": 0.49, "nextAction": "fresh-same" } },
+      { "round": 2, "workerSessionID": "ses_ecfffc9c5ffemf4gme8s816dkg", "criticSessionID": "ses_ecfffc853ffeawbZVyBRoF9fsJ", "model": "opencode/ling-3.0-flash-fin-free", "workerOutcome": "failed", "criticCheck": "fail", "jev": { "decisionStatus": "valid", "doneNoul": 0.03, "failureClass": "environment", "sameExecutorCanRepairNoul": 0.13, "nextAction": "fresh-same" } }
+    ],
+    "contractMaxRounds": 3,
+    "recovery": { "action": "fresh-same", "governedByJev": true, "withinMaxRounds": true, "hiddenRetry": false },
+    "modelSwitchObserved": false,
+    "providerErrors": {
+      "count": 4,
+      "errorCode": "provider-error",
+      "failureDomain": "provider",
+      "role": "unknown",
+      "statusCode": "unrecorded",
+      "sessionIDs": ["ses_ecfffd00dffeIW5oTL7HlIc73d", "ses_ecfffcd46ffeFC6A7GuDkNEINY", "ses_ecfffc9c5ffemf4gme8s816dkg", "ses_ecfffc853ffeawbZVyBRoF9fsJ"]
+    },
+    "criticTiming": {
+      "firstStream": "UNOBSERVABLE",
+      "round1": { "createdElapsedMs": 6, "promptSentElapsedMs": 12, "waitSettledElapsedMs": 326, "sessionReadElapsedMs": 332, "createdToPromptSentMs": 6, "promptSentToWaitSettledMs": 314, "waitSettledToSessionReadMs": 6 },
+      "round2": { "createdElapsedMs": 8, "promptSentElapsedMs": 19, "waitSettledElapsedMs": 601, "sessionReadElapsedMs": 607, "createdToPromptSentMs": 11, "promptSentToWaitSettledMs": 582, "waitSettledToSessionReadMs": 6 },
+      "durationsAreProviderRpcLatencies": false
+    },
+    "terminalState": { "checkpoint": "run-failed", "phase": "failed", "round": 2, "verdictApplied": false, "canonicalOutcomeForRound2": false },
+    "initialGatewayCounters": "UNOBSERVABLE: PTY driver did not capture launcher shutdown counters",
+    "canonicalUniquenessEvidence": { "sessionBindings": 1, "orchestrationRunRecords": 1, "workerRounds": 2, "explanation": "Two round dispatches are explained by the valid fresh-same Jev verdict; they are not duplicate runs." }
+  },
+  "auditAfterRun": {
+    "exitCode": 0,
+    "observations": "26/2048",
+    "canonicalRuns": 1,
+    "phases": { "failed": 1, "completed": 0 },
+    "rounds": 2,
+    "requests": 4,
+    "outcomes": 1,
+    "recoveries": 1,
+    "providerFailures": 4,
+    "operationalFailures": 0,
+    "evidencePackets": 1,
+    "criticChecks": 1,
+    "criticStatus": "fail",
+    "verdictsApplied": 0,
+    "accepted": 0,
+    "missingLinks": 0,
+    "evidenceInconsistencies": 0,
+    "roundViolations": 0,
+    "tokenUsageRecords": 4,
+    "auditTokenTotals": { "input": 0, "output": 0, "reasoning": 0 },
+    "billingConclusion": "No billing inference; zero/absent observed token totals are not evidence of zero provider cost."
+  },
+  "reopen": {
+    "sameParentSessionID": "ses_ecfffd2e5ffez4rN4PGqMB6rfm",
+    "newPromptSubmitted": false,
+    "driverExitCode": 0,
+    "tuiTrace": [
+      { "event": "session-snapshot", "status": "idle", "inboxAvailable": true, "inboxCount": 0, "userSteerCount": 0, "syntheticSteerCount": 0 },
+      { "event": "render", "status": "idle" },
+      { "event": "shown", "source": "summary", "phase": "failed" },
+      { "event": "toast-refreshed", "count": 4 }
+    ],
+    "ptyVisibleTerminalLabel": "Orchestration · Failed",
+    "nativeSpinner": { "candidateBrailleFrameGlyphsInAccumulatedPTYDumpSuffix": 10, "suffixBytes": 65536, "postIdlePersistence": "UNPROVEN", "exactRendererComponent": "UNATTRIBUTED" },
+    "pendingInputRecordsAfterReopen": { "userSteer": 1, "syntheticSteer": 1, "recordsRemovedByHarness": false },
+    "parentAssistantMessages": 0,
+    "gatewayCounters": { "orchestrateIntercept": 0, "admission": 0, "dispatch": 0, "duplicateSuppressed": 0, "failClosed": 0 },
+    "runRecordsAfterReopen": 1,
+    "resourceObservationsAfterReopen": 26,
+    "interpretation": "Failure summary was shown; original user and synthetic steer rows remained present after reopen. No acknowledgement or cancellation was issued, so ownership semantics remain unresolved. PTY glyphs do not prove spinner persistence after idle."
+  },
+  "historicalModelSwitch": {
+    "classification": "UNATTRIBUTED",
+    "evidenceSources": ["docs/reports/dogfood-operational-readiness-2026-10-07.md:154-175", "issue #49 comments"],
+    "namedHistoricalTraceAvailable": false,
+    "missingLinks": ["emitter identity", "correlated Jev/kernel decision", "provider request/session message at switch", "hook or host event attribution"],
+    "currentAttemptSwitch": false
+  },
+  "scopeDecisions": {
+    "workerDeadlineMs": 60000,
+    "authorityOrPolicyChanged": false,
+    "inboxCancelOrDelete": false,
+    "parentWakeOrSyntheticAssistant": false,
+    "retryAdded": false,
+    "thirdAttempt": false,
+    "dogfoodAcceptance": "BLOCKED",
+    "inputOwnershipAckChange": "NEEDS_APPROVAL"
+  }
+}
