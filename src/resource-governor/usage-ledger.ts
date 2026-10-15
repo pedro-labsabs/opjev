@@ -48,7 +48,10 @@ const KINDS = new Set<ObservationKind>([
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
 const MAX_IDENTITY = 200; // Matches the bounded run/session identity contracts.
-const SAFE_ERROR_CODES = new Set(["FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "interrupt-unconfirmed", "executor-model-mismatch", "executor-model-unobserved", "429", "529"]);
+const SAFE_ERROR_CODES = new Set([
+  "FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "interrupt-unconfirmed", "executor-model-mismatch", "executor-model-unobserved",
+  "400", "401", "403", "404", "408", "429", "500", "502", "503", "504", "529"
+]);
 const TOKEN_KEYS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 const ROUTES = new Set(["fast-coding", "heavy-reasoning", "research-docs"]);
 const FAILURE_CLASSES = new Set(["none", "implementation", "reasoning", "missing-context", "wrong-agent", "wrong-model", "environment", "bad-contract"]);

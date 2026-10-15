@@ -37,16 +37,23 @@ async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalTool
 }
 
 async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
+  const status = Number((error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status);
+  const statusValid = Number.isInteger(status) && status >= 0;
   if (isContextOverflow(error)) {
     await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
   } else if (isGlobalThrottle(error)) {
-    const status = Number((error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status);
     await recordRuntimeResource(ctx, {
       ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
-      ...(Number.isInteger(status) && status >= 0 ? { statusCode: status } : {}),
+      ...(statusValid ? { statusCode: status } : {}),
     });
   } else {
-    await recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
+    await recordRuntimeResource(ctx, {
+      ...resourceBase,
+      kind: "provider-error",
+      errorCode: statusValid ? String(status) : "provider-error",
+      ...(statusValid ? { statusCode: status } : {}),
+      failureDomain: "provider",
+    });
   }
 }
 
@@ -310,7 +317,7 @@ export async function registerSessionHooks(
       const role = await lookupHookRole(ctx, sessionID);
       if (role !== "external") {
         event.decision = { retry: false };
-        await observeRetryFailure(ctx, resourceBase, event?.error);
+        await observeRetryFailure(ctx, { ...resourceBase, role: role !== "ambiguous" ? role : "unknown" }, event?.error);
         return;
       }
 
@@ -348,7 +355,15 @@ export async function registerSessionHooks(
         if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
+        const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
+        const statusValid = Number.isInteger(status) && status >= 0;
+        recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: statusValid ? String(status) : "provider-error",
+          ...(statusValid ? { statusCode: status } : {}),
+          failureDomain: "provider",
+        });
       }
       // Provider 5xx and other ordinary failures keep the historical Jev
       // escalation only when the authoritative resource policy grants it.

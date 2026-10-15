@@ -73,7 +73,12 @@ describe("global hooks respect internal control-plane authority", () => {
         assert.equal(event.error, originalError, "original provider error remains observable");
         assert.equal(m.calls.switchModel.length, 0);
         assert.equal(stub.calls.length, 0);
-        assert.equal(resourceFacts(m.storage).some((x) => x.kind === "provider-error"), true);
+        const facts = resourceFacts(m.storage);
+        const providerFailure = facts.find((x) => x.kind === "provider-error");
+        assert.ok(providerFailure, "provider-error observation recorded");
+        assert.equal(providerFailure.role, role, "preserves exact role provenance instead of unknown");
+        assert.equal(providerFailure.statusCode, 503, "preserves HTTP status code");
+        assert.equal(providerFailure.errorCode, "503", "preserves sanitized allowlisted HTTP error code");
       } finally {
         stub.restore();
       }

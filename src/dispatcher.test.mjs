@@ -1192,12 +1192,12 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
   });
 
   it("O0d: observed 429/529 and quota errors remain observations, never implicit reroutes", async () => {
-    for (const [error, expectedKind] of [
-      [Object.assign(new Error("429 rate limit"), { status: 429 }), "throttle"],
-      [Object.assign(new Error("529 overloaded"), { statusCode: 529 }), "throttle"],
-      [Object.assign(new Error("rate limit"), { name: "RateLimitError" }), "throttle"],
-      [Object.assign(new Error("free usage exhausted"), { name: "FreeUsageLimitError" }), "quota-limit"],
-      [Object.assign(new Error("recognized provider outage"), { status: 503, type: "http_error" }), "provider-error"],
+    for (const [error, expectedKind, expectedCode] of [
+      [Object.assign(new Error("429 rate limit"), { status: 429 }), "throttle", undefined],
+      [Object.assign(new Error("529 overloaded"), { statusCode: 529 }), "throttle", undefined],
+      [Object.assign(new Error("rate limit"), { name: "RateLimitError" }), "throttle", undefined],
+      [Object.assign(new Error("free usage exhausted"), { name: "FreeUsageLimitError" }), "quota-limit", "FreeUsageLimitError"],
+      [Object.assign(new Error("recognized provider outage"), { status: 503, type: "http_error" }), "provider-error", "503"],
     ]) {
       const t = fakeDeps({ runtime: { prompt: async () => { throw error; } } });
       const observations = [];
@@ -1209,7 +1209,15 @@ describe("runOrchestrationOnce: dispatcher runtime real (fake runtime + fake Jev
       assert.equal(result.round, 1);
       assert.equal(t.effects.includes("select-model"), false);
       assert.equal(t.effects.includes("select-agent"), false);
-      assert.equal(observations.some(x => x.kind === expectedKind && x.failureDomain === (expectedKind === "quota-limit" ? "quota" : "provider")), true);
+      const match = observations.find(x => x.kind === expectedKind && x.failureDomain === (expectedKind === "quota-limit" ? "quota" : "provider"));
+      assert.ok(match, 'found matching observation');
+      if (expectedCode !== undefined) {
+        assert.equal(match.errorCode, expectedCode, 'expected matching errorCode');
+      }
+      if (expectedKind === "provider-error") {
+        assert.equal(match.role, "worker", "worker wait error preserves worker role");
+        assert.equal(match.statusCode, 503, "preserves HTTP status");
+      }
       assert.equal(observations.some(x => x.kind === "outcome"), false, "provider failures do not create a capability outcome");
       assert.equal(JSON.stringify(observations).includes(error.message), false);
     }

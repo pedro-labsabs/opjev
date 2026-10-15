@@ -274,7 +274,7 @@ function resourceErrorObservation(error: unknown, at: number, identity: Record<s
   // persistence, follow-up bookkeeping, or an ambiguous integration seam.
   const explicitHttp = Number.isInteger(status) && status >= 400 && status <= 599 &&
     (typeof e.type === "string" && /http.?error|provider.?error/i.test(e.type) || response.status !== undefined);
-  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: "provider-error", failureDomain: "provider" };
+  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: String(status), failureDomain: "provider" };
   return { ...identity, at, kind: "operational-failure", errorCode: "operational-failure", failureDomain: "operational" };
 }
 

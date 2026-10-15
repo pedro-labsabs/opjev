@@ -48,6 +48,10 @@ test("sanitizer only keeps factual scalar fields and observed token counters", (
   assert.equal(sanitizeObservation({ at: 1, kind: "made-up-kind" }).kind, "unknown");
   assert.equal("at" in sanitizeObservation({ kind: "request" }), false);
   assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "token=secret" }), false);
+  assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "Bearer secret-token-canary" }), false);
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "503", statusCode: 503, role: "worker" }).errorCode, "503");
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "403", statusCode: 403, role: "critic" }).role, "critic");
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "401", statusCode: 401 }).statusCode, 401);
 });
 
 test("critic timing observations keep only bounded stage identity and elapsed facts", () => {
