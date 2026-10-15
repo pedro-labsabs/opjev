@@ -39,6 +39,40 @@ test("cumulative usage snapshots from one session count only their increments", 
   assert.deepEqual(total.tokens, { input: 150, output: 15 });
 });
 
+test("RED regression: sanitizer rejects inconsistent errorCode and statusCode", () => {
+  const contradictory = sanitizeObservation({
+    at: 1,
+    kind: "provider-error",
+    errorCode: "503",
+    statusCode: 401,
+  });
+  // statusCode 401 and errorCode 503 are contradictory
+  assert.notEqual(contradictory.errorCode, "503");
+  assert.equal(contradictory.statusCode, 401);
+  assert.equal(contradictory.errorCode, "401");
+});
+
+test("RED regression: sanitizer preserves valid HTTP statusCode and falls back to safe generic errorCode if not allowlisted", () => {
+  const custom = sanitizeObservation({
+    at: 1,
+    kind: "provider-error",
+    statusCode: 418,
+  });
+  assert.equal(custom.statusCode, 418);
+  assert.equal(custom.errorCode, "provider-error");
+});
+
+test("RED regression: sanitizer rejects invalid or non-error status codes", () => {
+  for (const invalid of [null, 0, 200, 302, 600, -1, NaN, "401"]) {
+    const res = sanitizeObservation({
+      at: 1,
+      kind: "provider-error",
+      statusCode: invalid,
+    });
+    assert.equal("statusCode" in res, false, "statusCode should be rejected for invalid status");
+  }
+});
+
 test("sanitizer only keeps factual scalar fields and observed token counters", () => {
   const x = sanitizeObservation({ at: 1, kind: "token-usage", usageStatus: "partial", tokens: { input: 7, madeUp: 9 }, secret: "x", prompt: "p" });
   assert.equal(x.usageStatus, "partial");

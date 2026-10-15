@@ -36,22 +36,28 @@ async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalTool
   }
 }
 
+function extractErrorStatusCode(error: unknown): number | undefined {
+  const raw = (error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status;
+  if (raw === null || raw === undefined || raw === "") return undefined;
+  const num = Number(raw);
+  return Number.isInteger(num) && num >= 400 && num <= 599 ? num : undefined;
+}
+
 async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
-  const status = Number((error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status);
-  const statusValid = Number.isInteger(status) && status >= 0;
+  const status = extractErrorStatusCode(error);
   if (isContextOverflow(error)) {
     await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
   } else if (isGlobalThrottle(error)) {
     await recordRuntimeResource(ctx, {
       ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
-      ...(statusValid ? { statusCode: status } : {}),
+      ...(status !== undefined ? { statusCode: status } : {}),
     });
   } else {
     await recordRuntimeResource(ctx, {
       ...resourceBase,
       kind: "provider-error",
-      errorCode: statusValid ? String(status) : "provider-error",
-      ...(statusValid ? { statusCode: status } : {}),
+      errorCode: status !== undefined ? String(status) : "provider-error",
+      ...(status !== undefined ? { statusCode: status } : {}),
       failureDomain: "provider",
     });
   }
@@ -325,17 +331,17 @@ export async function registerSessionHooks(
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
       } else if (isGlobalThrottle(event?.error)) {
-        const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
+        const status = extractErrorStatusCode(event?.error);
         try {
           const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
           if (!budget.allowed) {
             event.decision = { retry: false };
-            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(status !== undefined ? { statusCode: status } : {}) });
             return;
           }
         } catch {
           event.decision = { retry: false };
-          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(status !== undefined ? { statusCode: status } : {}) });
           return;
         }
         let retryAllowed = false;
@@ -350,18 +356,17 @@ export async function registerSessionHooks(
         event.decision = retryAllowed ? { retry: true, delay } : { retry: false };
         await recordRuntimeResource(ctx, {
           ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
-          ...(Number.isFinite(status) ? { statusCode: status } : {}),
+          ...(status !== undefined ? { statusCode: status } : {}),
         });
         if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
-        const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
-        const statusValid = Number.isInteger(status) && status >= 0;
+        const status = extractErrorStatusCode(event?.error);
         recordRuntimeResource(ctx, {
           ...resourceBase,
           kind: "provider-error",
-          errorCode: statusValid ? String(status) : "provider-error",
-          ...(statusValid ? { statusCode: status } : {}),
+          errorCode: status !== undefined ? String(status) : "provider-error",
+          ...(status !== undefined ? { statusCode: status } : {}),
           failureDomain: "provider",
         });
       }

@@ -144,6 +144,48 @@ describe("global hooks respect internal control-plane authority", () => {
     });
   }
 
+  it("RED regression: HTTP status extraction in retry hook rejects null, 200, 600, negative and non-integer", async () => {
+    for (const [errStatus, expectedCode] of [
+      [null, "provider-error"],
+      [0, "provider-error"],
+      [200, "provider-error"],
+      [600, "provider-error"],
+      [-1, "provider-error"],
+      [418, "provider-error"],
+      [401, "401"],
+      [403, "403"],
+      [408, "408"],
+      [429, "429"],
+      [500, "500"],
+      [503, "503"],
+    ]) {
+      const m = await setup({ role: "worker" });
+      const originalError = { status: errStatus, message: "simulated provider failure" };
+      const event = providerEvent(m.sessionID, originalError);
+      await m.hooks.session.retry(event);
+      const facts = resourceFacts(m.storage);
+      const fact = facts[facts.length - 1];
+      assert.ok(fact, "fact recorded");
+      if (errStatus >= 400 && errStatus <= 599) {
+        assert.equal(fact.statusCode, errStatus, "expected valid status");
+      } else {
+        assert.equal("statusCode" in fact, false, "statusCode should not be recorded for invalid status");
+      }
+      assert.equal(fact.errorCode, expectedCode, "expected errorCode match");
+    }
+  });
+
+  it("RED regression: role lookup failure or ambiguity marks role unknown, never worker/critic", async () => {
+    const m = await setup({ get: async () => ({ metadata: { "jev-role": "ambiguous" } }) });
+    const originalError = { status: 503, message: "unavailable" };
+    const event = providerEvent(m.sessionID, originalError);
+    await m.hooks.session.retry(event);
+    const facts = resourceFacts(m.storage);
+    const fact = facts.find(x => x.kind === "provider-error");
+    assert.ok(fact);
+    assert.equal(fact.role, "unknown");
+  });
+
   it("quota latch still trips before internal role lookup", async () => {
     let lookups = 0;
     const m = await setup({ role: "worker", get: async () => { lookups += 1; throw new Error("unavailable"); } });

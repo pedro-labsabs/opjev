@@ -108,8 +108,19 @@ export function sanitizeObservation(value: unknown): UsageObservation {
       nextAction: decision.nextAction,
     };
   }
-  for (const key of ["round", "retry", "statusCode"] as const) {
+  for (const key of ["round", "retry"] as const) {
     if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
+  }
+  const rawStatus = x.statusCode;
+  const validStatus = Number.isInteger(rawStatus) && Number(rawStatus) >= 400 && Number(rawStatus) <= 599 ? Number(rawStatus) : undefined;
+  if (validStatus !== undefined) {
+    out.statusCode = validStatus;
+    const strStatus = String(validStatus);
+    if (SAFE_ERROR_CODES.has(strStatus)) {
+      out.errorCode = strStatus;
+    } else {
+      out.errorCode = "provider-error";
+    }
   }
   const tokens = x.tokens && typeof x.tokens === "object" ? x.tokens as Record<string, unknown> : {};
   const observed: NonNullable<UsageObservation["tokens"]> = {};
