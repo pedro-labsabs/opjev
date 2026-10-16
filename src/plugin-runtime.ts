@@ -146,7 +146,15 @@ export async function discoverAgentCatalog(ctx: any): Promise<AgentCatalog> {
   }
 }
 
-export type ProviderErrorKind = "quota-limit" | "throttle" | "context-overflow" | "provider-error" | "incomplete" | "ambiguous";
+export type ProviderErrorKind = "quota-limit" | "non-retryable" | "throttle" | "context-overflow" | "provider-error" | "incomplete" | "ambiguous";
+
+const NON_RETRYABLE_CANONICAL_PROVIDER_TYPES = new Set([
+  "provider.auth",
+  "provider.invalid-request",
+  "provider.content-filter",
+  "provider.no-route",
+  "provider.unsupported-operation",
+]);
 
 export interface ProviderErrorClassification {
   kind: ProviderErrorKind;
@@ -245,6 +253,7 @@ export function classifyProviderError(input: unknown): ProviderErrorClassificati
   const textualThrottle = typeMessage.includes("rate limit") || typeMessage.includes("overload") ||
     typeMessage.includes("too many requests");
   const canonicalThrottle = type.value === "provider.rate-limit";
+  const canonicalNonRetryable = typeof type.value === "string" && NON_RETRYABLE_CANONICAL_PROVIDER_TYPES.has(type.value);
 
   if (response.value !== undefined && response.value !== null && typeof response.value !== "object") complete = false;
   const statusReads = [status, statusCode, responseStatus];
@@ -257,6 +266,12 @@ export function classifyProviderError(input: unknown): ProviderErrorClassificati
   if (providerCode === "invalid") complete = false;
   const providerThrottle = providerCode === 429 || providerCode === 529;
   const httpThrottle = statuses.some((value) => value === 429 || value === 529);
+
+  // The host's canonical terminal categories take precedence over generic HTTP
+  // throttle signals. Preserve only a validated HTTP status for evidence.
+  if (canonicalNonRetryable) {
+    return { kind: "non-retryable", complete, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false };
+  }
 
   if (!complete) return { kind: "incomplete", complete: false, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow };
   if (distinctStatuses.size > 1 ||

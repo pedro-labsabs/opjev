@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { FREE_POOL } from "./config.ts";
 import { registerSessionHooks } from "./hooks.ts";
-import { latchQuotaLimit } from "./resource-governor/enforcement-state.ts";
+import { latchQuotaLimit, QUOTA_ENFORCEMENT_KEY } from "./resource-governor/enforcement-state.ts";
 import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
@@ -273,6 +273,89 @@ describe("global hooks respect internal control-plane authority", () => {
         assert.equal("errorCode" in throttle, false);
       } finally { stub.restore(); }
     }
+  });
+
+  for (const type of [
+    "provider.auth",
+    "provider.invalid-request",
+    "provider.content-filter",
+    "provider.no-route",
+    "provider.unsupported-operation",
+  ]) {
+    for (const status of [429, 529]) {
+      it(`RED regression: ${type} with HTTP ${status} preserves host retry deny`, async () => {
+        const storage = makeStorage();
+        const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+        const sessionID = `issue49-non-retryable-${type}-${status}-${++nextSession}`;
+        let roleLookups = 0;
+        m.ctx.session.get = async () => {
+          roleLookups++;
+          return { id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } };
+        };
+        await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+        const stub = stubFetch(() => { throw new Error(`${type} must not query Jev`); });
+        try {
+          const event = providerEvent(sessionID, { type, message: "terminal provider error", status });
+          event.decision = { retry: false };
+          await m.hooks.session.retry(event);
+          assert.deepEqual(event.decision, { retry: false }, `${type} must remain non-retryable despite HTTP ${status}`);
+          assert.equal(storage._map.has("resource/throttle-retry/v1"), false, `${type} must not reserve throttle budget`);
+          assert.equal(storage._map.has(QUOTA_ENFORCEMENT_KEY), false, `${type} must not fabricate a quota latch`);
+          assert.equal(m.calls.switchModel.length, 0, `${type} must not switch models`);
+          assert.equal(stub.calls.length, 0, `${type} must not query Jev`);
+          assert.equal(roleLookups, 0, `${type} deny must precede role lookup and recovery work`);
+          const evidence = resourceFacts(storage).find((item) => item.kind === "provider-error");
+          assert.ok(evidence, `${type} retains bounded provider failure evidence`);
+          assert.equal(evidence.statusCode, status);
+          assert.equal(evidence.errorCode, String(status));
+          assert.equal(JSON.stringify(evidence).includes("terminal provider error"), false);
+        } finally { stub.restore(); }
+      });
+    }
+  }
+
+  it("retry fails closed without reservation when quota-state storage reads fail", async () => {
+    const storage = makeStorage();
+    const get = storage.get;
+    storage.get = async (key) => {
+      if (key === QUOTA_ENFORCEMENT_KEY) throw new Error("quota state unreadable");
+      return get(key);
+    };
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-quota-state-read-failure-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("unreadable quota state must deny before Jev"); });
+    try {
+      const event = providerEvent(sessionID, { type: "provider.rate-limit", message: "rate limit", status: 429 });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("retry fails closed without reservation when resource-ledger storage reads fail", async () => {
+    const storage = makeStorage();
+    const get = storage.get;
+    storage.get = async (key) => {
+      if (key === RESOURCE_LEDGER_KEY) throw new Error("resource ledger unreadable");
+      return get(key);
+    };
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-ledger-read-failure-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("unreadable resource ledger must deny before Jev"); });
+    try {
+      const event = providerEvent(sessionID, { type: "provider.rate-limit", message: "rate limit", status: 429 });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
   });
 
   it("RED regression: quota latch storage failure retains emergency deny in the retry hook", async () => {

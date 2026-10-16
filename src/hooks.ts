@@ -321,6 +321,19 @@ export async function registerSessionHooks(
         return;
       }
 
+      if (classification.kind === "non-retryable") {
+        // Canonical host terminal categories cannot be upgraded by a 429/529.
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: classification.httpStatus !== undefined ? String(classification.httpStatus) : "provider-error",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+          failureDomain: "provider",
+        });
+        return;
+      }
+
       // Incomplete or contradictory error payloads never authorize any recovery
       // effect or consume throttle budget. Keep only normalized HTTP provenance.
       if (!classification.complete || classification.kind === "ambiguous" || classification.kind === "incomplete") {
