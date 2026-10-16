@@ -5,7 +5,7 @@ import { registerTools } from "./src/tools.ts";
 import { resolveApiKey } from "./src/auth.ts";
 import { resolveOptions } from "./src/config.ts";
 import { AdmissionRpc, createAdmissionOrchestrateHandler } from "./src/orchestration/admission-rpc.ts";
-import { ExecutionSummaryRpc, createExecutionSummaryHandler } from "./src/orchestration/execution-summary-rpc.ts";
+import { ExecutionSummaryRpc, createExecutionSummaryHandler, createAcceptedResultHandler } from "./src/orchestration/execution-summary-rpc.ts";
 import { runOrchestrationOnce } from "./src/orchestration/dispatcher.ts";
 import { type ExecutionContract } from "./src/orchestration/types.ts";
 import { OrchestrationResultRpc, ORCHESTRATION_RESULT_EVENT } from "./src/orchestration/presentation.ts";
@@ -105,6 +105,11 @@ export default Plugin.define({
         });
         try {
           await ctx.rpc.register(ExecutionSummaryRpc, {
+            getAcceptedResult: createAcceptedResultHandler({
+              storage: {
+                get: async (key: string) => await ctx.storage.get(key),
+              },
+            }),
             getActiveSummary: createExecutionSummaryHandler({
               storage: {
                 get: async (key: string) => await ctx.storage.get(key),

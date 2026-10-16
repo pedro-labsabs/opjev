@@ -19,7 +19,9 @@
     "e2e:context": "node scripts/e2e-context-management.mjs"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.7"
+    "@opencode/plugin": "2.0.7",
+    "@opentui/solid": "0.5.10",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
     "ajv": "^8.20.0",
