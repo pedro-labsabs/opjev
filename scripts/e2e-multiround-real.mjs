@@ -31,8 +31,7 @@ const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/openco
 const ROOT = process.env.E2E_ROOT ?? "/tmp/opjev-e2e";
 const RUN_TS = new Date().toISOString().replace(/[:.]/g, "-");
 const RUN_DIR = path.join(ROOT, "multiround-real", RUN_TS);
-const EVIDENCE_OUTPUT_DIR = path.join(REPO, "docs", "reports", "artifacts");
-const EVIDENCE_FILE = path.join(EVIDENCE_OUTPUT_DIR, "issue-14-real-e2e-evidence.json");
+const EVIDENCE_FILE = path.join(RUN_DIR, "issue-14-real-e2e-evidence.json");
 
 function baseContract(over = {}) {
   return {
@@ -284,7 +283,6 @@ async function main() {
   log("Chave OpenCode Zen: [CONFIGURED]");
 
   fs.mkdirSync(RUN_DIR, { recursive: true });
-  fs.mkdirSync(EVIDENCE_OUTPUT_DIR, { recursive: true });
   const projectDir = path.join(RUN_DIR, "project");
   const homeDir = path.join(RUN_DIR, "home");
   fs.mkdirSync(projectDir, { recursive: true });

@@ -296,19 +296,21 @@ test("R2: extractNoticeText aceita somente payload de inbox synthetic", () => {
   assert.equal(extractNoticeText(undefined), "");
 });
 
-test("R3: baseline por sessao — historico nao reaparece", () => {
+test("R3: baseline por sessao — historico nao reaparece nem consome dedupe de entrega", () => {
   const seen = new Set();
   const baseline = new Set();
-  const out = selectUnpresentedNotices({
+  const options = {
     sessionID: "ses_parent000001",
     items: [inboxItem(RUN_A)],
     seen,
     baseline,
     startedAt: 100,
-  });
-  assert.deepEqual(out, [], "primeira observacao e baseline: nada a apresentar");
-  assert.ok(seen.has(RUN_A), "historico marcado como visto");
+  };
+  assert.deepEqual(selectUnpresentedNotices(options), [], "primeira observacao e baseline: nada a apresentar");
+  assert.equal(seen.has(RUN_A), false, "baseline historico nao marca o run como apresentado");
   assert.ok(baseline.has("ses_parent000001"));
+  assert.deepEqual(selectUnpresentedNotices(options), [], "historico continua ignorado nos polls seguintes");
+  assert.equal(seen.has(RUN_A), false, "summary replay ainda pode apresentar esse run");
 });
 
 test("R4: notice perdido pelo evento e presente antes do primeiro poll e apresentado uma vez", () => {
@@ -370,7 +372,7 @@ test("R6: multiplos notices novos sao apresentados do mais novo para o mais anti
   selectUnpresentedNotices({ sessionID: "ses_p", items: [], seen, baseline, startedAt: 100 });
   const out = selectUnpresentedNotices({
     sessionID: "ses_p",
-    items: [inboxItem(RUN_A), inboxItem(RUN_B)],
+    items: [inboxItem(RUN_A, "failed", 200), inboxItem(RUN_B, "failed", 300)],
     seen,
     baseline,
     startedAt: 100,
@@ -395,11 +397,11 @@ test("R7: baseline e POR SESSAO — sessoes diferentes nao se contaminam", () =>
     startedAt: 100,
   });
   assert.deepEqual(b, [], "historico da sessao B nao e apresentado");
-  assert.ok(seen.has(RUN_B));
+  assert.equal(seen.has(RUN_B), false, "historico nao marca o run como apresentado");
   // Notice NOVO na sessao A continua sendo apresentado.
   const a = selectUnpresentedNotices({
     sessionID: "ses_A",
-    items: [inboxItem(RUN_A)],
+    items: [inboxItem(RUN_A, "failed", 200)],
     seen,
     baseline,
     startedAt: 100,

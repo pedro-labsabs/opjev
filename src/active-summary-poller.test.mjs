@@ -31,6 +31,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 test("active summary polling renders changed recovery before terminal and deduplicates snapshots", async () => {
   const scheduler = fakeScheduler();
   const shown = [];
+  const terminal = [];
   const sessionID = "ses_summary_1";
   const runID = "run-summary-1";
   const records = new Map([
@@ -47,6 +48,7 @@ test("active summary polling renders changed recovery before terminal and dedupl
     currentSessionID: () => route,
     present: (sessionID, summary) => shown.push({ sessionID, summary }),
     scheduler,
+    presentTerminal: (sessionID, summary, runID) => terminal.push({ sessionID, summary, runID }),
   });
 
   poller.start(route);
@@ -75,11 +77,28 @@ test("active summary polling renders changed recovery before terminal and dedupl
 
   records.set(`orchestration/run/${runID}`, {
     updatedAt: Date.now(),
-    state: { phase: "completed", round: 1, contract: { maxRounds: 3 }, history: [] },
+    state: { phase: "failed", round: 1, contract: { maxRounds: 3 }, history: [], lastError: "Worker exceeded the 60s wall-clock deadline" },
   });
   [...scheduler.intervals.values()][0].fn();
   await tick();
-  assert.equal(shown.length, 2, "terminal result stays on the existing result-delivery path");
+  assert.equal(shown.length, 2, "terminal result is not presented as progress");
+  assert.equal(terminal.length, 1, "persisted terminal summary is presented once for reopening");
+  assert.deepEqual(terminal[0], {
+    sessionID,
+    summary: {
+      available: true,
+      taskState: "failed",
+      outcome: "failed",
+      detail: "Worker exceeded the 60s wall-clock deadline",
+      round: 1,
+      maxRounds: 3,
+      progress: "Round 1 of 3",
+    },
+    runID,
+  });
+  [...scheduler.intervals.values()][0].fn();
+  await tick();
+  assert.equal(terminal.length, 1, "unchanged terminal snapshot is not replayed during the same TUI session");
   assert.equal(scheduler.intervals.size, 1, "bounded polling remains available to observe a later run in this session");
 
   const nextRunID = "run-summary-2";
@@ -92,6 +111,33 @@ test("active summary polling renders changed recovery before terminal and dedupl
   await tick();
   assert.equal(shown.length, 3);
   assert.equal(shown[2].summary.taskState, "running");
+});
+
+test("terminal presentation retries until shown, then deduplicates", async () => {
+  const scheduler = fakeScheduler();
+  let calls = 0;
+  const poller = createActiveSummaryPoller({
+    async getSummary() {
+      return { runID: "run-terminal-retry", summary: { available: true, taskState: "failed" } };
+    },
+    currentSessionID: () => "ses_summary_1",
+    present() {},
+    async presentTerminal() {
+      calls += 1;
+      return calls > 1;
+    },
+    scheduler,
+  });
+
+  poller.start("ses_summary_1");
+  await tick();
+  assert.equal(calls, 1, "first terminal presentation attempt was refused");
+  [...scheduler.intervals.values()][0].fn();
+  await tick();
+  assert.equal(calls, 2, "a later poll retries the still-undelivered terminal summary");
+  [...scheduler.intervals.values()][0].fn();
+  await tick();
+  assert.equal(calls, 2, "successful terminal presentation is not repeated");
 });
 
 test("active summary polling is bounded and stops when the current route changes", async () => {

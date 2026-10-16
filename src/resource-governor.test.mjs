@@ -31,15 +31,167 @@ test("window aggregation excludes old facts and leaves unavailable measurements 
   assert.equal(a.throttles, 1);
   assert.equal(a.quotaLimits, 0);
 });
+test("cumulative usage snapshots from one session count only their increments", () => {
+  const total = aggregateUsage([
+    { at: 10, kind: "token-usage", usageStatus: "partial", sessionID: "worker-1", tokens: { input: 100, output: 10 } },
+    { at: 20, kind: "token-usage", usageStatus: "terminal", sessionID: "worker-1", tokens: { input: 150, output: 15 } },
+  ], { from: 0, to: 30 });
+  assert.deepEqual(total.tokens, { input: 150, output: 15 });
+});
+
+test("RED regression: sanitizer rejects inconsistent errorCode and statusCode", () => {
+  const contradictory = sanitizeObservation({
+    at: 1,
+    kind: "provider-error",
+    errorCode: "503",
+    statusCode: 401,
+  });
+  // statusCode 401 and errorCode 503 are contradictory
+  assert.notEqual(contradictory.errorCode, "503");
+  assert.equal(contradictory.statusCode, 401);
+  assert.equal(contradictory.errorCode, "401");
+});
+
+test("RED regression: sanitizer preserves valid HTTP statusCode and falls back to safe generic errorCode if not allowlisted", () => {
+  const custom = sanitizeObservation({
+    at: 1,
+    kind: "provider-error",
+    statusCode: 418,
+  });
+  assert.equal(custom.statusCode, 418);
+  assert.equal(custom.errorCode, "provider-error");
+});
+
+test("RED regression: sanitizer preserves semantic errorCode for quota-limit, operational-failure and context-overflow without HTTP override", () => {
+  const quota = sanitizeObservation({
+    at: 1,
+    kind: "quota-limit",
+    errorCode: "FreeUsageLimitError",
+    failureDomain: "quota",
+    statusCode: 403,
+  });
+  assert.equal(quota.kind, "quota-limit");
+  assert.equal(quota.errorCode, "FreeUsageLimitError");
+  assert.equal(quota.statusCode, 403);
+
+  const operational = sanitizeObservation({
+    at: 1,
+    kind: "operational-failure",
+    errorCode: "operational-failure",
+    failureDomain: "operational",
+    statusCode: 503,
+  });
+  assert.equal(operational.kind, "operational-failure");
+  assert.equal(operational.errorCode, "operational-failure");
+  assert.equal(operational.statusCode, 503);
+
+  const throttle = sanitizeObservation({
+    at: 1,
+    kind: "throttle",
+    failureDomain: "provider",
+    statusCode: 429,
+  });
+  assert.equal(throttle.kind, "throttle");
+  assert.equal("errorCode" in throttle, false, "throttle should not have errorCode synthesized from statusCode");
+  assert.equal(throttle.statusCode, 429);
+});
+
+
+test("RED regression: sanitizer rejects invalid or non-error status codes", () => {
+  for (const invalid of [null, 0, 200, 302, 600, -1, NaN, "401"]) {
+    const res = sanitizeObservation({
+      at: 1,
+      kind: "provider-error",
+      statusCode: invalid,
+    });
+    assert.equal("statusCode" in res, false, "statusCode should be rejected for invalid status");
+  }
+});
 
 test("sanitizer only keeps factual scalar fields and observed token counters", () => {
-  const x = sanitizeObservation({ at: 1, kind: "request", tokens: { input: 7, madeUp: 9 }, secret: "x", prompt: "p" });
+  const x = sanitizeObservation({ at: 1, kind: "token-usage", usageStatus: "partial", tokens: { input: 7, madeUp: 9 }, secret: "x", prompt: "p" });
+  assert.equal(x.usageStatus, "partial");
   assert.deepEqual(x.tokens, { input: 7 });
   assert.equal("secret" in x, false);
   assert.equal("prompt" in x, false);
   assert.equal(sanitizeObservation({ at: 1, kind: "made-up-kind" }).kind, "unknown");
   assert.equal("at" in sanitizeObservation({ kind: "request" }), false);
   assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "token=secret" }), false);
+  assert.equal("errorCode" in sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "Bearer secret-token-canary" }), false);
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "503", statusCode: 503, role: "worker" }).errorCode, "503");
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "403", statusCode: 403, role: "critic" }).role, "critic");
+  assert.equal(sanitizeObservation({ at: 1, kind: "provider-error", errorCode: "401", statusCode: 401 }).statusCode, 401);
+});
+
+test("critic timing observations keep only bounded stage identity and elapsed facts", () => {
+  const safe = sanitizeObservation({
+    at: 50, kind: "critic-timing", runID: "run-1", sessionID: "critic-1", round: 1, role: "critic",
+    criticStage: "wait-settled", elapsedMs: 120_000, prompt: "private prompt",
+    headers: { authorization: "private header" }, response: "private response", model: "secret-model",
+  });
+  assert.deepEqual(safe, {
+    kind: "critic-timing", at: 50, runID: "run-1", sessionID: "critic-1",
+    role: "critic", round: 1, criticStage: "wait-settled", elapsedMs: 120_000,
+  });
+  for (const elapsedMs of [-1, 1.5, 120_001, "1"]) {
+    const invalid = sanitizeObservation({ kind: "critic-timing", criticStage: "not-a-stage", elapsedMs, prompt: "private" });
+    assert.equal("criticStage" in invalid, false);
+    assert.equal("elapsedMs" in invalid, false);
+    assert.equal("prompt" in invalid, false);
+  }
+});
+test("sanitizer preserves usage status and nonnegative integer ledger fields only", () => {
+  const safe = sanitizeObservation({
+    kind: "token-usage",
+    usageStatus: "partial",
+    round: 1,
+    retry: 2,
+    statusCode: 429,
+    prompt: "private prompt",
+    secret: "private secret",
+    arbitrary: "discard",
+  });
+  assert.deepEqual(
+    { round: safe.round, retry: safe.retry, statusCode: safe.statusCode, usageStatus: safe.usageStatus },
+    { round: 1, retry: 2, statusCode: 429, usageStatus: "partial" },
+  );
+  for (const invalid of [-1, 1.5, "2", null]) {
+    const rejected = sanitizeObservation({ kind: "retry", round: invalid, retry: invalid, statusCode: invalid });
+    assert.equal("round" in rejected, false);
+    assert.equal("retry" in rejected, false);
+    assert.equal("statusCode" in rejected, false);
+  }
+  assert.equal(sanitizeObservation({ kind: "token-usage", usageStatus: "terminal" }).usageStatus, "terminal");
+  assert.equal("usageStatus" in sanitizeObservation({ kind: "token-usage", usageStatus: "unknown" }), false);
+  assert.equal(JSON.stringify(safe).includes("private"), false);
+  assert.equal("arbitrary" in safe, false);
+});
+test("persists only the two controlled executor model failure codes", () => {
+  const ledger = new UsageLedger({ capacity: 4 });
+  const allowed = ["executor-model-mismatch", "executor-model-unobserved"];
+  for (const errorCode of allowed) {
+    ledger.append({
+      at: 1,
+      kind: "operational-failure",
+      errorCode,
+      prompt: "private prompt",
+      credential: "secret-token",
+      arbitrary: { output: "private result" },
+    });
+  }
+  const rows = ledger.snapshot();
+  assert.deepEqual(rows.map((row) => row.errorCode), allowed);
+  for (const row of rows) {
+    assert.equal("prompt" in row, false);
+    assert.equal("credential" in row, false);
+    assert.equal("arbitrary" in row, false);
+  }
+  assert.equal("errorCode" in ledger.append({
+    at: 2,
+    kind: "operational-failure",
+    errorCode: "executor-model-mismatch: token=secret",
+    prompt: "private prompt",
+  }), false);
 });
 
 test("sanitizer preserves contract-sized run and session identities", () => {

@@ -18,6 +18,7 @@
 
 import {
   OrchestrationError,
+  validateVerdict,
   type EvidencePacket,
   type ExecutionContract,
   type ExecutionOutcome,
@@ -30,7 +31,7 @@ import {
 } from "./types.ts";
 import { createRunState, transitionRun, type TransitionCommands } from "./state-machine.ts";
 import { validateResumableRunState } from "./human-gate.ts";
-import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict } from "./judgement.ts";
+import { buildRoundJudgementQuestions, buildRoundJudgementState, parseRoundVerdict, type RoundJudgementAnswers } from "./judgement.ts";
 import { buildCriticPrompt, criticOutcomeCheck, parseCriticOutput, type CriticFinding } from "./critic.ts";
 import { buildRecoveryPrompt } from "./recovery-prompt.ts";
 import { sanitizeDecisionExplanation, type DecisionExplanation } from "./decision-explanation.ts";
@@ -47,6 +48,7 @@ import {
 import { withKeyedLock } from "../lock.ts";
 import { sessionBindingKey } from "./admission.ts";
 import type { ResourceBudgetDecision, BudgetStage } from "../resource-governor/budget-policy.ts";
+import type { InternalWorkerBinding } from "./tool-authority.ts";
 
 export const WORKER_TIMEOUT_MS = Number(process?.env?.OPJEV_WORKER_TIMEOUT_MS) > 0 ? Number(process.env.OPJEV_WORKER_TIMEOUT_MS) : 60_000;
 export const CRITIC_TIMEOUT_MS = WORKER_TIMEOUT_MS;
@@ -58,13 +60,16 @@ export interface WorkerRuntime {
   createWorker(input: {
     agent: string;
     model: { providerID: string; id: string };
+    binding: InternalWorkerBinding;
     location?: { directory?: string };
     metadata: Record<string, unknown>;
   }): Promise<{ sessionID: string }>;
-  prompt(input: { sessionID: string; text: string; metadata?: Record<string, unknown> }): Promise<void>;
+  prompt(input: { sessionID: string; text: string; binding: InternalWorkerBinding; metadata?: Record<string, unknown> }): Promise<void>;
   wait(input: { sessionID: string }): Promise<void>;
   get(input: { sessionID: string }): Promise<WorkerSessionView>;
   context(input: { sessionID: string }): Promise<unknown[]>;
+  /** Synchronously fences all future worker tools before any interrupt request. */
+  fence(input: { sessionID: string }): void;
   interrupt?(input: { sessionID: string }): Promise<boolean>;
 }
 
@@ -269,7 +274,7 @@ function resourceErrorObservation(error: unknown, at: number, identity: Record<s
   // persistence, follow-up bookkeeping, or an ambiguous integration seam.
   const explicitHttp = Number.isInteger(status) && status >= 400 && status <= 599 &&
     (typeof e.type === "string" && /http.?error|provider.?error/i.test(e.type) || response.status !== undefined);
-  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: "provider-error", failureDomain: "provider" };
+  if (explicitHttp) return { ...identity, at, kind: "provider-error", statusCode: status, errorCode: String(status), failureDomain: "provider" };
   return { ...identity, at, kind: "operational-failure", errorCode: "operational-failure", failureDomain: "operational" };
 }
 
@@ -286,6 +291,61 @@ function observedTokenCounts(usage: unknown): Record<string, number> | undefined
     for (const name of names) if (Number.isFinite(u[name]) && Number(u[name]) >= 0) { out[target] = Number(u[name]); break; }
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+const MAX_MODEL_TRAIL = 4;
+const MAX_MODEL_REF_LENGTH = 256;
+
+function structuredModelRef(value: unknown): string | undefined {
+  const ref = typeof value === "string"
+    ? value.trim()
+    : value && typeof value === "object" &&
+        typeof (value as any).providerID === "string" &&
+        typeof (value as any).id === "string"
+      ? `${(value as any).providerID}/${(value as any).id}`
+      : "";
+  return ref && ref.length <= MAX_MODEL_REF_LENGTH && !/[\u0000-\u001f]/.test(ref) ? ref : undefined;
+}
+
+function assistantModelTrail(messages: unknown[], contractedModel: string): { models: string[]; mismatch: boolean; truncated: boolean } {
+  const models: string[] = [];
+  let last: string | undefined;
+  let mismatch = false;
+  let truncated = false;
+  if (!Array.isArray(messages)) return { models, mismatch, truncated };
+  for (const raw of messages) {
+    if (!raw || typeof raw !== "object" || (raw as any).type !== "assistant") continue;
+    const model = structuredModelRef((raw as any).model);
+    if (!model) continue;
+    if (model !== contractedModel) mismatch = true;
+    if (model === last) continue;
+    last = model;
+    if (models.length < MAX_MODEL_TRAIL) models.push(model);
+    else truncated = true;
+  }
+  return { models, mismatch, truncated };
+}
+
+function diagnosticModel(model: string | undefined): string {
+  return (model ?? "unknown").replace(/[\u0000-\u001f]/g, "?").slice(0, 64);
+}
+// Local diagnostics only: allow 250ms for host metadata, independent of worker deadline.
+const PARTIAL_USAGE_READ_TIMEOUT_MS = 250;
+
+async function readPartialSessionView(
+  read: () => Promise<WorkerSessionView>,
+): Promise<WorkerSessionView | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(read),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), PARTIAL_USAGE_READ_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function resolveFrontier(deps: DispatcherDeps, runID: string): Promise<InputFrontier> {
@@ -437,6 +497,53 @@ function withTimeout<T>(
     );
   });
 }
+async function fenceAndInterruptWorker(runtime: WorkerRuntime, sessionID: string): Promise<boolean> {
+  let fenced = false;
+  try {
+    runtime.fence({ sessionID });
+    fenced = true;
+  } catch { /* fencing failure remains unconfirmed; still attempt host interruption */ }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const interruption = Promise.resolve()
+    .then(() => runtime.interrupt?.({ sessionID }))
+    .then((confirmed) => confirmed === true, () => false);
+  try {
+    const confirmed = await Promise.race([
+      interruption,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), INTERRUPT_CONFIRMATION_TIMEOUT_MS);
+      }),
+    ]);
+    return fenced && confirmed;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+async function terminateUnauthorizedWorker(
+  deps: DispatcherDeps,
+  input: {
+    sessionID: string;
+    failureCode: "executor-not-free" | "executor-model-mismatch" | "executor-model-unobserved";
+    identity: Record<string, unknown>;
+    at: number;
+  },
+): Promise<boolean> {
+  const confirmed = await fenceAndInterruptWorker(deps.runtime, input.sessionID);
+  if (!confirmed) {
+    await observeResource(deps, resourceErrorObservation(
+      new OrchestrationError(
+        `${input.failureCode}-interrupt-unconfirmed`,
+        `${input.failureCode}: worker interruption was not confirmed`,
+      ),
+      input.at,
+      input.identity,
+    ));
+  }
+  return confirmed;
+}
+
+
 
 function bounded(msg: unknown): string {
   const s = msg instanceof Error ? msg.message : String(msg ?? "");
@@ -830,6 +937,7 @@ async function executeSchedule(
         const created = await deps.runtime.createWorker({
           agent: workerAgent,
           model: workerModel,
+          binding: { runID: contract.runID, round: state.round, model: roundModel },
           location: deps.location ? { directory: deps.location.directory } : undefined,
           metadata: {
             "jev-orchestration": true,
@@ -950,7 +1058,12 @@ async function executeSchedule(
       let promptDelivered = false;
       try {
         await observeResource(deps, { at: now(), kind: "request", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round });
-        await deps.runtime.prompt({ sessionID: workerSessionID, text: promptText, metadata: promptMeta });
+        await deps.runtime.prompt({
+          sessionID: workerSessionID,
+          text: promptText,
+          binding: { runID: contract.runID, round: state.round, model: roundModel },
+          metadata: promptMeta,
+        });
         promptDelivered = true;
         if (typeof followupsAny?.markDelivered === "function" && takenFollowups.length > 0) {
           try {
@@ -984,6 +1097,26 @@ async function executeSchedule(
       view = await deps.runtime.get({ sessionID: workerSessionID });
       messages = await deps.runtime.context({ sessionID: workerSessionID });
     } catch (err) {
+      const timedOut = err instanceof OrchestrationError && err.code.startsWith("worker-timeout");
+      if (timedOut) {
+        try {
+          const partialView = await readPartialSessionView(() => deps.runtime.get({ sessionID: workerSessionID }));
+          const partialTokens = observedTokenCounts(partialView?.usage ?? partialView?.metadata?.usage ?? partialView?.metadata?.tokens);
+          if (partialTokens) await observeResource(deps, {
+            at: now(),
+            kind: "token-usage",
+            usageStatus: "partial",
+            runID: contract.runID,
+            sessionID: workerSessionID,
+            route: selection?.route,
+            ...(partialView?.model?.trim() ? { model: partialView.model.trim() } : {}),
+            ...(partialView?.agent?.trim() ? { agent: partialView.agent.trim() } : {}),
+            role: "worker",
+            round: state.round,
+            tokens: partialTokens,
+          });
+        } catch { /* usage is unknown unless the runtime confirms structured values */ }
+      }
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model: roundModel, agent: roundAgent, role: "worker", round: state.round }));
       const interruptionConfirmed = err instanceof OrchestrationError && err.code === "worker-timeout";
       if (interruptionConfirmed || workerWaitCompleted) {
@@ -1012,30 +1145,129 @@ async function executeSchedule(
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
     const agent = view.agent?.trim() || roundAgent;
-    const model = view.model?.trim() || roundModel;
+    const jevSelectedModel = mode === "initial"
+      ? selection?.model
+      : mode === "switch-model"
+        ? prev?.switchTo?.model
+        : roundModel;
+    const contractedModel = state.executor?.model ?? roundModel;
+    const runtimeModel = structuredModelRef(view.model);
+    const modelTrail = assistantModelTrail(messages, contractedModel);
+    const model = runtimeModel ?? modelTrail.models.at(-1);
+    const hasMultipleObservedModels = modelTrail.truncated ||
+      modelTrail.models.length > 1 ||
+      (runtimeModel !== undefined && modelTrail.models.length > 0 && runtimeModel !== modelTrail.models.at(-1));
     const tokenCounts = observedTokenCounts(view.usage ?? view.metadata?.usage ?? view.metadata?.tokens);
-    if (tokenCounts) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: workerSessionID, route: selection?.route, model, agent, role: "worker", round: state.round, tokens: tokenCounts });
+    if (tokenCounts) {
+      const tokenModel = hasMultipleObservedModels
+        ? undefined
+        : modelTrail.models[0] ?? runtimeModel ?? undefined;
+      await observeResource(deps, {
+        at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID,
+        sessionID: workerSessionID, route: selection?.route,
+        ...(tokenModel ? { model: tokenModel } : {}),
+        agent, role: "worker", round: state.round, tokens: tokenCounts,
+      });
+    }
 
-    // Hard guard FREE_POOL: o model OBSERVADO so vira executor canonico se
-    // continuar elegivel. Out-of-pool => bounded failure ANTES de evidence,
-    // critic, judge e recovery — sem fallback para selection, sem routing
-    // alternativo (validation != routing).
-    if (!isFreeModel(model)) {
+    const diagnostic = (code: string) =>
+      `${code}: selected=${diagnosticModel(jevSelectedModel)} contracted=${diagnosticModel(contractedModel)} ` +
+      `runtime=${diagnosticModel(runtimeModel)} observed=${modelTrail.models.map(diagnosticModel).join("→") || "unknown"}` +
+      (modelTrail.truncated ? "→…" : "");
+
+    // Missing executor evidence is not permission to inherit the selected
+    // model; only structured runtime/message identity can substantiate it.
+    if (!model) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-model-unobserved",
+        identity: { runID: contract.runID, sessionID: workerSessionID, route: selection?.route, agent, role: "worker", round: state.round },
+        at: now(),
+      });
       try {
         state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
       } catch { /* kernel barrier */ }
+      const error = new OrchestrationError("executor-model-unobserved", diagnostic("executor-model-unobserved"));
+      await observeResource(deps, {
+        at: now(), kind: "operational-failure", runID: contract.runID, sessionID: workerSessionID,
+        route: selection?.route, agent, role: "worker", round: state.round,
+        errorCode: "executor-model-unobserved", failureDomain: "operational",
+      });
+      return {
+        abort: true,
+        result: await failRun(state, contract.runID, error, { rounds }, { deps, kind: "run-failed", workerSessionID }),
+      };
+    }
+
+    // A FREE_POOL model is still unauthorized unless the runtime and every
+    // structured assistant-message model match the current kernel contract.
+    if (!isFreeModel(model)) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-not-free",
+        identity: {
+          runID: contract.runID,
+          sessionID: workerSessionID,
+          route: selection?.route,
+          model: diagnosticModel(model),
+          agent,
+          role: "worker",
+          round: state.round,
+        },
+        at: now(),
+      });
+      try {
+        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
+      } catch { /* kernel barrier */ }
+      const error = new OrchestrationError(
+        "executor-not-free",
+        `executor-not-free: observed model outside FREE_POOL (${diagnosticModel(model)})`,
+      );
       return {
         abort: true,
         result: await failRun(
           state,
           contract.runID,
-          new OrchestrationError("executor-not-free", `modelo observado fora do FREE_POOL: ${model}`),
-          {
-            worker: { sessionID: workerSessionID, agent, model, outcome: "failed", finalText },
-            rounds,
-          },
+          error,
+          { rounds },
           { deps, kind: "run-failed", workerSessionID },
         ),
+      };
+    }
+
+    const modelMismatch =
+      jevSelectedModel !== contractedModel ||
+      roundModel !== contractedModel ||
+      (runtimeModel !== undefined && runtimeModel !== contractedModel) ||
+      modelTrail.mismatch;
+    if (modelMismatch) {
+      await terminateUnauthorizedWorker(deps, {
+        sessionID: workerSessionID,
+        failureCode: "executor-model-mismatch",
+        identity: {
+          runID: contract.runID,
+          sessionID: workerSessionID,
+          route: selection?.route,
+          ...(runtimeModel ? { model: runtimeModel } : {}),
+          agent,
+          role: "worker",
+          round: state.round,
+        },
+        at: now(),
+      });
+      try {
+        state = transitionRun(state, { type: "EXECUTION_FINISHED", outcome: "failed" }).state;
+      } catch { /* kernel barrier */ }
+      const error = new OrchestrationError("executor-model-mismatch", diagnostic("executor-model-mismatch"));
+      await observeResource(deps, {
+        at: now(), kind: "operational-failure", runID: contract.runID, sessionID: workerSessionID,
+        route: selection?.route, ...(runtimeModel ? { model: runtimeModel } : {}),
+        agent, role: "worker", round: state.round,
+        errorCode: "executor-model-mismatch", failureDomain: "operational",
+      });
+      return {
+        abort: true,
+        result: await failRun(state, contract.runID, error, { rounds }, { deps, kind: "run-failed", workerSessionID }),
       };
     }
 
@@ -1077,6 +1309,18 @@ async function executeSchedule(
     };
     let criticInterruptUnconfirmed = false;
     let criticInterruptError: unknown;
+    const criticStartedAt = performance.now();
+    const observeCriticTiming = (
+      criticStage: "created" | "prompt-sent" | "wait-settled" | "session-read" | "interruption-requested" | "interruption-confirmed" | "interruption-unconfirmed",
+      sessionID: string | undefined,
+    ) => {
+      if (!sessionID) return;
+      const elapsedMs = Math.min(120_000, Math.max(0, Math.floor(performance.now() - criticStartedAt)));
+      void observeResource(deps, {
+        at: now(), kind: "critic-timing", runID: contract.runID, sessionID,
+        role: "critic", round: state.round, criticStage, elapsedMs,
+      }).catch(() => {});
+    };
     try {
       const created = await deps.critic.createCritic({
         agent,
@@ -1093,6 +1337,7 @@ async function executeSchedule(
       const createdSessionID = created.sessionID;
       if (!createdSessionID) throw new OrchestrationError("critic-create-failed", "createCritic nao retornou sessionID");
       criticSessionID = createdSessionID;
+      observeCriticTiming("created", criticSessionID);
       const criticPrompt = buildCriticPrompt({
         objective: state.contract.objective,
         acceptanceCriteria: state.contract.acceptanceCriteria,
@@ -1109,17 +1354,39 @@ async function executeSchedule(
         text: criticPrompt,
         metadata: { "jev-router": "orchestration-internal", "jev-role": "critic", "jev-round": state.round },
       });
+      observeCriticTiming("prompt-sent", createdSessionID);
       await withTimeout(
         () => deps.critic.wait({ sessionID: createdSessionID }),
         criticTimeoutMs,
-        () => deps.critic.interrupt?.({ sessionID: createdSessionID }) ?? false,
+        () => {
+          observeCriticTiming("interruption-requested", createdSessionID);
+          try {
+            const interruption = deps.critic.interrupt?.({ sessionID: createdSessionID });
+            if (!interruption) {
+              observeCriticTiming("interruption-unconfirmed", createdSessionID);
+              return false;
+            }
+            return Promise.resolve(interruption).then((confirmed) => {
+              observeCriticTiming(confirmed === true ? "interruption-confirmed" : "interruption-unconfirmed", createdSessionID);
+              return confirmed === true;
+            }, () => {
+              observeCriticTiming("interruption-unconfirmed", createdSessionID);
+              return false;
+            });
+          } catch {
+            observeCriticTiming("interruption-unconfirmed", createdSessionID);
+            return false;
+          }
+        },
         { code: "critic-timeout", label: "critic" },
       );
+      observeCriticTiming("wait-settled", createdSessionID);
       const cView = await deps.critic.get({ sessionID: createdSessionID });
       const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
-      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
+      if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
       const ownOutcome = cView.outcome;
+      observeCriticTiming("session-read", createdSessionID);
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
       const raw = extractFinalAssistantText(cMessages);
       const parsed = parseCriticOutput(raw);
@@ -1155,6 +1422,7 @@ async function executeSchedule(
         }
       }
     } catch (err) {
+      if (isInterruptUnconfirmed(err)) observeCriticTiming("interruption-unconfirmed", criticSessionID);
       await observeResource(deps, resourceErrorObservation(err, now(), { runID: contract.runID, sessionID: criticSessionID, model, agent, role: "critic", round: state.round }));
       criticInterruptUnconfirmed = isInterruptUnconfirmed(err);
       criticInterruptError = err;
@@ -1270,6 +1538,27 @@ async function executeSchedule(
       // 7. parse + verdict
       try {
         verdict = parseRoundVerdict(answers);
+        const structured = answers as RoundJudgementAnswers;
+        let decisionStatus: "valid" | "invalid" = "valid";
+        try {
+          validateVerdict(verdict);
+        } catch {
+          decisionStatus = "invalid";
+        }
+        await observeResource(deps, {
+          at: now(),
+          kind: "jev-verdict",
+          runID: contract.runID,
+          role: "jev",
+          round: state.round,
+          decisionAnswers: {
+            doneNoul: structured.done.noul,
+            failureClass: verdict.failureClass,
+            sameExecutorCanRepairNoul: structured.same_executor_can_repair.noul,
+            nextAction: verdict.nextAction,
+          },
+          decisionStatus,
+        });
       } catch (err) {
         return {
           abort: true,
@@ -1750,7 +2039,7 @@ async function executeSchedule(
         // nao troca agent/model/executor, nao aprova, nao corrige output.
         const orchView = await deps.orchestrator.get({ sessionID: orchestratorSessionID });
         const orchestratorTokens = observedTokenCounts(orchView?.usage ?? orchView?.metadata?.usage ?? orchView?.metadata?.tokens);
-        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
+        if (orchestratorTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: orchestratorSessionID, model: orchView?.model?.trim() || orchModel, agent: orchView?.agent?.trim() || orchAgent, role: "orchestrator", round: out.state.round, tokens: orchestratorTokens });
         const orchOutcome = orchView?.outcome;
         if (orchOutcome === "failed" || orchOutcome === "interrupted") {
           throw new OrchestrationError(

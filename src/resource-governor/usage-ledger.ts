@@ -1,9 +1,11 @@
+import { isFailureClass, isNextAction, type FailureClass, type NextAction } from "../orchestration/types.ts";
+
 /** Shared, factual telemetry for resource governance and future model intelligence. */
 export type ObservationKind =
   | "unknown"
   | "request" | "round" | "retry" | "recovery" | "escalation" | "outcome" | "fanout"
   | "compaction" | "token-usage" | "throttle" | "quota-limit" | "context-overflow"
-  | "provider-error" | "operational-failure";
+  | "provider-error" | "operational-failure" | "jev-verdict" | "critic-timing";
 
 export interface UsageObservation {
   at?: number;
@@ -24,27 +26,52 @@ export interface UsageObservation {
   signal?: "rate-limit" | "throttle" | "overload" | "unknown";
   errorCode?: string;
   failureDomain?: "provider" | "quota" | "context" | "execution" | "operational" | "unknown";
+  usageStatus?: "partial" | "terminal";
   tokens?: { input?: number; output?: number; reasoning?: number; cacheRead?: number; cacheWrite?: number };
+  decisionAnswers?: {
+    doneNoul: number;
+    failureClass: FailureClass;
+    sameExecutorCanRepairNoul: number;
+    nextAction: NextAction;
+  };
+  decisionStatus?: "valid" | "invalid";
+  criticStage?: "created" | "prompt-sent" | "wait-settled" | "session-read" | "interruption-requested" | "interruption-confirmed" | "interruption-unconfirmed";
+  elapsedMs?: number;
 }
 
 const KINDS = new Set<ObservationKind>([
   "unknown",
   "request", "round", "retry", "recovery", "escalation", "outcome", "fanout", "compaction",
   "token-usage", "throttle", "quota-limit", "context-overflow", "provider-error", "operational-failure",
+  "jev-verdict", "critic-timing",
 ]);
 const STRINGS = ["runID", "sessionID", "model", "agent", "errorCode"] as const;
 const MAX_TEXT = 160;
 const MAX_IDENTITY = 200; // Matches the bounded run/session identity contracts.
-const SAFE_ERROR_CODES = new Set(["FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "interrupt-unconfirmed", "429", "529"]);
+const SAFE_ERROR_CODES = new Set([
+  "FreeUsageLimitError", "quota-limit", "provider-error", "context-overflow", "operational-failure", "interrupt-unconfirmed", "executor-model-mismatch", "executor-model-unobserved",
+  "400", "401", "403", "404", "408", "429", "500", "502", "503", "504", "529"
+]);
 const TOKEN_KEYS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 const ROUTES = new Set(["fast-coding", "heavy-reasoning", "research-docs"]);
 const FAILURE_CLASSES = new Set(["none", "implementation", "reasoning", "missing-context", "wrong-agent", "wrong-model", "environment", "bad-contract"]);
 const RECOVERY_ACTIONS = new Set(["repair-same", "fresh-same", "switch-model", "switch-agent", "replan", "human-resume"]);
+const CRITIC_STAGES = new Set(["created", "prompt-sent", "wait-settled", "session-read", "interruption-requested", "interruption-confirmed", "interruption-unconfirmed"]);
 
 /** Strict whitelist: prompts, messages, stack traces, and arbitrary payloads are discarded. */
 export function sanitizeObservation(value: unknown): UsageObservation {
   const x = value && typeof value === "object" ? value as Record<string, unknown> : {};
   const kind = KINDS.has(x.kind as ObservationKind) ? x.kind as ObservationKind : "unknown";
+  if (kind === "critic-timing") {
+    const timing: UsageObservation = { kind };
+    if (typeof x.at === "number" && Number.isFinite(x.at)) timing.at = x.at;
+    for (const key of ["runID", "sessionID"] as const) if (typeof x[key] === "string" && x[key].length) timing[key] = (x[key] as string).slice(0, MAX_IDENTITY);
+    if (x.role === "critic") timing.role = "critic";
+    if (Number.isInteger(x.round) && Number(x.round) > 0) timing.round = Number(x.round);
+    if (CRITIC_STAGES.has(String(x.criticStage))) timing.criticStage = x.criticStage as UsageObservation["criticStage"];
+    if (Number.isInteger(x.elapsedMs) && Number(x.elapsedMs) >= 0 && Number(x.elapsedMs) <= 120_000) timing.elapsedMs = Number(x.elapsedMs);
+    return timing;
+  }
   const out: UsageObservation = {
     kind,
   };
@@ -62,7 +89,41 @@ export function sanitizeObservation(value: unknown): UsageObservation {
   if (RECOVERY_ACTIONS.has(String(x.recoveryAction))) out.recoveryAction = x.recoveryAction as UsageObservation["recoveryAction"];
   if (["provider", "quota", "context", "execution", "operational", "unknown"].includes(String(x.failureDomain))) out.failureDomain = x.failureDomain as UsageObservation["failureDomain"];
   if (["rate-limit", "throttle", "overload", "unknown"].includes(String(x.signal))) out.signal = x.signal as UsageObservation["signal"];
-  for (const key of ["round", "retry", "statusCode"] as const) if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
+  if (["partial", "terminal"].includes(String(x.usageStatus))) out.usageStatus = x.usageStatus as UsageObservation["usageStatus"];
+  if (x.decisionStatus === "valid" || x.decisionStatus === "invalid") out.decisionStatus = x.decisionStatus;
+  const decision = x.decisionAnswers && typeof x.decisionAnswers === "object"
+    ? x.decisionAnswers as Record<string, unknown>
+    : {};
+  if (
+    typeof decision.doneNoul === "number" && Number.isFinite(decision.doneNoul) && decision.doneNoul >= 0 && decision.doneNoul <= 1 &&
+    isFailureClass(decision.failureClass) &&
+    typeof decision.sameExecutorCanRepairNoul === "number" && Number.isFinite(decision.sameExecutorCanRepairNoul) &&
+    decision.sameExecutorCanRepairNoul >= 0 && decision.sameExecutorCanRepairNoul <= 1 &&
+    isNextAction(decision.nextAction)
+  ) {
+    out.decisionAnswers = {
+      doneNoul: decision.doneNoul,
+      failureClass: decision.failureClass,
+      sameExecutorCanRepairNoul: decision.sameExecutorCanRepairNoul,
+      nextAction: decision.nextAction,
+    };
+  }
+  for (const key of ["round", "retry"] as const) {
+    if (Number.isInteger(x[key]) && Number(x[key]) >= 0) out[key] = Number(x[key]);
+  }
+  const rawStatus = x.statusCode;
+  const validStatus = Number.isInteger(rawStatus) && Number(rawStatus) >= 400 && Number(rawStatus) <= 599 ? Number(rawStatus) : undefined;
+  if (validStatus !== undefined) {
+    out.statusCode = validStatus;
+    if (kind === "provider-error") {
+      const strStatus = String(validStatus);
+      if (SAFE_ERROR_CODES.has(strStatus)) {
+        out.errorCode = strStatus;
+      } else {
+        out.errorCode = "provider-error";
+      }
+    }
+  }
   const tokens = x.tokens && typeof x.tokens === "object" ? x.tokens as Record<string, unknown> : {};
   const observed: NonNullable<UsageObservation["tokens"]> = {};
   for (const key of TOKEN_KEYS) if (Number.isFinite(tokens[key]) && Number(tokens[key]) >= 0) observed[key] = Number(tokens[key]);
@@ -124,19 +185,45 @@ export function aggregateUsage(values: readonly unknown[], window: { from: numbe
     fanouts: 0, compactions: 0, throttles: 0, quotaLimits: 0, contextOverflows: 0,
     providerFailures: 0, operationalFailures: 0, tokens: {}, observations: 0,
   };
+  const snapshots = new Map<string, Array<{ at: number; tokens: NonNullable<UsageObservation["tokens"]> }>>();
+  const key: Partial<Record<ObservationKind, keyof UsageWindow>> = {
+    request: "requests", round: "rounds", retry: "retries", recovery: "recoveries", escalation: "escalations",
+    fanout: "fanouts", compaction: "compactions", throttle: "throttles", "quota-limit": "quotaLimits",
+    "context-overflow": "contextOverflows", "provider-error": "providerFailures", "operational-failure": "operationalFailures",
+  };
   for (const raw of values) {
     const x = sanitizeObservation(raw);
     if (x.at === undefined) continue; // timestamp unknown: never fabricate window membership
-    if (x.at < window.from || x.at > window.to) continue;
-    out.observations++;
-    const key: Partial<Record<ObservationKind, keyof UsageWindow>> = {
-    request: "requests", round: "rounds", retry: "retries", recovery: "recoveries", escalation: "escalations",
-      fanout: "fanouts", compaction: "compactions", throttle: "throttles", "quota-limit": "quotaLimits",
-      "context-overflow": "contextOverflows", "provider-error": "providerFailures", "operational-failure": "operationalFailures",
-    };
-    const count = key[x.kind];
-    if (count) (out[count] as number)++;
-    for (const token of TOKEN_KEYS) if (x.tokens?.[token] !== undefined) out.tokens[token] = (out.tokens[token] ?? 0) + x.tokens[token]!;
+    const inWindow = x.at >= window.from && x.at <= window.to;
+    if (inWindow) {
+      out.observations++;
+      const count = key[x.kind];
+      if (count) (out[count] as number)++;
+    }
+    if (x.kind === "token-usage" && x.sessionID && x.tokens) {
+      const session = snapshots.get(x.sessionID) ?? [];
+      session.push({ at: x.at, tokens: x.tokens });
+      snapshots.set(x.sessionID, session);
+    } else if (inWindow) {
+      for (const token of TOKEN_KEYS) if (x.tokens?.[token] !== undefined) out.tokens[token] = (out.tokens[token] ?? 0) + x.tokens[token]!;
+    }
+  }
+  // Runtime session usage is a cumulative snapshot: charge only the increase
+  // from the preceding observation for that session.
+  for (const session of snapshots.values()) {
+    session.sort((a, b) => a.at - b.at);
+    const previous: Partial<Record<keyof NonNullable<UsageObservation["tokens"]>, number>> = {};
+    for (const snapshot of session) {
+      const inWindow = snapshot.at >= window.from && snapshot.at <= window.to;
+      for (const token of TOKEN_KEYS) {
+        const current = snapshot.tokens[token];
+        if (current === undefined) continue;
+        const prior = previous[token];
+        const next = prior === undefined ? current : Math.max(prior, current);
+        previous[token] = next;
+        if (inWindow && next > (prior ?? 0)) out.tokens[token] = (out.tokens[token] ?? 0) + next - (prior ?? 0);
+      }
+    }
   }
   return out;
 }

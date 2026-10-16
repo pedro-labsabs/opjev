@@ -7,7 +7,13 @@ import { OrchestrationError, type ExecutionContract } from "./orchestration/type
 import { createFollowupTakeSeam } from "./orchestration/followup.ts";
 
 import { buildCriticProviderPermissions, buildOrchestratorProviderPermissions } from "./orchestration/readonly-policy.ts";
-import { assertInternalToolRegistryAvailable, fenceInternalToolSession, registerInternalToolSession } from "./orchestration/tool-authority.ts";
+import {
+  assertInternalToolRegistryAvailable,
+  assertInternalWorkerBinding,
+  bindInternalWorkerSession,
+  fenceInternalToolSession,
+  registerInternalToolSession,
+} from "./orchestration/tool-authority.ts";
 import {
   buildAgentCatalog,
   primaryEligibleAgents,
@@ -140,18 +146,161 @@ export async function discoverAgentCatalog(ctx: any): Promise<AgentCatalog> {
   }
 }
 
-export function isContextOverflow(error: any): boolean {
-  const text = `${String(error?.type ?? "")} ${String(error?.message ?? "")}`.toLowerCase();
-  return text.includes("context") || text.includes("overflow") || text.includes("too large") || text.includes("token limit");
+export type ProviderErrorKind = "quota-limit" | "non-retryable" | "throttle" | "context-overflow" | "provider-error" | "incomplete" | "ambiguous";
+
+const NON_RETRYABLE_CANONICAL_PROVIDER_TYPES = new Set([
+  "provider.auth",
+  "provider.invalid-request",
+  "provider.content-filter",
+  "provider.no-route",
+  "provider.unsupported-operation",
+]);
+
+export interface ProviderErrorClassification {
+  kind: ProviderErrorKind;
+  complete: boolean;
+  httpStatus?: number;
+  quotaErrorCode?: "FreeUsageLimitError" | "quota-limit";
+  contextOverflow: boolean;
+  /** Canonical host types whose retryability depends on details absent from SessionRetry.error. */
+  hostConditionalRetry?: boolean;
+  /** Bounded primitive text for the existing provider escalation prompt only; never persisted. */
+  safeType?: string;
+  safeMessage?: string;
 }
 
-// G2: throttle global do gateway Zen (todos os free compartilham a mesma
-// entrada). 429/529/rate-limit -> trocar de modelo nao resolve; o retry
-// apenas aguarda com backoff.
+type ErrorFieldRead = { ok: true; value: unknown } | { ok: false; value: undefined };
+
+function readErrorField(error: Record<string, unknown>, key: string): ErrorFieldRead {
+  try {
+    return { ok: true, value: error[key] };
+  } catch {
+    return { ok: false, value: undefined };
+  }
+}
+
+function readHttpStatus(value: unknown): number | undefined | "invalid" {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number") return "invalid";
+  return Number.isInteger(value) && value >= 400 && value <= 599 ? value : "invalid";
+}
+
+function readProviderThrottleCode(value: unknown): 429 | 529 | undefined | "invalid" {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) return "invalid";
+    return value === 429 || value === 529 ? value : undefined;
+  }
+  if (typeof value === "string") {
+    if (value.length > 64) return "invalid";
+    const trimmed = value.trim();
+    if (!trimmed) return "invalid";
+    if (/^\d{1,16}$/.test(trimmed)) {
+      const parsed = Number(trimmed);
+      if (!Number.isSafeInteger(parsed)) return "invalid";
+      return parsed === 429 || parsed === 529 ? parsed : undefined;
+    }
+    return undefined;
+  }
+  return "invalid";
+}
+
+/**
+ * Classifies a fixed set of error fields without coercing object values. Each
+ * property read is independent; this bounds field count, not time spent inside
+ * a synchronous getter/proxy trap. Canonical OpenCode v2.0.11 errors are plain
+ * data with type/message/optional status; extra fields are legacy evidence only.
+ */
+export function classifyProviderError(input: unknown): ProviderErrorClassification {
+  if (!input || typeof input !== "object") return { kind: "incomplete", complete: false, contextOverflow: false };
+
+  const error = input as Record<string, unknown>;
+  const name = readErrorField(error, "name");
+  const type = readErrorField(error, "type");
+  const code = readErrorField(error, "code");
+  const message = readErrorField(error, "message");
+  const status = readErrorField(error, "status");
+  const statusCode = readErrorField(error, "statusCode");
+  const response = readErrorField(error, "response");
+  const responseStatus = response.ok && response.value !== undefined && response.value !== null && typeof response.value === "object"
+    ? readErrorField(response.value as Record<string, unknown>, "status")
+    : { ok: true as const, value: undefined };
+
+  let complete = [name, type, code, message, status, statusCode, response, responseStatus].every((field) => field.ok);
+  const textValues = [name.value, type.value, message.value];
+  if (textValues.some((value) => value !== undefined && value !== null && typeof value !== "string")) complete = false;
+  if (code.value !== undefined && code.value !== null && typeof code.value !== "string" && typeof code.value !== "number") complete = false;
+  if (response.value !== undefined && response.value !== null && typeof response.value !== "object") complete = false;
+
+  const boundedText = (value: unknown): string => typeof value === "string" ? value.slice(0, 512).toLowerCase() : "";
+  const nameText = boundedText(name.value);
+  const typeText = boundedText(type.value);
+  const codeText = boundedText(code.value);
+  const messageText = boundedText(message.value);
+  const quotaText = `${nameText} ${typeText} ${codeText} ${messageText}`;
+  const canonicalQuota = type.value === "provider.quota";
+  const quotaSignal = canonicalQuota || /freeusagelimit|quota.?limit|usage.?limit/i.test(quotaText);
+  if (quotaSignal) {
+    return {
+      kind: "quota-limit",
+      complete,
+      quotaErrorCode: /freeusagelimit/i.test(quotaText) ? "FreeUsageLimitError" : "quota-limit",
+      contextOverflow: false,
+    };
+  }
+
+  const typeMessage = `${typeText} ${messageText}`;
+  const contextOverflow = typeMessage.includes("context") || typeMessage.includes("overflow") ||
+    typeMessage.includes("too large") || typeMessage.includes("token limit");
+  const textualThrottle = typeMessage.includes("rate limit") || typeMessage.includes("overload") ||
+    typeMessage.includes("too many requests");
+  const canonicalThrottle = type.value === "provider.rate-limit";
+  const canonicalNonRetryable = typeof type.value === "string" && NON_RETRYABLE_CANONICAL_PROVIDER_TYPES.has(type.value);
+  const hostConditionalRetry = type.value === "provider.invalid-output" || type.value === "provider.transport";
+
+  if (response.value !== undefined && response.value !== null && typeof response.value !== "object") complete = false;
+  const statusReads = [status, statusCode, responseStatus];
+  const parsedStatuses = statusReads.map((field) => field.ok ? readHttpStatus(field.value) : "invalid");
+  if (parsedStatuses.includes("invalid")) complete = false;
+  const statuses = parsedStatuses.filter((value): value is number => typeof value === "number");
+  const distinctStatuses = new Set(statuses);
+  const httpStatus = distinctStatuses.size === 1 ? statuses[0] : undefined;
+  const providerCode = code.ok ? readProviderThrottleCode(code.value) : "invalid";
+  if (providerCode === "invalid") complete = false;
+  const providerThrottle = providerCode === 429 || providerCode === 529;
+  const httpThrottle = statuses.some((value) => value === 429 || value === 529);
+
+  // The host's canonical terminal categories take precedence over generic HTTP
+  // throttle signals. Preserve only a validated HTTP status for evidence.
+  if (canonicalNonRetryable) {
+    return { kind: "non-retryable", complete, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false };
+  }
+
+  if (!complete) return { kind: "incomplete", complete: false, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow };
+  if (distinctStatuses.size > 1 ||
+    (providerThrottle && statuses.some((value) => value !== 429 && value !== 529)) ||
+    (canonicalThrottle && statuses.some((value) => value !== 429 && value !== 529))) {
+    return { kind: "ambiguous", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow };
+  }
+
+  const safeType = typeof type.value === "string" ? type.value.slice(0, 300) : "";
+  const safeMessage = typeof message.value === "string" ? message.value.slice(0, 300) : "";
+  if (contextOverflow) return { kind: "context-overflow", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow, safeType, safeMessage };
+  const conditionalRetry = hostConditionalRetry ? { hostConditionalRetry: true } : {};
+  if (canonicalThrottle || httpThrottle || providerThrottle || textualThrottle) {
+    return { kind: "throttle", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, ...conditionalRetry, safeType, safeMessage };
+  }
+  return { kind: "provider-error", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, ...conditionalRetry, safeType, safeMessage };
+}
+
+export function isContextOverflow(error: any): boolean {
+  return classifyProviderError(error).contextOverflow;
+}
+
+// G2: 429/529/rate-limit signals use the global bounded backoff path.
 export function isGlobalThrottle(error: any): boolean {
-  const code = Number(error?.status ?? error?.statusCode ?? error?.code ?? 0);
-  const text = `${String(error?.type ?? "")} ${String(error?.message ?? "")}`.toLowerCase();
-  return code === 429 || code === 529 || text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
+  const classification = classifyProviderError(error);
+  return classification.complete && classification.kind === "throttle";
 }
 
 /**
@@ -456,6 +605,7 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
   return {
     async createWorker(input) {
       assertInternalToolRegistryAvailable();
+      assertInternalWorkerBinding(input.binding);
       const info: any = await ctx.session.create({
         agent: input.agent,
         model: input.model,
@@ -465,11 +615,15 @@ export function makeWorkerRuntime(ctx: any): WorkerRuntime {
       });
       const sessionID = String(info?.id ?? "");
       if (!sessionID) throw new OrchestrationError("worker-create-failed", "ctx.session.create nao retornou id");
-      registerInternalToolSession(sessionID, "worker");
+      registerInternalToolSession(sessionID, "worker", input.binding);
       return { sessionID };
     },
-    async prompt({ sessionID, text, metadata }) {
+    async prompt({ sessionID, text, metadata, binding }) {
+      bindInternalWorkerSession(sessionID, binding);
       await ctx.session.prompt({ sessionID, text, metadata });
+    },
+    fence({ sessionID }) {
+      fenceInternalToolSession(sessionID);
     },
     async wait({ sessionID }) {
       await ctx.session.wait({ sessionID });

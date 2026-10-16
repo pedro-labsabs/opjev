@@ -982,7 +982,7 @@ describe("AUTH: caller guard em orchestrate_resume (Tool.Context real)", () => {
       const stored = m.storage._map.get(`orchestration/run/${runID}`);
       assert.equal(stored.checkpoint, "human-decision", "checkpoint da decisao observavel");
       assert.equal(stored.state.phase, "stopped");
-      assert.equal(stored.workerSessionID, "worker-1", "sessao da rodada pausada preservada no record");
+      assert.equal(stored.workerSessionID, m.workerSessions.keys().next().value, "sessao da rodada pausada preservada no record");
     } finally {
       stub.restore();
     }

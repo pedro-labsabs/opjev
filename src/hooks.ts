@@ -5,7 +5,7 @@ import { buildSnapshot } from "./snapshot.ts";
 import { buildDecisionRecord } from "./sanitize.ts";
 import { buildToolRecoverQuestions } from "./jev-client.ts";
 
-import { enforceInternalToolAuthority, resolveInternalToolRole } from "./orchestration/tool-authority.ts";
+import { enforceInternalToolAuthority, resolveInternalToolRole, type InternalToolRole } from "./orchestration/tool-authority.ts";
 
 import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { latchQuotaLimit } from "./resource-governor/enforcement-state.ts";
@@ -13,21 +13,59 @@ import { reserveThrottleRetry } from "./resource-governor/throttle-retry-budget.
 
 import { buildCriticContextInstruction, buildOrchestratorContextInstruction, buildWorkerContextInstruction } from "./worker-hooks.ts";
 
-import { applySwitch, errorClassOf, firstAvailable, freeCandidates, isModelAvailable, isContextOverflow, isGlobalThrottle, isTrivialFollowUp, modelRefString, orchestrationRoleOf, pruneKeys, recordRuntimeResource, safeStorageGet, switchExecutor, switchToModel, switchToAgent, validAgents, type IntentionRecord, type RouteState, TOOL_ERROR_WINDOW_MS, TOOL_ERROR_REPEAT_THRESHOLD, TOOL_DECIDE_COOLDOWN_MS, SWITCH_COOLDOWN_MS, RECOVERY_ACTIONS, toolErrorMayBeUnviable } from "./plugin-runtime.ts";
+import { applySwitch, classifyProviderError, errorClassOf, firstAvailable, freeCandidates, isModelAvailable, isTrivialFollowUp, modelRefString, orchestrationRoleOf, pruneKeys, recordRuntimeResource, safeStorageGet, switchExecutor, switchToModel, switchToAgent, validAgents, type IntentionRecord, type ProviderErrorClassification, type RouteState, TOOL_ERROR_WINDOW_MS, TOOL_ERROR_REPEAT_THRESHOLD, TOOL_DECIDE_COOLDOWN_MS, SWITCH_COOLDOWN_MS, RECOVERY_ACTIONS, toolErrorMayBeUnviable } from "./plugin-runtime.ts";
+
+const HOOK_ROLE_LOOKUP_TIMEOUT_MS = 250;
+
+async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalToolRole> {
+  if (!sessionID) return "ambiguous";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const info: any = await Promise.race([
+      ctx.session.get({ sessionID }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("session role lookup timed out")), HOOK_ROLE_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+    if (!info || typeof info !== "object" || Array.isArray(info)) return "ambiguous";
+    return resolveInternalToolRole(info.metadata, sessionID);
+  } catch {
+    return "ambiguous";
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, classification: ProviderErrorClassification): Promise<void> {
+  if (classification.kind === "incomplete" || classification.kind === "ambiguous") {
+    await recordRuntimeResource(ctx, {
+      ...resourceBase,
+      kind: "unknown",
+      failureDomain: "unknown",
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+    });
+  } else if (classification.kind === "context-overflow") {
+    await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
+  } else if (classification.kind === "throttle") {
+    await recordRuntimeResource(ctx, {
+      ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+    });
+  } else {
+    await recordRuntimeResource(ctx, {
+      ...resourceBase,
+      kind: "provider-error",
+      errorCode: classification.httpStatus !== undefined ? String(classification.httpStatus) : "provider-error",
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+      failureDomain: "provider",
+    });
+  }
+}
 
 async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number; getKey: () => Promise<string | undefined>; jevModel: string; jevEndpoint: string }): Promise<void> {
   if (event?.status !== "error") return;
   const sessionID = String(event?.sessionID ?? "");
   if (!sessionID) return;
-  // Critic/orchestrator are evaluators/planners, never Jev decision clients.
-  // A local read-only denial must not turn into a Jev retry/recovery loop.
-  try {
-    const info: any = await ctx.session.get({ sessionID });
-    const role = resolveInternalToolRole(info?.metadata, sessionID);
-    if (role === "critic" || role === "orchestrator" || role === "ambiguous") return;
-  } catch {
-    return;
-  }
   const tool = String(event?.tool ?? "unknown");
   const message = String(event?.error?.message ?? event?.error ?? "");
   const errorClass = errorClassOf(message);
@@ -50,6 +88,10 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
     counter.count >= TOOL_ERROR_REPEAT_THRESHOLD || toolErrorMayBeUnviable(message);
   if (!material) return;
 
+  // Factual counting above is retained even for internal/ambiguous roles.
+  // Only the external parent may use this legacy advisory recovery hook.
+  const role = await lookupHookRole(ctx, sessionID);
+  if (role !== "external") return;
   // Cooldown: mesma assinatura decidida recentemente nao re-consulta o Jev.
   const decidedKey = `tool-decided/${sessionID}/${tool}/${errorClass}`;
   const lastDecided: any = await safeStorageGet(ctx, decidedKey);
@@ -195,12 +237,12 @@ async function observeToolError(ctx: any, event: any, opts: { timeoutMs: number;
     // Jev indisponivel: fallback determinístico — apenas registra; nao vira acao.
   }
 }
-
 // Recomendacao de recuperacao one-shot: se existe `pending-recovery/<sessionID>`
 // (decisao do Jev apos erro material, nao executada pelo plugin), injeta uma
 // mensagem ENXUTA no proximo context do agente e CONSONE a chave na hora —
 // chega uma unica vez, nunca cresce, nunca roda em loop. Sem acao destrutiva
 // automatica: o agente decide se segue a recomendacao.
+
 async function injectPendingRecovery(ctx: any, sessionID: string, event: any): Promise<void> {
   if (!sessionID || !event?.system || !Array.isArray(event.system)) return;
   try {
@@ -265,29 +307,86 @@ export async function registerSessionHooks(
         role: "unknown",
         failureDomain: "provider",
       };
-      const errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
-      if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
-        // Set the runtime boundary first, then establish the authoritative latch
-        // before this hook returns. The observation ledger remains best-effort.
+      const classification = classifyProviderError(event?.error);
+      if (classification.kind === "quota-limit") {
+        // Quota is a global deny and must latch before role lookup.
         event.decision = { retry: false };
         try { await latchQuotaLimit(ctx.storage, Date.now()); } catch { /* in-process emergency latch stays active */ }
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "quota-limit",
+          errorCode: classification.quotaErrorCode ?? "quota-limit",
+          failureDomain: "quota",
+        });
         return;
-      } else if (isContextOverflow(event?.error)) {
+      }
+
+      if (classification.kind === "non-retryable") {
+        // Canonical host terminal categories cannot be upgraded by a 429/529.
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: classification.httpStatus !== undefined ? String(classification.httpStatus) : "provider-error",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+          failureDomain: "provider",
+        });
+        return;
+      }
+
+      // The host can retry these categories only when provider-specific delivery/
+      // operation details allow it. SessionRetry.error omits those details, so
+      // never upgrade an explicit host deny from a generic HTTP throttle signal.
+      if (classification.hostConditionalRetry && event?.decision?.retry === false) {
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: "provider-error",
+          failureDomain: "provider",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+        });
+        return;
+      }
+
+      // Incomplete or contradictory error payloads never authorize any recovery
+      // effect or consume throttle budget. Keep only normalized HTTP provenance.
+      if (!classification.complete || classification.kind === "ambiguous" || classification.kind === "incomplete") {
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "unknown",
+          failureDomain: "unknown",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+        });
+        return;
+      }
+
+      // Global hooks may recover only an unambiguously external parent. Worker,
+      // critic, orchestrator, and unavailable/ambiguous session state are owned
+      // by the control plane or denied; preserve facts but do not retry/switch.
+      const role = await lookupHookRole(ctx, sessionID);
+      if (role !== "external") {
+        event.decision = { retry: false };
+        await observeRetryFailure(ctx, { ...resourceBase, role: role !== "ambiguous" ? role : "unknown" }, classification);
+        return;
+      }
+
+      const status = classification.httpStatus;
+      if (classification.kind === "context-overflow") {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
-      } else if (isGlobalThrottle(event?.error)) {
-        const status = Number(event?.error?.status ?? event?.error?.statusCode ?? event?.error?.response?.status);
+      } else if (classification.kind === "throttle") {
         try {
           const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
           if (!budget.allowed) {
             event.decision = { retry: false };
-            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+            await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(status !== undefined ? { statusCode: status } : {}) });
             return;
           }
         } catch {
           event.decision = { retry: false };
-          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(Number.isFinite(status) ? { statusCode: status } : {}) });
+          await recordRuntimeResource(ctx, { ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider", ...(status !== undefined ? { statusCode: status } : {}) });
           return;
         }
         let retryAllowed = false;
@@ -302,12 +401,18 @@ export async function registerSessionHooks(
         event.decision = retryAllowed ? { retry: true, delay } : { retry: false };
         await recordRuntimeResource(ctx, {
           ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
-          ...(Number.isFinite(status) ? { statusCode: status } : {}),
+          ...(status !== undefined ? { statusCode: status } : {}),
         });
         if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
-        recordRuntimeResource(ctx, { ...resourceBase, kind: "provider-error", errorCode: "provider-error", failureDomain: "provider" });
+        recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: status !== undefined ? String(status) : "provider-error",
+          ...(status !== undefined ? { statusCode: status } : {}),
+          failureDomain: "provider",
+        });
       }
       // Provider 5xx and other ordinary failures keep the historical Jev
       // escalation only when the authoritative resource policy grants it.
@@ -332,7 +437,7 @@ export async function registerSessionHooks(
 
       const snapshot = await buildSnapshot(ctx, sessionID, {
         attempt: Number(event?.attempt) || tried.length,
-        lastError: `${String(event?.error?.type ?? "")}: ${String(event?.error?.message ?? "").slice(0, 300)}`,
+        lastError: `${classification.safeType ?? ""}: ${classification.safeMessage ?? ""}`,
         failedModel: failedRef,
       });
       const routeKind: RouteKind = snapshot.route !== "unknown"
@@ -343,7 +448,7 @@ export async function registerSessionHooks(
       const chain = chainFor(routeKind);
       const esk = (await decideEscalation({
         failedModel: failedRef,
-        reason: `${String(event?.error?.type ?? "")}: ${String(event?.error?.message ?? "").slice(0, 300)}`,
+        reason: `${classification.safeType ?? ""}: ${classification.safeMessage ?? ""}`,
         candidates: chain,
         triedModels: tried,
         snapshot,
@@ -394,7 +499,7 @@ export async function registerSessionHooks(
         await ctx.storage.set(
           `decision/${sessionID}/${Date.now()}`,
           buildDecisionRecord(
-            { failedModel: failedRef, reasonSnippet: String(event?.error?.message ?? "").slice(0, 200) },
+            { failedModel: failedRef, reasonSnippet: classification.safeMessage?.slice(0, 200) ?? "" },
             { via: esk.via, model: valid },
           ),
         );

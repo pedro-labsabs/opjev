@@ -62,9 +62,9 @@ export function collectNotices(items: readonly unknown[]): DurableNotice[] {
  * Decide o que apresentar a partir do inbox.
  *
  * `baseline` e mutado: na primeira observacao, notices anteriores a `startedAt`
- * sao historico; os posteriores podem ser recuperados mesmo que ja estejam no
- * inbox. Nas observacoes seguintes, notices ainda nao vistos sao devolvidos,
- * do mais novo para o mais antigo (bounded pelo proprio inbox).
+ * sao ignorados; os posteriores podem ser recuperados mesmo que ja estejam no
+ * inbox. Nas observacoes seguintes, timestamps antigos continuam ignorados e
+ * notices novos ainda nao vistos sao devolvidos, do mais novo para o mais antigo.
  *
  * Fail-closed: nao conhece o texto, nao filtra por papel (isso e do TUI via
  * isPresentableSession) e nao inventa resultado — um item sem o formato exato
@@ -81,18 +81,13 @@ export function selectUnpresentedNotices(input: {
   const found = collectNotices(items);
   if (!baseline.has(sessionID)) {
     baseline.add(sessionID);
-    const fresh: DurableNotice[] = [];
-    for (const f of found) {
-      if (seen.has(f.runID)) continue; // o caminho RPC ja apresentou
-      if (f.createdAt >= startedAt) fresh.push(f);
-      else seen.add(f.runID); // histórico ou timestamp inválido: fail-closed
-    }
+    const fresh = found.filter(f => !seen.has(f.runID) && f.createdAt >= startedAt);
     return fresh.reverse();
   }
   const out: DurableNotice[] = [];
   for (let i = found.length - 1; i >= 0; i--) {
     const f = found[i]!;
-    if (seen.has(f.runID)) continue;
+    if (seen.has(f.runID) || f.createdAt < startedAt) continue;
     out.push(f);
   }
   return out;

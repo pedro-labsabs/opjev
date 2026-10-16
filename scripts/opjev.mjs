@@ -161,9 +161,11 @@ function verifyProfileConfig() {
   }
 }
 
-function baseEnvironment() {
+export function baseEnvironment() {
   const names = [
     "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "TERM", "COLORTERM", "TMPDIR", "TMP", "TEMP",
+    // Explicit opt-in; the TUI trace excludes prompts, outputs and credentials.
+    "OPJEV_TUI_TRACE",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE", "LD_LIBRARY_PATH",
   ];
