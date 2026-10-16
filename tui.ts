@@ -21,6 +21,8 @@
 // nunca afeta o run (que continua authoritative no lado server/opjev).
 
 import { Plugin } from "@opencode/plugin/tui";
+import { jsx } from "@opentui/solid/jsx-runtime";
+import { formatReadOnlyResultPanel } from "./src/orchestration/result-panel.ts";
 import {
   OrchestrationResultRpc,
   ORCHESTRATION_RESULT_EVENT,
@@ -128,6 +130,93 @@ export default Plugin.define({
   id: "jev-free-router-presentation",
   async setup(ctx: any) {
     trace("setup", { hasClient: typeof (ctx as any)?.client?.rpc === "function" });
+    // A consulta e uma view on-demand; nao e um assistant message nem uma
+    // sessao de modelo. O plugin de TUI nunca executa prompts ou altera estado.
+    const RESULT_PANEL_NAME = "opjev.result";
+    // Single, bounded and ephemeral snapshot: only the currently requested session.
+    let panelSnapshot: { sessionID: string; text: string } | undefined;
+    const ResultCommand = () => {
+      trace("result-command-render");
+      ctx.keymap.layer(() => ({
+        // Present regardless of whether the editor is in insert/base mode.
+        mode: "global",
+        commands: [{
+          id: "opjev.result.open",
+          title: "OPJEV: Abrir resultado verificado",
+          description: "Exibe o ultimo resultado aceito pelo Jev nesta sessao",
+          group: "OPJEV",
+          palette: true,
+          slash: { name: "opjev-result" },
+          run: async () => {
+            const route = ctx.ui.router.current();
+            if (route?.type !== "session") return;
+            const info = ctx.data.session.get(route.sessionID);
+            if (!isPresentableSession({
+              currentSessionID: route.sessionID,
+              eventSessionID: route.sessionID,
+              metadata: info?.metadata as Record<string, unknown> | undefined,
+              parentID: typeof info?.parentID === "string" ? info.parentID : undefined,
+            })) return;
+            const currentPanel = ctx.ui.panel.current();
+            if (currentPanel?.name === RESULT_PANEL_NAME && currentPanel.sessionID === route.sessionID) {
+              ctx.ui.panel.close();
+              panelSnapshot = undefined;
+              trace("result-command-close", { sessionID: route.sessionID });
+              return;
+            }
+            let text = "Resultado indisponivel. Nenhuma execucao adicional foi iniciada.";
+            try {
+              const rpc = (ctx.client as any).rpc(ExecutionSummaryRpc);
+              const response = await rpc.getAcceptedResult({ sessionID: route.sessionID });
+              trace("result-query", {
+                sessionID: route.sessionID,
+                runID: response?.runID,
+                available: response?.result?.available === true,
+              });
+              text = formatReadOnlyResultPanel(response);
+            } catch {
+              // Fail closed: no raw worker payload and no second run.
+            }
+            const after = ctx.ui.router.current();
+            if (after?.type !== "session" || after.sessionID !== route.sessionID) return;
+            panelSnapshot = { sessionID: route.sessionID, text };
+            const opened = ctx.ui.panel.open(RESULT_PANEL_NAME, { presentation: "panel" });
+            trace("result-command-run", { opened, sessionID: route.sessionID });
+          },
+        }],
+      }));
+      trace("result-command-keymap-registered");
+      return jsx("box", { width: 0, height: 0 });
+    };
+    const unclaimResultCommand = ctx.ui.slot({
+      append: "app",
+      render: ResultCommand,
+    });
+    const ResultPanel = (props: Record<string, unknown>) => {
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : "";
+      trace("result-panel-render", { sessionID });
+      const content = panelSnapshot?.sessionID === sessionID
+        ? panelSnapshot.text
+        : "Nenhum resultado aceito disponivel para esta sessao.";
+      return jsx("scrollbox", {
+        width: "100%", height: "100%", flexGrow: 1,
+        children: jsx("box", {
+          flexDirection: "column", padding: 1,
+          children: [
+            jsx("text", { children: "OPJEV | Resultado verificado (somente leitura)" }),
+            jsx("text", { children: content }),
+          ],
+        }),
+      });
+    };
+    const unclaimResultPanel = ctx.ui.slot({
+      append: "session.panel",
+      render: (input: { name: string; sessionID: string }) =>
+        input.name === RESULT_PANEL_NAME
+          ? jsx(ResultPanel, { sessionID: input.sessionID })
+          : jsx("box", { height: 0 }),
+    });
+
 // Dedupe por runID (identidade real): reconexao do barramento de eventos
     // ou re-emissao do server NUNCA produzem display duplicado.
     const seen = new Set<string>();
@@ -463,6 +552,8 @@ export default Plugin.define({
 
     return () => {
       disposed = true;
+      try { unclaimResultPanel(); } catch { /* best effort */ }
+      try { unclaimResultCommand(); } catch { /* best effort */ }
       activeSummaryPoller?.stop();
       for (const refreshTimer of refreshTimers) clearTimeout(refreshTimer);
       refreshTimers.clear();

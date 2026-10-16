@@ -1353,7 +1353,26 @@ async function main() {
         // continua exigindo notice + identidade do run — apenas o harness deixa
         // de torcer por um toast transitorio.
         { wait_dump: { regex: "Orquestracao", min_extra: 1, timeout_ms: 180000 } },
-        { sleep_ms: 8000 },
+        { sleep_ms: 2000 },
+        // Read-only command: open the persisted Jev-accepted result in the native TUI panel.
+        // This must not turn into a new parent prompt or dispatch.
+        // Public TUI keybind: Ctrl+P opens command palette (not raw slash text).
+        { key: "\u0010", after_ms: 750 },
+        { type: "OPJEV: Abrir resultado verificado", enter: true, after_enter_ms: 1000 },
+        { wait_dump: { regex: "somente leitura", min_extra: 1, timeout_ms: 25000 } },
+        { sleep_ms: 1000 },
+        // Toggle the same official palette command to close the panel before
+        // exercising the ordinary native parent route.
+        { key: "\u0010", after_ms: 750 },
+        { type: "OPJEV: Abrir resultado verificado", enter: true, after_enter_ms: 700 },
+        { sleep_ms: 1000 },
+        // Re-open the same persisted accepted run without a new dispatch.
+        { key: "\u0010", after_ms: 700 },
+        { type: "OPJEV: Abrir resultado verificado", enter: true, after_enter_ms: 700 },
+        { wait_dump: { regex: "Resultado aceito pelo Jev", min_extra: 2, timeout_ms: 25000 } },
+        { key: "\u0010", after_ms: 700 },
+        { type: "OPJEV: Abrir resultado verificado", enter: true, after_enter_ms: 700 },
+        { sleep_ms: 1000 },
         { type: "ping normal pelo tui atraves do gateway", enter: true, after_enter_ms: 500 },
         {
           wait_log: {
@@ -1572,6 +1591,27 @@ async function main() {
         ptyContent.includes("Orquestracao") &&
         (ptyContent.includes(tuiRunID) || ptyContent.includes(digest));
     }
+    let resultPanelVisible = false;
+    if (fs.existsSync(ptyDumpPath)) {
+      const rendered = rebuildRenderedText(fs.readFileSync(ptyDumpPath, "utf8"));
+      const canonical = tuiRunID ? readPluginKv(homeDir)?.runs.get(`orchestration/run/${tuiRunID}`) : undefined;
+      const acceptedText = canonical?.state?.phase === "completed" &&
+        canonical?.state?.lastVerdict?.nextAction === "accept"
+        ? canonical?.state?.evidence?.resultSummary : undefined;
+      resultPanelVisible = typeof acceptedText === "string" && acceptedText.length > 0 &&
+        acceptedText.length <= 500 &&
+        rendered.includes("OPJEV | Resultado verificado") &&
+        rendered.includes("Resultado aceito pelo Jev") &&
+        rendered.includes(acceptedText) &&
+        (rendered.match(/Resultado aceito pelo Jev/g)?.length ?? 0) >= 2 &&
+        rendered.includes("somente leitura");
+    }
+    assert(
+      "TUI: painel nativo mostra resultado aceito e persistido sem parent execution",
+      resultPanelVisible,
+      resultPanelVisible ? "render TUI real: painel de resultado aceito visivel" : "painel/resultSummary nao renderizado",
+      true,
+    );
     assert(
       "TUI: publicacao VISIVEL na experiencia (dump do PTY contem o notice e a identidade unica do run)",
       ptyVisible,

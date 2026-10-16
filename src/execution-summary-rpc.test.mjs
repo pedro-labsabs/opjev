@@ -45,7 +45,7 @@ test("active summary RPC reads only the current session binding and bounded run 
   assert.equal(result.summary.route, "builder / free-model");
   assert.equal(result.runID, RUN_ID);
   assert.deepEqual(reads, [sessionBindingKey(SESSION_ID), `orchestration/run/${RUN_ID}`]);
-  assert.deepEqual(Object.keys(ExecutionSummaryRpc.methods), ["getActiveSummary"]);
+  assert.deepEqual(Object.keys(ExecutionSummaryRpc.methods), ["getAcceptedResult", "getActiveSummary"]);
   assert.equal("pattern" in ExecutionSummaryRpc.methods.getActiveSummary.input.properties.sessionID, false);
   assert.equal("pattern" in ExecutionSummaryRpc.methods.getActiveSummary.input.properties.runID, false);
 });

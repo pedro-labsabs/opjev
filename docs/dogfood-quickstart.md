@@ -84,3 +84,22 @@ mv ~/.local/bin/opjev ~/.local/bin/opjev.disabled
 ```
 
 The global `opencode` command then remains available as before, but is uninstrumented and does not collect OPJEV observations. Keep the isolated profile/database as a backup. If removing the dogfood installation later, first close the launcher and move `~/.local/share/opjev-dogfood` to a backup location; do not delete it until its sessions and evidence are no longer needed. The generated isolated OpenCode config refuses unexpected edits instead of overwriting them.
+
+## Consultar resultado aceito no TUI (issue #51, OPJEV com painel read-only)
+
+Na sessao raiz do OpenCode v2.0.11, pressione **Ctrl+P** para abrir a
+paleta de comandos e selecione **OPJEV: Abrir resultado verificado**.
+O mesmo comando fecha o painel. Ele consulta o ultimo run vinculado a essa
+sessao pelo RPC read-only `getAcceptedResult` e mostra apenas o
+`EvidencePacket.resultSummary` (maximo de 500 caracteres) quando o kernel
+registrou `completed`, o Jev decidiu `accept` e os checks de worker e
+critic foram aprovados. Ausencia ou divergencia de identidade falha
+fechada com estado indisponivel.
+
+O painel **nao** e uma mensagem gerada pelo assistant da sessao raiz:
+nao executa prompt, nao acorda o parent, nao inicia novos rounds, nao
+modifica o inbox e nao altera a autoridade do kernel. Reabrir o painel
+consulta novamente o armazenamento canonico e nao reexecuta o worker.
+Nao confundir esta visualizacao bounded com transcricao integral do trabalho.
+A navegacao foi validada via **paleta Ctrl+P**; a sintaxe digitada
+`/opjev-result` nao constitui um gate comprovado no runtime v2.0.11.

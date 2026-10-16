@@ -1,5 +1,6 @@
 import { sessionBindingKey } from "./admission.ts";
 import { summarizeExecutionRun, type ExecutionSummary } from "./summary.ts";
+import { projectAcceptedResult, type AcceptedResult } from "./accepted-result.ts";
 
 const summarySchema = {
   type: "object",
@@ -26,6 +27,32 @@ const summarySchema = {
 export const ExecutionSummaryRpc = {
   id: "opjev.execution-summary.v1",
   methods: {
+    getAcceptedResult: {
+      input: {
+        type: "object",
+        additionalProperties: false,
+        required: ["sessionID"],
+        properties: {
+          sessionID: { type: "string", minLength: 4, maxLength: 200 },
+          runID: { type: "string", minLength: 1, maxLength: 200 },
+        },
+      },
+      output: {
+        type: "object",
+        additionalProperties: false,
+        required: ["result"],
+        properties: {
+          runID: { type: "string", maxLength: 200 },
+          result: {
+            type: "object", additionalProperties: false, required: ["available"],
+            properties: {
+              available: { type: "boolean" },
+              text: { type: "string", maxLength: 500 },
+            },
+          },
+        },
+      },
+    },
     getActiveSummary: {
       input: {
         type: "object",
@@ -85,6 +112,29 @@ export function createExecutionSummaryHandler(deps: {
       return { summary: summarizeExecutionRun(persisted), runID };
     } catch {
       return { summary: { available: false } };
+    }
+  };
+}
+
+
+/** Only returns an accepted, independently checked result from the session's bound run. */
+export function createAcceptedResultHandler(deps: {
+  storage: SummaryStorage;
+}): (input: unknown) => Promise<{ result: AcceptedResult; runID?: string }> {
+  const unavailable = (): { result: AcceptedResult } => ({ result: { available: false } });
+  return async (input) => {
+    try {
+      const request = record(input);
+      const sessionID = safeSessionID(request?.sessionID);
+      const expectedRunID = request?.runID === undefined ? undefined : safeRunID(request.runID);
+      if (!sessionID || (request?.runID !== undefined && !expectedRunID)) return unavailable();
+      const binding = record(await deps.storage.get(sessionBindingKey(sessionID)));
+      const runID = safeRunID(binding?.runID);
+      if (!runID || (expectedRunID && runID !== expectedRunID)) return unavailable();
+      const persisted = await deps.storage.get(`orchestration/run/${runID}`);
+      return { result: projectAcceptedResult(persisted, sessionID, runID), runID };
+    } catch {
+      return unavailable();
     }
   };
 }
