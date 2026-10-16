@@ -4,9 +4,11 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { evaluateMatrixEvidence } from "./e2e-matrix-gate.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const testFile = path.resolve(__dirname, "../src/multiround-stabilization.test.mjs");
+const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 
 const SCENARIOS = [
   {
@@ -138,34 +140,77 @@ const child = spawn("node", ["--test", testFile], { stdio: ["inherit", "pipe", "
 
 let stdout = "";
 let stderr = "";
+let stdoutBytes = 0;
+let stderrBytes = 0;
+let stdoutTruncated = false;
+let stderrTruncated = false;
+let spawnError = null;
 
-child.stdout.on("data", (d) => { stdout += d.toString(); });
-child.stderr.on("data", (d) => { stderr += d.toString(); });
+function capture(stream, chunk) {
+  const remaining = MAX_CAPTURE_BYTES - stream.bytes;
+  if (remaining <= 0) {
+    stream.truncated = true;
+    return;
+  }
 
-child.on("close", (code) => {
-  const allPassed = code === 0;
-  
-  console.log("| #  | Cenário                                  | Teste / E2E Necessário                                            | Resultado |");
-  console.log("|----|------------------------------------------|-------------------------------------------------------------------|-----------|");
-  
+  const captured = chunk.subarray(0, remaining);
+  stream.text += captured.toString("utf8");
+  stream.bytes += captured.length;
+  if (captured.length < chunk.length) stream.truncated = true;
+}
+
+child.stdout.on("data", (chunk) => {
+  const stream = { text: stdout, bytes: stdoutBytes, truncated: stdoutTruncated };
+  capture(stream, chunk);
+  stdout = stream.text;
+  stdoutBytes = stream.bytes;
+  stdoutTruncated = stream.truncated;
+});
+child.stderr.on("data", (chunk) => {
+  const stream = { text: stderr, bytes: stderrBytes, truncated: stderrTruncated };
+  capture(stream, chunk);
+  stderr = stream.text;
+  stderrBytes = stream.bytes;
+  stderrTruncated = stream.truncated;
+});
+child.once("error", (error) => {
+  spawnError = error;
+});
+
+child.once("close", (code, signal) => {
+  const result = evaluateMatrixEvidence({
+    stdout,
+    stderr,
+    code,
+    signal,
+    spawnError,
+    stdoutTruncated,
+    stderrTruncated,
+  }, SCENARIOS.map(({ id }) => id));
+  const rowById = new Map(result.rows.map((row) => [row.id, row]));
+
+  console.log("| #  | Cenário                                  | Teste / E2E Necessário                                            | Resultado TAP |");
+  console.log("|----|------------------------------------------|-------------------------------------------------------------------|---------------|");
+
   for (const s of SCENARIOS) {
-    const passed = stdout.includes(`ok ${s.id} - Cenário ${s.id}:`);
-    const status = passed ? " PASS " : " FAIL ";
+    const status = rowById.get(s.id)?.status ?? "FAIL";
     const idStr = String(s.id).padEnd(2, " ");
     const nameStr = s.name.padEnd(40, " ");
     const testStr = s.testRequired.slice(0, 65).padEnd(65, " ");
-    console.log(`| ${idStr} | ${nameStr} | ${testStr} |   ${status}  |`);
+    console.log(`| ${idStr} | ${nameStr} | ${testStr} | ${status.padStart(5, " ")}         |`);
   }
-  
+
   console.log("================================================================================");
-  if (allPassed) {
+  console.log(` [EVIDENCE] TAP scenarios passed: ${result.passedCount}/${result.expectedCount}.`);
+  if (result.ok) {
     console.log(" [SUCCESS] Todos os 17 cenários da Issue #14 passaram com sucesso.");
     console.log(" [GATE OK] Matriz multi-round e estabilização de orquestração v1 consolidada.");
     console.log("================================================================================\n");
-    process.exit(0);
+    process.exitCode = 0;
   } else {
-    console.error(" [FAILURE] Falha em cenários da matriz de estabilização.");
-    if (stderr) console.error(stderr);
-    process.exit(1);
+    console.error(" [FAILURE] Matriz TAP/processo incompleta, contraditória ou malsucedida.");
+    for (const diagnostic of result.diagnostics) console.error(` [GATE] ${diagnostic}`);
+    console.log("================================================================================\n");
+    process.exitCode = 1;
   }
 });
