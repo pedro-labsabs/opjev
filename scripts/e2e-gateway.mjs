@@ -36,6 +36,8 @@ const RUN_DIR = path.join(ROOT, "runs", RUN_TS);
 const T = {
   boot: 60000,
   dispatch: 30000,
+  providerBarrier: 30000,
+  providerBarrierHold: 45000,
   exec: 120000,
   notice: 300000,
   tuiTotal: 540000,
@@ -48,6 +50,48 @@ const T = {
 // ---------------------------------------------------------------- utilidades
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => process.stdout.write(`[e2e] ${msg}\n`);
+
+function createProviderBarrier(id, marker) {
+  let reached = false;
+  let released = false;
+  let resolveReached;
+  let resolveRelease;
+  let releaseTimer;
+  const reachedPromise = new Promise((resolve) => { resolveReached = resolve; });
+  const releasedPromise = new Promise((resolve) => { resolveRelease = resolve; });
+  return {
+    id,
+    marker,
+    waitUntilReached: () => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout em fixture worker barrier ${id} (${T.providerBarrier}ms)`)), T.providerBarrier);
+      reachedPromise.then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    }),
+    arrive: async () => {
+      if (!reached) {
+        reached = true;
+        resolveReached();
+      }
+      if (released) return;
+      if (!releaseTimer) {
+        releaseTimer = setTimeout(() => {
+          log(`fixture barrier safety timeout: auto-release ${id}`);
+          released = true;
+          resolveRelease();
+        }, T.providerBarrierHold);
+      }
+      await releasedPromise;
+    },
+    release: () => {
+      if (released) return;
+      released = true;
+      if (releaseTimer) clearTimeout(releaseTimer);
+      resolveRelease();
+    },
+  };
+}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -436,6 +480,13 @@ async function main() {
   // Keep the isolated gateway E2E independent of external model capacity while
   // still exercising the real OpenCode 2.0.11 worker/critic sessions.
   let modelProviderCompletions = 0;
+  const providerEvidence = {
+    endpoint: null,
+    worker: 0,
+    critic: 0,
+    requests: [],
+  };
+  const providerBarriers = new Map();
   const providerServer = http.createServer((req, res) => {
     if (req.method === "GET" && req.url?.includes("/models")) {
       res.writeHead(200, { "content-type": "application/json" });
@@ -455,6 +506,21 @@ async function main() {
       try { body = JSON.parse(rawBody); } catch {}
       modelProviderCompletions += 1;
       const isCritic = rawBody.includes("verifier/critic") || rawBody.includes("findings") || rawBody.includes("critic");
+      const role = isCritic ? "critic" : "worker";
+      providerEvidence[role] += 1;
+      const matchedBarrier = [...providerBarriers.values()].find((barrier) => rawBody.includes(barrier.marker));
+      providerEvidence.requests.push({
+        role,
+        model: typeof body.model === "string" ? body.model.slice(0, 120) : null,
+        path: String(req.url ?? "").slice(0, 120),
+        localPeer: req.socket.remoteAddress === "127.0.0.1" || req.socket.remoteAddress === "::ffff:127.0.0.1",
+        hasAuthorization: typeof req.headers.authorization === "string",
+        barrier: matchedBarrier?.id ?? null,
+      });
+      if (matchedBarrier) {
+        log(`provider fixture reached barrier ${matchedBarrier.id} role=${role} model=${typeof body.model === "string" ? body.model : "missing"}`);
+        await matchedBarrier.arrive();
+      }
       if (!isCritic) await sleep(3000);
       const content = isCritic ? JSON.stringify({ findings: [] }) : "Implementation completed with objective evidence.";
       const id = `chatcmpl-gateway-${modelProviderCompletions}`;
@@ -478,6 +544,7 @@ async function main() {
     providerServer.listen(0, "127.0.0.1", resolve);
   });
   const providerPort = providerServer.address().port;
+  providerEvidence.endpoint = `http://127.0.0.1:${providerPort}`;
   log(`OpenCode local completion fixture em :${providerPort}`);
 
   const opencodeConfig = {
@@ -512,6 +579,12 @@ async function main() {
     // Trace da apresentacao (lado server: registro do RPC e resultado do emit).
     OPJEV_TUI_TRACE: tuiTracePath,
   };
+  assert(
+    "provider fixture: upstream usa somente credencial local de teste e env allowlisted",
+    upstreamEnv.OPENCODE_API_KEY === "local-gateway-e2e-only" &&
+      Object.keys(upstreamEnv).every((key) => ["OPENCODE_API_KEY", "PATH", "HOME", "OPJEV_JEV_ENDPOINT", "OPJEV_WORKER_TIMEOUT_MS", "OPJEV_TUI_TRACE"].includes(key)),
+    `envKeys=${Object.keys(upstreamEnv).sort().join(",")}`,
+  );
   log(`subindo upstream v2.0.11 em :${upPort} (HOME ${homeDir})`);
   const up = spawnCapture(
     BIN,
@@ -938,13 +1011,15 @@ async function main() {
   try {
     clearResourceLedger(homeDir);
     const FU_MSG = "msg_e2efollowup0001";
+    const gateA = createProviderBarrier("followup-A", "OPJEV_E2E_GATE_FOLLOWUP_A_20261016");
+    providerBarriers.set(gateA.id, gateA);
     const mark = gwEvents.length;
     const mk = await api("POST", "/api/session", {});
     fu.sid = parseDataId(mk.text);
     if (fu.sid === null) throw new Error("criacao de sessao falhou");
     const ra = await api("POST", `/api/session/${fu.sid}/prompt`, {
       id: "msg_e2efollowA00001",
-      text: "ORCH: responda apenas com a palavra PRONTO.",
+      text: "ORCH: responda apenas com a palavra PRONTO. OPJEV_E2E_GATE_FOLLOWUP_A_20261016",
     });
     assert("follow-up: turno inicial 200 com identidade", ra.status === 200 && extractMsgId(ra.text) !== null, `status=${ra.status}`);
     await waitFor(() => since(mark).some((e) => e.type === "admitted" && e.sessionID === fu.sid), T.dispatch, "admitted do turno A");
@@ -953,8 +1028,15 @@ async function main() {
     await waitFor(() => since(mark).some((e) => e.type === "rpc-dispatched"), T.dispatch, "dispatch do run A");
     const runADispatches = since(mark).filter((e) => e.type === "rpc-dispatched").length;
     assert("follow-up: run R despachado exatamente 1x", runADispatches === 1, `dispatches=${runADispatches}`);
+    await gateA.waitUntilReached();
+    assert(
+      "follow-up: worker A atingiu a barreira local antes de F",
+      providerEvidence.requests.some((request) => request.barrier === gateA.id && request.role === "worker" && request.localPeer),
+      `barrier=${gateA.id}`,
+    );
 
-    // F chega ENQUANTO R esta ativo (sem esperar o notice de conclusao)
+    // F só chega depois de o provider fixture confirmar que o worker A está
+    // aguardando a resposta. O run permanece ativo até a liberação explícita.
     const rf = await api("POST", `/api/session/${fu.sid}/prompt`, {
       id: FU_MSG,
       text: "ORCH: FOLLOW-UP: cubra tambem o caso de timeout",
@@ -974,20 +1056,25 @@ async function main() {
       `dispatches=${since(mark).filter((e) => e.type === "rpc-dispatched").length}`,
     );
     assert("follow-up: parent=0 na sessao", execStartedCount(fu.sid) === 0, `execStarted=${execStartedCount(fu.sid)}`);
+    gateA.release();
+    providerBarriers.delete(gateA.id);
 
     // Isolamento S1 != S2: segunda sessao com run proprio e follow-up proprio.
     const mark2 = gwEvents.length;
     const mk2 = await api("POST", "/api/session", {});
     fu.sid2 = parseDataId(mk2.text);
     if (fu.sid2 === null) throw new Error("criacao da sessao 2 falhou");
+    const gateB = createProviderBarrier("followup-B", "OPJEV_E2E_GATE_FOLLOWUP_B_20261016");
+    providerBarriers.set(gateB.id, gateB);
     const rb = await api("POST", `/api/session/${fu.sid2}/prompt`, {
       id: "msg_e2efollowB00001",
-      text: "ORCH: responda apenas com a palavra PRONTO (segunda sessao)",
+      text: "ORCH: responda apenas com a palavra PRONTO (segunda sessao). OPJEV_E2E_GATE_FOLLOWUP_B_20261016",
     });
     assert("follow-up: sessao 2 turno 200", rb.status === 200, `status=${rb.status}`);
     await waitFor(() => since(mark2).some((e) => e.type === "rpc-dispatched"), T.dispatch, "dispatch do run B");
     const admittedB = since(mark2).find((e) => e.type === "admitted" && e.sessionID === fu.sid2);
     fu.runB = admittedB?.runID ?? null;
+    await gateB.waitUntilReached();
     const rf2 = await api("POST", `/api/session/${fu.sid2}/prompt`, {
       id: "msg_e2efollowB0002",
       text: "ORCH: FOLLOW-UP da sessao 2",
@@ -1003,6 +1090,8 @@ async function main() {
       attach2.length === 1 && attach2[0].runID === fu.runB && attach2[0].runID !== fu.runA,
       `ownerB=${attach2[0]?.runID} R2=${fu.runB} R1=${fu.runA}`,
     );
+    gateB.release();
+    providerBarriers.delete(gateB.id);
 
     // Replay de F: zero attach adicional, zero dispatch (plugin dedupe)
     const replayMark = gwEvents.length;
@@ -1099,7 +1188,7 @@ async function main() {
     const termMark = gwEvents.length;
     const rt = await api("POST", `/api/session/${fu.sid}/prompt`, {
       id: "msg_e2efollowT0001",
-      text: "ORCH: nova tarefa apos run terminal",
+      text: "ORCH: follow-up F2 apos o run A estar terminal",
     });
     await waitFor(
       () => since(termMark).some((e) => e.type === "rpc-dispatched"),
@@ -1107,13 +1196,25 @@ async function main() {
       "dispatch do run pos-terminal",
     );
     const termDispatch = since(termMark).filter((e) => e.type === "rpc-dispatched");
+    const termAdmission = since(termMark).find((e) => e.type === "admitted" && e.sessionID === fu.sid);
     assert(
-      "follow-up: run terminal + nova mensagem => NOVO run (admission normal)",
-      rt.status === 200 && termDispatch.length === 1 && termDispatch[0].runID !== fu.runA,
-      `dispatches=${termDispatch.length} newRun=${termDispatch[0]?.runID} oldRun=${fu.runA}`,
+      "follow-up: run terminal + F2 => NOVO runID e exatamente 1 dispatch, sem attach sob A",
+      rt.status === 200 && termDispatch.length === 1 && termAdmission?.runID === termDispatch[0].runID && termDispatch[0].runID !== fu.runA &&
+        !since(termMark).some((e) => e.type === "rpc-followup-attached" && e.runID === fu.runA && e.messageID === "msg_e2efollowT0001"),
+      `dispatches=${termDispatch.length} admitted=${termAdmission?.runID} dispatchRun=${termDispatch[0]?.runID} oldRun=${fu.runA}`,
+    );
+    const terminalKv = readPluginKv(homeDir);
+    const terminalFollowupRecords = terminalKv ? [...terminalKv.followups.values()].filter((value) => value?.messageID === "msg_e2efollowT0001") : [];
+    assert(
+      "follow-up: F2 pos-terminal não cria record de follow-up sob A",
+      terminalFollowupRecords.length === 0,
+      `records=${terminalFollowupRecords.length}`,
     );
   } catch (err) {
     assert("fase follow-up", false, err.message);
+  } finally {
+    for (const barrier of providerBarriers.values()) barrier.release();
+    providerBarriers.clear();
   }
 
   // --------------------------------------------------- 10. fase ROUTE (API)
@@ -1583,6 +1684,12 @@ async function main() {
       rejected: gwCount("rejected"),
       execEvents: sseEvents.filter((e) => e.type.includes("execution.")).length,
       modelProviderCompletions,
+      provider: {
+        endpoint: providerEvidence.endpoint,
+        workerCompletions: providerEvidence.worker,
+        criticCompletions: providerEvidence.critic,
+        requests: providerEvidence.requests,
+      },
       sniff: {
         reqs: sniffCount((e) => e.dir === "req"),
         patchInbox: sniffCount(
@@ -1624,6 +1731,12 @@ async function main() {
       ptyDump: ptyDumpPath,
     },
   };
+  assert(
+    "provider fixture: requests de worker e critic recebidos localmente",
+    providerEvidence.worker > 0 && providerEvidence.critic > 0 &&
+      providerEvidence.requests.every((request) => request.localPeer && request.path.includes("/chat/completions")),
+    `endpoint=${providerEvidence.endpoint} worker=${providerEvidence.worker} critic=${providerEvidence.critic} requests=${providerEvidence.requests.length}`,
+  );
   fs.writeFileSync(resultPath, `${JSON.stringify(summary, null, 2)}\n`);
   log(`evidencia: ${resultPath}`);
 
