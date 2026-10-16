@@ -162,6 +162,8 @@ export interface ProviderErrorClassification {
   httpStatus?: number;
   quotaErrorCode?: "FreeUsageLimitError" | "quota-limit";
   contextOverflow: boolean;
+  /** Canonical host types whose retryability depends on details absent from SessionRetry.error. */
+  hostConditionalRetry?: boolean;
   /** Bounded primitive text for the existing provider escalation prompt only; never persisted. */
   safeType?: string;
   safeMessage?: string;
@@ -254,6 +256,7 @@ export function classifyProviderError(input: unknown): ProviderErrorClassificati
     typeMessage.includes("too many requests");
   const canonicalThrottle = type.value === "provider.rate-limit";
   const canonicalNonRetryable = typeof type.value === "string" && NON_RETRYABLE_CANONICAL_PROVIDER_TYPES.has(type.value);
+  const hostConditionalRetry = type.value === "provider.invalid-output" || type.value === "provider.transport";
 
   if (response.value !== undefined && response.value !== null && typeof response.value !== "object") complete = false;
   const statusReads = [status, statusCode, responseStatus];
@@ -283,10 +286,11 @@ export function classifyProviderError(input: unknown): ProviderErrorClassificati
   const safeType = typeof type.value === "string" ? type.value.slice(0, 300) : "";
   const safeMessage = typeof message.value === "string" ? message.value.slice(0, 300) : "";
   if (contextOverflow) return { kind: "context-overflow", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow, safeType, safeMessage };
+  const conditionalRetry = hostConditionalRetry ? { hostConditionalRetry: true } : {};
   if (canonicalThrottle || httpThrottle || providerThrottle || textualThrottle) {
-    return { kind: "throttle", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, safeType, safeMessage };
+    return { kind: "throttle", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, ...conditionalRetry, safeType, safeMessage };
   }
-  return { kind: "provider-error", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, safeType, safeMessage };
+  return { kind: "provider-error", complete: true, ...(httpStatus !== undefined ? { httpStatus } : {}), contextOverflow: false, ...conditionalRetry, safeType, safeMessage };
 }
 
 export function isContextOverflow(error: any): boolean {

@@ -334,6 +334,21 @@ export async function registerSessionHooks(
         return;
       }
 
+      // The host can retry these categories only when provider-specific delivery/
+      // operation details allow it. SessionRetry.error omits those details, so
+      // never upgrade an explicit host deny from a generic HTTP throttle signal.
+      if (classification.hostConditionalRetry && event?.decision?.retry === false) {
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "provider-error",
+          errorCode: "provider-error",
+          failureDomain: "provider",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+        });
+        return;
+      }
+
       // Incomplete or contradictory error payloads never authorize any recovery
       // effect or consume throttle budget. Keep only normalized HTTP provenance.
       if (!classification.complete || classification.kind === "ambiguous" || classification.kind === "incomplete") {

@@ -7,7 +7,7 @@ import { latchQuotaLimit, QUOTA_ENFORCEMENT_KEY } from "./resource-governor/enfo
 import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
-import { makeCtx, makeStorage, okJev, stubFetch } from "./harness.mjs";
+import { escalateAnswers, makeCtx, makeStorage, okJev, stubFetch } from "./harness.mjs";
 
 const OPTIONS = {
   enableAutoRoute: false,
@@ -312,6 +312,65 @@ describe("global hooks respect internal control-plane authority", () => {
         } finally { stub.restore(); }
       });
     }
+  }
+
+  for (const [type, message] of [
+    ["provider.invalid-output", "not incomplete-stream"],
+    ["provider.transport", "write failed"],
+  ]) {
+    for (const status of [429, 529, undefined]) {
+      const statusLabel = status === undefined ? "no HTTP status" : `HTTP ${status}`;
+      it(`RED regression: host retry:false for conditional ${type} with ${statusLabel} denies all recovery`, async () => {
+        const m = await setup();
+        let roleLookups = 0;
+        m.ctx.session.get = async () => {
+          roleLookups++;
+          return { id: m.sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } };
+        };
+        const stub = stubFetch(() => { throw new Error(`${type} with host retry:false must not query Jev`); });
+        try {
+          const error = { type, message, ...(status !== undefined ? { status } : {}) };
+          const event = providerEvent(m.sessionID, error);
+          event.decision = { retry: false };
+          await m.hooks.session.retry(event);
+          assert.deepEqual(event.decision, { retry: false }, "host denial must not be upgraded");
+          assert.equal(stub.calls.length, 0, "denied conditional recovery must not query Jev");
+          assert.equal(m.calls.switchModel.length, 0, "denied conditional recovery must not switch models");
+          assert.equal(m.storage._map.has("resource/throttle-retry/v1"), false, "denied conditional recovery must not reserve throttle budget");
+          assert.equal(roleLookups, 0, "host denial is honored before role/recovery lookup");
+        } finally { stub.restore(); }
+      });
+    }
+
+    for (const status of [429, 529]) {
+      it(`host retry:true keeps bounded throttle recovery for conditional ${type} with HTTP ${status}`, async () => {
+        const m = await setup();
+        const stub = stubFetch(() => { throw new Error("throttle recovery must not query Jev"); });
+        try {
+          const event = providerEvent(m.sessionID, { type, message, status });
+          event.decision = { retry: true };
+          await m.hooks.session.retry(event);
+          assert.deepEqual(event.decision, { retry: true, delay: 5000 });
+          assert.equal(m.storage._map.get("resource/throttle-retry/v1")?.retries, 1, "authorized throttle uses the existing reservation");
+          assert.equal(m.calls.switchModel.length, 0);
+          assert.equal(stub.calls.length, 0);
+        } finally { stub.restore(); }
+      });
+    }
+
+    it(`host retry:true keeps existing Jev-governed provider recovery for conditional ${type} without status`, async () => {
+      const m = await setup();
+      const stub = stubFetch(() => okJev(escalateAnswers("opencode/mimo-v2.5-free")));
+      try {
+        const event = providerEvent(m.sessionID, { type, message });
+        event.decision = { retry: true };
+        await m.hooks.session.retry(event);
+        assert.deepEqual(event.decision, { retry: true, delay: 1000 });
+        assert.ok(stub.calls.length > 0, "authorized ordinary provider recovery remains Jev-governed");
+        assert.equal(m.calls.switchModel.length, 1, "existing authorized model switch remains available");
+        assert.equal(m.storage._map.has("resource/throttle-retry/v1"), false, "no HTTP status means no throttle reservation");
+      } finally { stub.restore(); }
+    });
   }
 
   it("retry fails closed without reservation when quota-state storage reads fail", async () => {
