@@ -37,17 +37,36 @@ async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalTool
 }
 
 function extractErrorStatusCode(error: unknown): number | undefined {
-  const raw = (error as any)?.status ?? (error as any)?.statusCode ?? (error as any)?.response?.status;
-  if (raw === null || raw === undefined || raw === "") return undefined;
-  const num = Number(raw);
-  return Number.isInteger(num) && num >= 400 && num <= 599 ? num : undefined;
+  if (!error || (typeof error !== "object" && typeof error !== "function")) return undefined;
+  let raw: unknown;
+  try {
+    raw = (error as any).status ?? (error as any).statusCode ?? (error as any).response?.status;
+  } catch {
+    return undefined;
+  }
+  if (typeof raw === "number") {
+    return Number.isInteger(raw) && raw >= 400 && raw <= 599 ? raw : undefined;
+  }
+  return undefined;
+}
+
+function safeIsGlobalThrottle(error: unknown, status: number | undefined): boolean {
+  if (status === 429 || status === 529) return true;
+  try {
+    const text = `${String((error as any)?.type ?? "")} ${String((error as any)?.message ?? "")}`.toLowerCase();
+    return text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
+  } catch {
+    return false;
+  }
 }
 
 async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
   const status = extractErrorStatusCode(error);
-  if (isContextOverflow(error)) {
+  let isOverflow = false;
+  try { isOverflow = isContextOverflow(error); } catch {}
+  if (isOverflow) {
     await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
-  } else if (isGlobalThrottle(error)) {
+  } else if (safeIsGlobalThrottle(error, status)) {
     await recordRuntimeResource(ctx, {
       ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
       ...(status !== undefined ? { statusCode: status } : {}),
@@ -327,11 +346,13 @@ export async function registerSessionHooks(
         return;
       }
 
-      if (isContextOverflow(event?.error)) {
+      const status = extractErrorStatusCode(event?.error);
+      let isOverflow = false;
+      try { isOverflow = isContextOverflow(event?.error); } catch {}
+      if (isOverflow) {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
-      } else if (isGlobalThrottle(event?.error)) {
-        const status = extractErrorStatusCode(event?.error);
+      } else if (safeIsGlobalThrottle(event?.error, status)) {
         try {
           const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
           if (!budget.allowed) {

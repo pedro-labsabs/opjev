@@ -115,11 +115,13 @@ export function sanitizeObservation(value: unknown): UsageObservation {
   const validStatus = Number.isInteger(rawStatus) && Number(rawStatus) >= 400 && Number(rawStatus) <= 599 ? Number(rawStatus) : undefined;
   if (validStatus !== undefined) {
     out.statusCode = validStatus;
-    const strStatus = String(validStatus);
-    if (SAFE_ERROR_CODES.has(strStatus)) {
-      out.errorCode = strStatus;
-    } else {
-      out.errorCode = "provider-error";
+    if (kind === "provider-error") {
+      const strStatus = String(validStatus);
+      if (SAFE_ERROR_CODES.has(strStatus)) {
+        out.errorCode = strStatus;
+      } else {
+        out.errorCode = "provider-error";
+      }
     }
   }
   const tokens = x.tokens && typeof x.tokens === "object" ? x.tokens as Record<string, unknown> : {};

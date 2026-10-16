@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { FREE_POOL } from "./config.ts";
 import { registerSessionHooks } from "./hooks.ts";
+import { latchQuotaLimit } from "./resource-governor/enforcement-state.ts";
 import { RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
 import { makeCtx, makeStorage, okJev, stubFetch } from "./harness.mjs";
@@ -115,7 +116,67 @@ describe("global hooks respect internal control-plane authority", () => {
     await m.hooks.session.retry(event);
     assert.deepEqual(event.decision, { retry: false });
     assert.equal(m.storage._map.has("resource/throttle-retry/v1"), false);
-    assert.equal(resourceFacts(m.storage).some((x) => x.kind === "throttle" && x.statusCode === 429), true);
+    const facts = resourceFacts(m.storage);
+    const throttleFact = facts.find((x) => x.kind === "throttle" && x.statusCode === 429);
+    assert.ok(throttleFact, "throttle recorded with statusCode 429");
+    assert.equal("errorCode" in throttleFact, false, "throttle should not synthesize errorCode from statusCode");
+  });
+
+  it("adversarial status inputs do not throw in retry hook and record safe fallback", async () => {
+    const adversarial = [
+      Symbol("untrusted"),
+      { valueOf() { throw new Error("hostile valueOf"); } },
+      " 403 ",
+      "403abc",
+      null,
+      undefined,
+      0,
+      200,
+      600,
+      -1,
+      418.5,
+    ];
+    for (const bad of adversarial) {
+      const m = await setup({ role: "worker" });
+      const event = providerEvent(m.sessionID, { status: bad, message: "adversarial error input" });
+      // Must not throw exception
+      await assert.doesNotReject(async () => {
+        await m.hooks.session.retry(event);
+      });
+      assert.deepEqual(event.decision, { retry: false }, "worker role always fails closed");
+      const facts = resourceFacts(m.storage);
+      const fact = facts[facts.length - 1];
+      assert.ok(fact, "fact recorded");
+      assert.equal("statusCode" in fact, false, "invalid status should not be recorded as statusCode");
+      assert.equal(fact.errorCode, "provider-error");
+    }
+
+    // Also test external session with quota latched: instrumentation error must not alter fail-closed decision
+    const storage = makeStorage();
+    await latchQuotaLimit(storage, Date.now());
+    const mExt = makeCtx({
+      models: FREE_POOL,
+      storage,
+      session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
+    });
+    const extSessionID = `issue49-ext-failclosed-${++nextSession}`;
+    mExt.ctx.session.get = async () => ({
+      id: extSessionID,
+      agent: { id: "build" },
+      model: { providerID: "opencode", id: "big-pickle" },
+    });
+    await registerSessionHooks(mExt.ctx, OPTIONS, async () => "test-key");
+    const extEvent = {
+      sessionID: extSessionID,
+      model: { providerID: "opencode", id: "big-pickle" },
+      error: { status: { valueOf() { throw new Error("hostile"); } }, message: "adversarial" },
+      attempt: 1,
+      decision: {},
+    };
+    await assert.doesNotReject(async () => {
+      await mExt.hooks.session.retry(extEvent);
+    });
+    assert.deepEqual(extEvent.decision, { retry: false }, "latched quota fails closed regardless of error status");
   });
 
   for (const [label, get] of [
@@ -147,15 +208,21 @@ describe("global hooks respect internal control-plane authority", () => {
   it("RED regression: HTTP status extraction in retry hook rejects null, 200, 600, negative and non-integer", async () => {
     for (const [errStatus, expectedCode] of [
       [null, "provider-error"],
+      [undefined, "provider-error"],
+      ["", "provider-error"],
       [0, "provider-error"],
       [200, "provider-error"],
       [600, "provider-error"],
       [-1, "provider-error"],
+      [418.5, "provider-error"],
+      ["401", "provider-error"],
+      [" 403 ", "provider-error"],
+      [Symbol("untrusted"), "provider-error"],
+      [{ valueOf() { throw new Error("hostile valueOf"); } }, "provider-error"],
       [418, "provider-error"],
       [401, "401"],
       [403, "403"],
       [408, "408"],
-      [429, "429"],
       [500, "500"],
       [503, "503"],
     ]) {
@@ -166,7 +233,7 @@ describe("global hooks respect internal control-plane authority", () => {
       const facts = resourceFacts(m.storage);
       const fact = facts[facts.length - 1];
       assert.ok(fact, "fact recorded");
-      if (errStatus >= 400 && errStatus <= 599) {
+      if (typeof errStatus === "number" && Number.isInteger(errStatus) && errStatus >= 400 && errStatus <= 599) {
         assert.equal(fact.statusCode, errStatus, "expected valid status");
       } else {
         assert.equal("statusCode" in fact, false, "statusCode should not be recorded for invalid status");

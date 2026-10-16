@@ -62,6 +62,41 @@ test("RED regression: sanitizer preserves valid HTTP statusCode and falls back t
   assert.equal(custom.errorCode, "provider-error");
 });
 
+test("RED regression: sanitizer preserves semantic errorCode for quota-limit, operational-failure and context-overflow without HTTP override", () => {
+  const quota = sanitizeObservation({
+    at: 1,
+    kind: "quota-limit",
+    errorCode: "FreeUsageLimitError",
+    failureDomain: "quota",
+    statusCode: 403,
+  });
+  assert.equal(quota.kind, "quota-limit");
+  assert.equal(quota.errorCode, "FreeUsageLimitError");
+  assert.equal(quota.statusCode, 403);
+
+  const operational = sanitizeObservation({
+    at: 1,
+    kind: "operational-failure",
+    errorCode: "operational-failure",
+    failureDomain: "operational",
+    statusCode: 503,
+  });
+  assert.equal(operational.kind, "operational-failure");
+  assert.equal(operational.errorCode, "operational-failure");
+  assert.equal(operational.statusCode, 503);
+
+  const throttle = sanitizeObservation({
+    at: 1,
+    kind: "throttle",
+    failureDomain: "provider",
+    statusCode: 429,
+  });
+  assert.equal(throttle.kind, "throttle");
+  assert.equal("errorCode" in throttle, false, "throttle should not have errorCode synthesized from statusCode");
+  assert.equal(throttle.statusCode, 429);
+});
+
+
 test("RED regression: sanitizer rejects invalid or non-error status codes", () => {
   for (const invalid of [null, 0, 200, 302, 600, -1, NaN, "401"]) {
     const res = sanitizeObservation({
