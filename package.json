@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit -p ./tsconfig.json",
     "test": "node --test ./src/*.test.mjs",
     "evaluate:routing": "node ./scripts/evaluate-routing.mjs",
-    "e2e:gateway": "node scripts/e2e-gateway.mjs",
+    "test:e2e-isolation": "node --test scripts/e2e-gateway-isolation.test.mjs",
+    "e2e:gateway": "node scripts/e2e-gateway-isolated.mjs",
     "e2e:matrix": "node scripts/e2e-multiround-matrix.mjs",
     "e2e:multiround-real": "node scripts/e2e-multiround-real.mjs",
     "e2e:context": "node scripts/e2e-context-management.mjs"

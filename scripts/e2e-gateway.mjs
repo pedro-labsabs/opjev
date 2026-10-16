@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
 import { runIDDigest } from "../src/orchestration/admission.ts";
+import { verifyNetworkIsolation } from "./e2e-network-preflight.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = process.env.OPENCODE_BIN ?? "/tmp/opencode-2.0.11/package/bin/opencode";
@@ -408,6 +409,10 @@ function clearResourceLedger(homeDir) {
 
 // ==================================================================== E2E
 async function main() {
+  const hostNamespaceIndex = process.argv.indexOf("--expected-host-netns");
+  const expectedHostNamespace = hostNamespaceIndex >= 0 ? process.argv[hostNamespaceIndex + 1] : undefined;
+  const isolationProof = await verifyNetworkIsolation(expectedHostNamespace);
+  log(`PASS isolamento de rede verificado antes de E2E: ${JSON.stringify(isolationProof)}`);
   if (!fs.existsSync(BIN)) {
     log(`binario nao encontrado: ${BIN} (defina OPENCODE_BIN)`);
     process.exit(2);
