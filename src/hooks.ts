@@ -13,7 +13,7 @@ import { reserveThrottleRetry } from "./resource-governor/throttle-retry-budget.
 
 import { buildCriticContextInstruction, buildOrchestratorContextInstruction, buildWorkerContextInstruction } from "./worker-hooks.ts";
 
-import { applySwitch, errorClassOf, firstAvailable, freeCandidates, isModelAvailable, isContextOverflow, isGlobalThrottle, isTrivialFollowUp, modelRefString, orchestrationRoleOf, pruneKeys, recordRuntimeResource, safeStorageGet, switchExecutor, switchToModel, switchToAgent, validAgents, type IntentionRecord, type RouteState, TOOL_ERROR_WINDOW_MS, TOOL_ERROR_REPEAT_THRESHOLD, TOOL_DECIDE_COOLDOWN_MS, SWITCH_COOLDOWN_MS, RECOVERY_ACTIONS, toolErrorMayBeUnviable } from "./plugin-runtime.ts";
+import { applySwitch, classifyProviderError, errorClassOf, firstAvailable, freeCandidates, isModelAvailable, isTrivialFollowUp, modelRefString, orchestrationRoleOf, pruneKeys, recordRuntimeResource, safeStorageGet, switchExecutor, switchToModel, switchToAgent, validAgents, type IntentionRecord, type ProviderErrorClassification, type RouteState, TOOL_ERROR_WINDOW_MS, TOOL_ERROR_REPEAT_THRESHOLD, TOOL_DECIDE_COOLDOWN_MS, SWITCH_COOLDOWN_MS, RECOVERY_ACTIONS, toolErrorMayBeUnviable } from "./plugin-runtime.ts";
 
 const HOOK_ROLE_LOOKUP_TIMEOUT_MS = 250;
 
@@ -36,42 +36,27 @@ async function lookupHookRole(ctx: any, sessionID: string): Promise<InternalTool
   }
 }
 
-function extractErrorStatusCode(error: unknown): number | undefined {
-  if (!error || (typeof error !== "object" && typeof error !== "function")) return undefined;
-  let raw: unknown;
-  try {
-    raw = (error as any).status ?? (error as any).statusCode ?? (error as any).response?.status;
-  } catch {
-    return undefined;
-  }
-  if (typeof raw === "number") {
-    return Number.isInteger(raw) && raw >= 400 && raw <= 599 ? raw : undefined;
-  }
-  return undefined;
-}
-
-function safeIsGlobalThrottle(error: unknown, status: number | undefined): boolean {
-  if (status === 429 || status === 529) return true;
-  return isGlobalThrottle(error);
-}
-
-async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
-  const status = extractErrorStatusCode(error);
-  let isOverflow = false;
-  try { isOverflow = isContextOverflow(error); } catch {}
-  if (isOverflow) {
+async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, classification: ProviderErrorClassification): Promise<void> {
+  if (classification.kind === "incomplete" || classification.kind === "ambiguous") {
+    await recordRuntimeResource(ctx, {
+      ...resourceBase,
+      kind: "unknown",
+      failureDomain: "unknown",
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+    });
+  } else if (classification.kind === "context-overflow") {
     await recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
-  } else if (safeIsGlobalThrottle(error, status)) {
+  } else if (classification.kind === "throttle") {
     await recordRuntimeResource(ctx, {
       ...resourceBase, kind: "throttle", signal: "throttle", failureDomain: "provider",
-      ...(status !== undefined ? { statusCode: status } : {}),
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
     });
   } else {
     await recordRuntimeResource(ctx, {
       ...resourceBase,
       kind: "provider-error",
-      errorCode: status !== undefined ? String(status) : "provider-error",
-      ...(status !== undefined ? { statusCode: status } : {}),
+      errorCode: classification.httpStatus !== undefined ? String(classification.httpStatus) : "provider-error",
+      ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
       failureDomain: "provider",
     });
   }
@@ -322,17 +307,30 @@ export async function registerSessionHooks(
         role: "unknown",
         failureDomain: "provider",
       };
-      let errorText = "";
-      try {
-        errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
-      } catch {
-        errorText = "";
-      }
-      if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
+      const classification = classifyProviderError(event?.error);
+      if (classification.kind === "quota-limit") {
         // Quota is a global deny and must latch before role lookup.
         event.decision = { retry: false };
         try { await latchQuotaLimit(ctx.storage, Date.now()); } catch { /* in-process emergency latch stays active */ }
-        await recordRuntimeResource(ctx, { ...resourceBase, kind: "quota-limit", errorCode: /freeusagelimit/i.test(errorText) ? "FreeUsageLimitError" : "quota-limit", failureDomain: "quota" });
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "quota-limit",
+          errorCode: classification.quotaErrorCode ?? "quota-limit",
+          failureDomain: "quota",
+        });
+        return;
+      }
+
+      // Incomplete or contradictory error payloads never authorize any recovery
+      // effect or consume throttle budget. Keep only normalized HTTP provenance.
+      if (!classification.complete || classification.kind === "ambiguous" || classification.kind === "incomplete") {
+        event.decision = { retry: false };
+        await recordRuntimeResource(ctx, {
+          ...resourceBase,
+          kind: "unknown",
+          failureDomain: "unknown",
+          ...(classification.httpStatus !== undefined ? { statusCode: classification.httpStatus } : {}),
+        });
         return;
       }
 
@@ -342,17 +340,15 @@ export async function registerSessionHooks(
       const role = await lookupHookRole(ctx, sessionID);
       if (role !== "external") {
         event.decision = { retry: false };
-        await observeRetryFailure(ctx, { ...resourceBase, role: role !== "ambiguous" ? role : "unknown" }, event?.error);
+        await observeRetryFailure(ctx, { ...resourceBase, role: role !== "ambiguous" ? role : "unknown" }, classification);
         return;
       }
 
-      const status = extractErrorStatusCode(event?.error);
-      let isOverflow = false;
-      try { isOverflow = isContextOverflow(event?.error); } catch {}
-      if (isOverflow) {
+      const status = classification.httpStatus;
+      if (classification.kind === "context-overflow") {
         recordRuntimeResource(ctx, { ...resourceBase, kind: "context-overflow", errorCode: "context-overflow", failureDomain: "context" });
         return;
-      } else if (safeIsGlobalThrottle(event?.error, status)) {
+      } else if (classification.kind === "throttle") {
         try {
           const budget = await evaluateResourceBudget(ctx.storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
           if (!budget.allowed) {
@@ -382,7 +378,6 @@ export async function registerSessionHooks(
         if (retryAllowed) recordRuntimeResource(ctx, { ...resourceBase, kind: "retry", failureDomain: "provider" });
         return;
       } else {
-        const status = extractErrorStatusCode(event?.error);
         recordRuntimeResource(ctx, {
           ...resourceBase,
           kind: "provider-error",
@@ -414,7 +409,7 @@ export async function registerSessionHooks(
 
       const snapshot = await buildSnapshot(ctx, sessionID, {
         attempt: Number(event?.attempt) || tried.length,
-        lastError: `${String(event?.error?.type ?? "")}: ${String(event?.error?.message ?? "").slice(0, 300)}`,
+        lastError: `${classification.safeType ?? ""}: ${classification.safeMessage ?? ""}`,
         failedModel: failedRef,
       });
       const routeKind: RouteKind = snapshot.route !== "unknown"
@@ -425,7 +420,7 @@ export async function registerSessionHooks(
       const chain = chainFor(routeKind);
       const esk = (await decideEscalation({
         failedModel: failedRef,
-        reason: `${String(event?.error?.type ?? "")}: ${String(event?.error?.message ?? "").slice(0, 300)}`,
+        reason: `${classification.safeType ?? ""}: ${classification.safeMessage ?? ""}`,
         candidates: chain,
         triedModels: tried,
         snapshot,
@@ -476,7 +471,7 @@ export async function registerSessionHooks(
         await ctx.storage.set(
           `decision/${sessionID}/${Date.now()}`,
           buildDecisionRecord(
-            { failedModel: failedRef, reasonSnippet: String(event?.error?.message ?? "").slice(0, 200) },
+            { failedModel: failedRef, reasonSnippet: classification.safeMessage?.slice(0, 200) ?? "" },
             { via: esk.via, model: valid },
           ),
         );

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { FREE_POOL } from "./config.ts";
 import { registerSessionHooks } from "./hooks.ts";
 import { latchQuotaLimit } from "./resource-governor/enforcement-state.ts";
+import { evaluateResourceBudget } from "./resource-governor/runtime-policy.ts";
 import { RESOURCE_LEDGER_KEY } from "./resource-governor/storage-sink.ts";
 import { registerInternalToolSession } from "./orchestration/tool-authority.ts";
 import { makeCtx, makeStorage, okJev, stubFetch } from "./harness.mjs";
@@ -200,15 +201,214 @@ describe("global hooks respect internal control-plane authority", () => {
       assert.notEqual(fact?.kind, "throttle", "adversarial/non-throttle input must not be classified as throttle");
     }
 
-    // Valid valueOf returning 429
+    // Approved contract: object coercion never produces a provider-code signal.
     const mValueOf = await setup({ role: "worker" });
-    const eventValueOf = providerEvent(mValueOf.sessionID, { code: { valueOf() { return 429; } }, message: "provider error" });
+    let valueOfCalls = 0;
+    const eventValueOf = providerEvent(mValueOf.sessionID, { code: { valueOf() { valueOfCalls++; return 429; } }, message: "provider error" });
     await mValueOf.hooks.session.retry(eventValueOf);
     assert.deepEqual(eventValueOf.decision, { retry: false });
+    assert.equal(valueOfCalls, 0, "classifier must not invoke valueOf");
     const factsValueOf = resourceFacts(mValueOf.storage);
-    const factValueOf = factsValueOf.find((x) => x.kind === "throttle");
-    assert.ok(factValueOf, "object with valueOf() === 429 classified as throttle");
-    assert.equal("statusCode" in factValueOf, false, "statusCode not invented from valueOf");
+    assert.equal(factsValueOf.some((x) => x.kind === "throttle"), false, "object code cannot be classified as throttle");
+    assert.equal(mValueOf.storage._map.has("resource/throttle-retry/v1"), false);
+  });
+
+  it("RED regression: canonical provider.quota wins over 429, 403, and absent HTTP status", async () => {
+    for (const status of [429, 403, undefined]) {
+      const storage = makeStorage();
+      let roleLookups = 0;
+      const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+      const sessionID = `issue49-canonical-quota-${++nextSession}`;
+      m.ctx.session.get = async () => {
+        roleLookups++;
+        return { id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } };
+      };
+      await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+      const stub = stubFetch(() => { throw new Error("quota hard deny must not query Jev"); });
+      try {
+        const event = providerEvent(sessionID, {
+          type: "provider.quota",
+          message: "quota exceeded",
+          ...(status !== undefined ? { status } : {}),
+        });
+        event.decision = { retry: true, delay: 5000 };
+        await m.hooks.session.retry(event);
+        assert.deepEqual(event.decision, { retry: false }, `provider.quota/status=${status} must deny retry`);
+        assert.equal(roleLookups, 0, "quota latch occurs before external role lookup");
+        assert.equal(storage._map.get("resource/enforcement/quota-latch/v1")?.signal, "quota-limit");
+        assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+        assert.equal(m.calls.switchModel.length, 0);
+        assert.equal(stub.calls.length, 0);
+        const quotaFact = resourceFacts(storage).find((item) => item.kind === "quota-limit");
+        assert.ok(quotaFact, "canonical quota evidence is persisted best effort");
+        assert.equal(quotaFact.errorCode, "quota-limit");
+        assert.equal(JSON.stringify(quotaFact).includes("quota exceeded"), false);
+      } finally { stub.restore(); }
+    }
+  });
+
+  it("RED regression: canonical provider.rate-limit preserves bounded retry for all HTTP status provenance fields", async () => {
+    for (const [httpFields, expectedStatus] of [
+      [{ status: 429 }, 429], [{ status: 529 }, 529],
+      [{ statusCode: 429 }, 429], [{ statusCode: 529 }, 529],
+      [{ response: { status: 429 } }, 429], [{ response: { status: 529 } }, 529],
+    ]) {
+      const storage = makeStorage();
+      const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+      const sessionID = `issue49-canonical-rate-limit-${++nextSession}`;
+      m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+      await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+      const stub = stubFetch(() => { throw new Error("canonical throttle must not query Jev"); });
+      try {
+        const event = providerEvent(sessionID, { type: "provider.rate-limit", message: "rate limit", ...httpFields });
+        await m.hooks.session.retry(event);
+        assert.deepEqual(event.decision, { retry: true, delay: 5000 });
+        assert.equal(storage._map.has("resource/enforcement/quota-latch/v1"), false);
+        assert.equal(storage._map.get("resource/throttle-retry/v1")?.retries, 1);
+        assert.equal(m.calls.switchModel.length, 0);
+        assert.equal(stub.calls.length, 0);
+        const throttle = resourceFacts(storage).find((item) => item.kind === "throttle");
+        assert.ok(throttle);
+        assert.equal(throttle.statusCode, expectedStatus);
+        assert.equal("errorCode" in throttle, false);
+      } finally { stub.restore(); }
+    }
+  });
+
+  it("RED regression: quota latch storage failure retains emergency deny in the retry hook", async () => {
+    const storage = makeStorage();
+    const set = storage.set;
+    storage.set = async (key, value) => {
+      if (key === "resource/enforcement/quota-latch/v1") throw new Error("quota state unavailable");
+      await set(key, value);
+    };
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-quota-storage-failure-${++nextSession}`;
+    let roleLookups = 0;
+    m.ctx.session.get = async () => {
+      roleLookups++;
+      return { id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } };
+    };
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("quota storage failure must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, { type: "provider.quota", message: "quota exceeded", status: 429 });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(roleLookups, 0);
+      assert.equal(storage._map.has("resource/enforcement/quota-latch/v1"), false, "durable write is genuinely unavailable");
+      const budget = await evaluateResourceBudget(storage, { stage: "provider-retry", maxRounds: 1, round: 1 });
+      assert.equal(budget.allowed, false, "emergency latch survives the failed durable write");
+      assert.equal(resourceFacts(storage).some((item) => item.kind === "quota-limit"), true);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("RED regression: failed throttle reservation explicitly denies retry without switching", async () => {
+    const storage = makeStorage();
+    const set = storage.set;
+    storage.set = async (key, value) => {
+      if (key === "resource/throttle-retry/v1") throw new Error("throttle reservation unavailable");
+      await set(key, value);
+    };
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-throttle-storage-failure-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("failed reservation must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, { type: "provider.rate-limit", message: "rate limit", status: 429 });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(storage._map.has("resource/enforcement/quota-latch/v1"), false);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+      assert.equal(resourceFacts(storage).some((item) => item.kind === "throttle"), true);
+    } finally { stub.restore(); }
+  });
+
+  it("RED regression: readable canonical quota survives a throwing unrelated getter", async () => {
+    const storage = makeStorage();
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-partial-quota-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("quota hard deny must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, {
+        get name() { throw new Error("hostile unrelated getter"); },
+        type: "provider.quota",
+        message: "quota exceeded",
+        status: 429,
+      });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.get("resource/enforcement/quota-latch/v1")?.signal, "quota-limit");
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(resourceFacts(storage).some((item) => item.kind === "quota-limit"), true);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("RED regression: status 503 plus provider code 429 is ambiguous and cannot recover", async () => {
+    const storage = makeStorage();
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-status-code-conflict-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("ambiguous error must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, { status: 503, code: 429, message: "server unavailable" });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+      const observation = resourceFacts(storage).find((item) => item.kind === "unknown");
+      assert.ok(observation);
+      assert.equal(observation.statusCode, 503);
+      assert.equal("errorCode" in observation, false);
+    } finally { stub.restore(); }
+  });
+
+  it("RED regression: hostile provider code coercion is not called or authorized for external recovery", async () => {
+    const storage = makeStorage();
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-valueof-code-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    let calls = 0;
+    const stub = stubFetch(() => { throw new Error("object code must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, { code: { valueOf() { calls++; return 429; } }, message: "provider failure" });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(calls, 0);
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(stub.calls.length, 0);
+    } finally { stub.restore(); }
+  });
+
+  it("RED regression: Symbol provider code makes an otherwise throttled external payload fail closed", async () => {
+    const storage = makeStorage();
+    const m = makeCtx({ models: FREE_POOL, storage, session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } } });
+    const sessionID = `issue49-symbol-provider-code-${++nextSession}`;
+    m.ctx.session.get = async () => ({ id: sessionID, agent: { id: "build" }, model: { providerID: "opencode", id: "big-pickle" } });
+    await registerSessionHooks(m.ctx, OPTIONS, async () => "test-key");
+    const stub = stubFetch(() => { throw new Error("incomplete provider code must not query Jev"); });
+    try {
+      const event = providerEvent(sessionID, { type: "provider.rate-limit", message: "rate limit", status: 429, code: Symbol("429") });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      assert.equal(storage._map.has("resource/throttle-retry/v1"), false);
+      assert.equal(m.calls.switchModel.length, 0);
+      assert.equal(stub.calls.length, 0);
+      const observation = resourceFacts(storage).find((item) => item.kind === "unknown");
+      assert.ok(observation);
+      assert.equal(observation.statusCode, 429);
+      assert.equal("errorCode" in observation, false);
+    } finally { stub.restore(); }
   });
 
   it("adversarial status inputs do not throw in retry hook and record safe fallback", async () => {
@@ -237,7 +437,12 @@ describe("global hooks respect internal control-plane authority", () => {
       const fact = facts[facts.length - 1];
       assert.ok(fact, "fact recorded");
       assert.equal("statusCode" in fact, false, "invalid status should not be recorded as statusCode");
-      assert.equal(fact.errorCode, "provider-error");
+      if (bad === null || bad === undefined) {
+        assert.equal(fact.errorCode, "provider-error", "absent HTTP status remains a complete generic provider error");
+      } else {
+        assert.equal(fact.kind, "unknown", "malformed HTTP status must remain an incomplete observation");
+        assert.equal("errorCode" in fact, false, "incomplete input must not be projected as provider-error");
+      }
     }
 
     // Also test external session with quota latched: instrumentation error must not alter fail-closed decision
@@ -295,25 +500,9 @@ describe("global hooks respect internal control-plane authority", () => {
   }
 
   it("RED regression: HTTP status extraction in retry hook rejects null, 200, 600, negative and non-integer", async () => {
-    for (const [errStatus, expectedCode] of [
-      [null, "provider-error"],
-      [undefined, "provider-error"],
-      ["", "provider-error"],
-      [0, "provider-error"],
-      [200, "provider-error"],
-      [600, "provider-error"],
-      [-1, "provider-error"],
-      [418.5, "provider-error"],
-      ["401", "provider-error"],
-      [" 403 ", "provider-error"],
-      [Symbol("untrusted"), "provider-error"],
-      [{ valueOf() { throw new Error("hostile valueOf"); } }, "provider-error"],
-      [418, "provider-error"],
-      [401, "401"],
-      [403, "403"],
-      [408, "408"],
-      [500, "500"],
-      [503, "503"],
+    for (const errStatus of [
+      null, undefined, "", 0, 200, 600, -1, 418.5, "401", " 403 ", Symbol("untrusted"),
+      { valueOf() { throw new Error("hostile valueOf"); } }, 418, 401, 403, 408, 500, 503,
     ]) {
       const m = await setup({ role: "worker" });
       const originalError = { status: errStatus, message: "simulated provider failure" };
@@ -324,10 +513,16 @@ describe("global hooks respect internal control-plane authority", () => {
       assert.ok(fact, "fact recorded");
       if (typeof errStatus === "number" && Number.isInteger(errStatus) && errStatus >= 400 && errStatus <= 599) {
         assert.equal(fact.statusCode, errStatus, "expected valid status");
+        assert.equal(fact.errorCode, errStatus === 418 ? "provider-error" : String(errStatus), "HTTP status provenance remains bounded");
       } else {
         assert.equal("statusCode" in fact, false, "statusCode should not be recorded for invalid status");
+        if (errStatus === null || errStatus === undefined) {
+          assert.equal(fact.errorCode, "provider-error");
+        } else {
+          assert.equal(fact.kind, "unknown");
+          assert.equal("errorCode" in fact, false);
+        }
       }
-      assert.equal(fact.errorCode, expectedCode, "expected errorCode match");
     }
   });
 
