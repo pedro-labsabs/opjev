@@ -122,6 +122,95 @@ describe("global hooks respect internal control-plane authority", () => {
     assert.equal("errorCode" in throttleFact, false, "throttle should not synthesize errorCode from statusCode");
   });
 
+  it("RED regression: error.code 429 and 529 (numeric and textual) are classified as throttle without inventing statusCode", async () => {
+    for (const [codeVal, expectedKind] of [
+      [429, "throttle"],
+      [529, "throttle"],
+      ["429", "throttle"],
+      ["529", "throttle"],
+      [" 429 ", "throttle"],
+    ]) {
+      const m = await setup({ role: "worker" });
+      const event = providerEvent(m.sessionID, { code: codeVal, message: "provider error" });
+      await m.hooks.session.retry(event);
+      assert.deepEqual(event.decision, { retry: false });
+      const facts = resourceFacts(m.storage);
+      const fact = facts.find((x) => x.kind === expectedKind);
+      assert.ok(fact, `error.code ${codeVal} should be recorded as kind=${expectedKind}`);
+      assert.equal("statusCode" in fact, false, "statusCode should NOT be invented from error.code");
+    }
+
+    // External session throttle handling: error.code 429/529 gets throttle treatment with explicit budget, not generic provider escalation
+    for (const codeVal of [429, "429", 529, "529"]) {
+      const mExt = makeCtx({
+        models: FREE_POOL,
+        storage: makeStorage(),
+        session: { agent: "build", model: { providerID: "opencode", id: "big-pickle" } },
+      });
+      const extSessionID = `issue49-ext-throttle-${++nextSession}`;
+      mExt.ctx.session.get = async () => ({
+        id: extSessionID,
+        agent: { id: "build" },
+        model: { providerID: "opencode", id: "big-pickle" },
+      });
+      await registerSessionHooks(mExt.ctx, OPTIONS, async () => "test-key");
+      const extEvent = {
+        sessionID: extSessionID,
+        model: { providerID: "opencode", id: "big-pickle" },
+        error: { code: codeVal, message: "provider error" },
+        attempt: 1,
+        decision: {},
+      };
+      await mExt.hooks.session.retry(extEvent);
+      assert.equal(extEvent.decision.retry, true, `external throttle retry granted for code ${codeVal}`);
+      assert.equal(mExt.calls.switchModel.length, 0, "throttle does not trigger switchModel escalation");
+      const facts = resourceFacts(mExt.storage);
+      const throttleFact = facts.find((x) => x.kind === "throttle");
+      assert.ok(throttleFact, `external error.code ${codeVal} recorded as throttle`);
+      assert.equal("statusCode" in throttleFact, false, "statusCode not invented for external throttle");
+    }
+
+    // Adversarial inputs fail-closed (not throttle unless valid signal)
+    const adversarialNonThrottle = [
+      Symbol("throttle-sym"),
+      { valueOf() { throw new Error("hostile valueOf"); } },
+      { get code() { throw new Error("hostile getter"); } },
+      { get status() { throw new Error("hostile getter"); } },
+      { get message() { throw new Error("hostile getter"); } },
+      { code: Symbol("sym") },
+      { status: Symbol("sym") },
+      null,
+      undefined,
+      {},
+      { status: 401 },
+      { status: 403 },
+      { status: 418 },
+      { status: 500 },
+      { status: 503 },
+    ];
+    for (const bad of adversarialNonThrottle) {
+      const m = await setup({ role: "worker" });
+      const event = providerEvent(m.sessionID, bad);
+      await assert.doesNotReject(async () => {
+        await m.hooks.session.retry(event);
+      });
+      assert.deepEqual(event.decision, { retry: false });
+      const facts = resourceFacts(m.storage);
+      const fact = facts[facts.length - 1];
+      assert.notEqual(fact?.kind, "throttle", "adversarial/non-throttle input must not be classified as throttle");
+    }
+
+    // Valid valueOf returning 429
+    const mValueOf = await setup({ role: "worker" });
+    const eventValueOf = providerEvent(mValueOf.sessionID, { code: { valueOf() { return 429; } }, message: "provider error" });
+    await mValueOf.hooks.session.retry(eventValueOf);
+    assert.deepEqual(eventValueOf.decision, { retry: false });
+    const factsValueOf = resourceFacts(mValueOf.storage);
+    const factValueOf = factsValueOf.find((x) => x.kind === "throttle");
+    assert.ok(factValueOf, "object with valueOf() === 429 classified as throttle");
+    assert.equal("statusCode" in factValueOf, false, "statusCode not invented from valueOf");
+  });
+
   it("adversarial status inputs do not throw in retry hook and record safe fallback", async () => {
     const adversarial = [
       Symbol("untrusted"),

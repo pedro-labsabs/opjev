@@ -155,9 +155,35 @@ export function isContextOverflow(error: any): boolean {
 // entrada). 429/529/rate-limit -> trocar de modelo nao resolve; o retry
 // apenas aguarda com backoff.
 export function isGlobalThrottle(error: any): boolean {
-  const code = Number(error?.status ?? error?.statusCode ?? error?.code ?? 0);
-  const text = `${String(error?.type ?? "")} ${String(error?.message ?? "")}`.toLowerCase();
-  return code === 429 || code === 529 || text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
+  if (!error || (typeof error !== "object" && typeof error !== "function")) return false;
+  try {
+    const parseCode = (raw: unknown): number | undefined => {
+      if (typeof raw === "number") return Number.isInteger(raw) ? raw : undefined;
+      if (typeof raw === "string") {
+        const trimmed = raw.trim();
+        if (/^\d+$/.test(trimmed)) {
+          const parsed = Number(trimmed);
+          if (Number.isSafeInteger(parsed)) return parsed;
+        }
+        return undefined;
+      }
+      if (typeof raw === "object" && raw !== null) {
+        try {
+          const val = (raw as any).valueOf();
+          if (typeof val === "number" && Number.isInteger(val)) return val;
+        } catch {
+          return undefined;
+        }
+      }
+      return undefined;
+    };
+    const code = parseCode(error.status ?? error.statusCode ?? error.response?.status) ?? parseCode(error.code);
+    if (code === 429 || code === 529) return true;
+    const text = `${String(error.type ?? "")} ${String(error.message ?? "")}`.toLowerCase();
+    return text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -52,12 +52,7 @@ function extractErrorStatusCode(error: unknown): number | undefined {
 
 function safeIsGlobalThrottle(error: unknown, status: number | undefined): boolean {
   if (status === 429 || status === 529) return true;
-  try {
-    const text = `${String((error as any)?.type ?? "")} ${String((error as any)?.message ?? "")}`.toLowerCase();
-    return text.includes("rate limit") || text.includes("overload") || text.includes("too many requests");
-  } catch {
-    return false;
-  }
+  return isGlobalThrottle(error);
 }
 
 async function observeRetryFailure(ctx: any, resourceBase: Record<string, unknown>, error: unknown): Promise<void> {
@@ -327,7 +322,12 @@ export async function registerSessionHooks(
         role: "unknown",
         failureDomain: "provider",
       };
-      const errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
+      let errorText = "";
+      try {
+        errorText = `${String(event?.error?.name ?? "")} ${String(event?.error?.type ?? "")} ${String(event?.error?.code ?? "")} ${String(event?.error?.message ?? "")}`;
+      } catch {
+        errorText = "";
+      }
       if (/freeusagelimit|quota.?limit|usage.?limit/i.test(errorText)) {
         // Quota is a global deny and must latch before role lookup.
         event.decision = { retry: false };
