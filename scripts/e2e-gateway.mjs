@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { installServerPluginToProject, installPluginToHome } from "./install-plugin.mjs";
 import { runIDDigest } from "../src/orchestration/admission.ts";
+import { evaluateTuiAdmissionEvidence } from "./e2e-tui-admission.mjs";
 import { verifyNetworkIsolation } from "./e2e-network-preflight.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -126,6 +127,7 @@ async function waitFor(fn, timeoutMs, label) {
 
 const results = [];
 const summaryRpcEvidence = { probeStatus: null, probeAvailable: null, tuiRequests: 0, tuiResponses200: 0, tuiResponses400: 0, preterminal: false, matchingRunProjection: false };
+let tuiAdmissionEvidence = null;
 function assert(name, pass, detail = "", required = true) {
   results.push({ name, pass: Boolean(pass), required, detail: String(detail).slice(0, 600) });
   log(`${pass ? "PASS" : required ? "FAIL" : "note"} ${name}${detail ? ` — ${detail}` : ""}`);
@@ -1377,21 +1379,30 @@ async function main() {
       cwd: REPO,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const driverRec = { label: "driver", child: driver, lines: [], exited: false, code: null };
+    const driverRec = { label: "driver", child: driver, lines: [], exited: false, code: null, signal: null, spawnError: null };
     children.push(driverRec);
     let driverOut = "";
     driver.stdout.on("data", (c) => (driverOut += c));
     driver.stderr.on("data", (c) => (driverOut += c));
 
     let driverFinished = false;
-    const driverDone = new Promise((resolve) =>
-      driver.on("exit", (code) => {
+    const driverDone = new Promise((resolve) => {
+      driver.once("error", (error) => {
+        driverFinished = true;
+        driverRec.exited = true;
+        driverRec.code = 127;
+        driverRec.spawnError = typeof error?.code === "string" ? error.code.slice(0, 24) : "spawn-error";
+        driverOut += `driver spawn error (${driverRec.spawnError})`;
+        resolve(127);
+      });
+      driver.once("exit", (code, signal) => {
         driverFinished = true;
         driverRec.exited = true;
         driverRec.code = code;
+        driverRec.signal = signal;
         resolve(code);
-      }),
-    );
+      });
+    });
 
     let tuiSid = null;
     let execAtOrch = null;
@@ -1443,9 +1454,23 @@ async function main() {
     ]);
     if (exitCode === "TIMEOUT") {
       try {
-        driver.kill("SIGKILL");
+        // SIGINT unwinds the versioned Python driver's finally block, which
+        // terminates and waitpid()s its PTY child. Hard kill is bounded fallback.
+        driver.kill("SIGINT");
       } catch {
         // ja morto
+      }
+      const gracefulStop = await Promise.race([
+        driverDone,
+        sleep(5000).then(() => "CLEANUP_TIMEOUT"),
+      ]);
+      if (gracefulStop === "CLEANUP_TIMEOUT") {
+        try {
+          driver.kill("SIGKILL");
+        } catch {
+          // ja morto
+        }
+        await Promise.race([driverDone, sleep(1000)]);
       }
       assert("fase TUI: driver terminou", false, "timeout do driver TUI");
     } else {
@@ -1456,6 +1481,25 @@ async function main() {
       );
     }
     const watchOut = await watch;
+
+    tuiAdmissionEvidence = evaluateTuiAdmissionEvidence({
+      events: gwEvents,
+      baselineIndex: gwMark,
+      driverExitCode: exitCode === "TIMEOUT" ? null : exitCode,
+      driverSignal: driverRec.signal,
+      driverOutput: driverOut,
+      expectedSessionID: tuiSid,
+      expectedSubmitStep: 0,
+    });
+    assert(
+      "TUI acceptance: PTY write/Enter requires exactly one correlated intercept → admitted → dispatch",
+      tuiAdmissionEvidence.ok,
+      JSON.stringify({
+        counts: tuiAdmissionEvidence.counts,
+        identity: tuiAdmissionEvidence.identity,
+        diagnostics: tuiAdmissionEvidence.diagnostics,
+      }),
+    );
 
     const tuiIntercepts = since(gwMark).filter((e) => e.type === "intercept");
     const tuiNormal = tuiIntercepts.filter((e) => e.mode === "normal");
@@ -1483,7 +1527,9 @@ async function main() {
     // execAtOrch==0 (nada executava na admissao) + final==1 (exatamente o
     // ping; >=2 indicaria wake tardio) + wire com ZERO PATCH em todo o run
     // (nenhum mecanismo de wake disparou em nenhuma fase).
-    const tuiAdmitted = since(gwMark).find((e) => e.type === "admitted" && e.sessionID === tuiSid);
+    const tuiAdmitted = tuiAdmissionEvidence.identity === null
+      ? since(gwMark).find((e) => e.type === "admitted" && e.sessionID === tuiSid)
+      : since(gwMark).find((e) => e.type === "admitted" && e.runID === tuiAdmissionEvidence.identity.runID);
     const tuiPing = since(gwMark).find(
       (e) => e.type === "intercept" && e.mode === "normal" && e.sessionID === tuiSid,
     );
@@ -1727,6 +1773,12 @@ async function main() {
       runB: fu.runB,
     },
     notices: { orchestrate: orch.notice },
+    tuiAdmissionEvidence: tuiAdmissionEvidence ?? {
+      ok: false,
+      counts: { ptyBytesWritten: 0, ptyEnterSent: 0, orchestrateIntercept: 0, admitted: 0, rpcDispatched: 0 },
+      identity: null,
+      diagnostics: ["TUI admission evidence was not produced"],
+    },
     results,
     eventsTail: gwEvents.slice(-400),
     artifacts: {

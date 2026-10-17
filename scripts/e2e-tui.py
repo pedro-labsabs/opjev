@@ -25,6 +25,10 @@ Spec (JSON):
 - Todo output do PTY e gravado em dump_to (para grep de visibilidade).
 - wait_log: le o arquivo (log do gateway) e espera NOVAS ocorrencias do regex
   a partir do baseline do inicio do passo; faz pump do PTY durante a espera.
+- exit 0 confirma somente que os passos do script terminaram; nao confirma
+  submit, intercept, admission ou dispatch. O chamador valida eventos do gateway.
+- progresso stdout e allowlisted (step, bytes escritos, Enter); nunca inclui o
+  texto digitado nem o output bruto do PTY.
 - No fim (ou erro) envia SIGTERM/SIGKILL no filho: o TUI nunca fica orfao.
 """
 import json
@@ -33,6 +37,7 @@ import os
 import pty
 import re
 import select
+import signal
 import struct
 import sys
 import termios
@@ -40,6 +45,12 @@ import time
 
 
 def main() -> int:
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+
+    # Parent cancellation must unwind through finally so the PTY child is reaped.
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     if len(sys.argv) != 2:
         sys.stderr.write("uso: e2e-tui.py <spec.json>\n")
         return 2
@@ -61,6 +72,21 @@ def main() -> int:
 
     dump = open(spec["dump_to"], "wb", buffering=0)
     alive = True
+
+    def progress(event: str, step: int, **fields: int) -> None:
+        # Allowlisted metrics only. Never echo input text, PTY output, or IDs.
+        record = {"source": "opjev-e2e-tui", "event": event, "step": step, **fields}
+        sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    def write_all(payload: bytes) -> int:
+        written_total = 0
+        while written_total < len(payload):
+            written = os.write(fd, payload[written_total:])
+            if written <= 0:
+                raise OSError("PTY write made no progress")
+            written_total += written
+        return written_total
 
     def pump(seconds: float) -> bool:
         """Le o output do PTY durante `seconds`. False = filho morreu."""
@@ -95,11 +121,26 @@ def main() -> int:
                 sys.stderr.write(f"driver: filho morreu no passo {idx}\n")
                 return 1
             if "type" in step:
-                os.write(fd, step["type"].encode("utf-8"))
-                pump(0.4)
+                payload = step["type"].encode("utf-8")
+                try:
+                    written = write_all(payload)
+                except OSError:
+                    sys.stderr.write(f"driver: falha de escrita PTY no passo {idx}\n")
+                    return 1
+                progress("pty-write", idx, bytesRequested=len(payload), bytesWritten=written)
+                if not pump(0.4):
+                    sys.stderr.write(f"driver: filho morreu apos bytes PTY no passo {idx}\n")
+                    return 1
                 if step.get("enter", True):
-                    os.write(fd, b"\r")
-                    pump(step.get("after_enter_ms", 500) / 1000.0)
+                    try:
+                        enter_written = write_all(b"\r")
+                    except OSError:
+                        sys.stderr.write(f"driver: falha ao enviar Enter PTY no passo {idx}\n")
+                        return 1
+                    progress("enter-sent", idx, bytesWritten=enter_written)
+                    if not pump(step.get("after_enter_ms", 500) / 1000.0):
+                        sys.stderr.write(f"driver: filho morreu apos Enter PTY no passo {idx}\n")
+                        return 1
             elif "key" in step:
                 os.write(fd, step["key"].encode("utf-8").decode("unicode_escape").encode("utf-8"))
                 pump(step.get("after_ms", 500) / 1000.0)
@@ -184,4 +225,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
