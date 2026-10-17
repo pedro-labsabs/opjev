@@ -44,6 +44,53 @@ import termios
 import time
 
 
+def terminate_and_reap(pid: int) -> None:
+    """Stop the PTY child without blocking on a silent master PTY read."""
+    def wait_nonblocking() -> bool:
+        while True:
+            try:
+                done, _ = os.waitpid(pid, os.WNOHANG)
+                return done == pid
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                # ECHILD means this process is no longer waitable by us.
+                return True
+
+    def signal_child(signum: int) -> None:
+        while True:
+            try:
+                os.kill(pid, signum)
+                return
+            except InterruptedError:
+                continue
+            except ProcessLookupError:
+                # The child may have exited between waitpid and kill. Keep
+                # checking waitpid so an exited-but-unreaped child is reaped.
+                return
+
+    if wait_nonblocking():
+        return
+
+    signal_child(signal.SIGTERM)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if wait_nonblocking():
+            return
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    signal_child(signal.SIGKILL)
+    while True:
+        try:
+            done, _ = os.waitpid(pid, 0)
+            if done == pid:
+                return
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return
+
+
 def main() -> int:
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
@@ -197,31 +244,22 @@ def main() -> int:
         pump(spec.get("tail_ms", 1000) / 1000.0)
         return 0
     finally:
-        dump.close()
+        previous_sigterm = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
-            os.kill(pid, 15)  # SIGTERM -> TUI fecha
-        except OSError:
-            pass
-        end = time.time() + 3
-        while time.time() < end:
-            done, _ = os.waitpid(pid, os.WNOHANG)
-            if done:
-                break
             try:
-                os.read(fd, 4096)
-            except OSError:
-                break
-            time.sleep(0.1)
-        else:
-            try:
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+                dump.close()
+            finally:
+                try:
+                    terminate_and_reap(pid)
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import test from "node:test";
 import { autoAdmissionRunID } from "./orchestration/admission.ts";
 import { evaluateTuiAdmissionEvidence } from "../scripts/e2e-tui-admission.mjs";
@@ -48,6 +47,31 @@ function isAlive(pid) {
   } catch (error) {
     return error?.code === "EPERM";
   }
+}
+
+function waitForExitWithin(child, timeoutMs) {
+  return new Promise((resolve) => {
+    let timer;
+    const onExit = (code, signal) => finish({ code, signal });
+    const finish = (result) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(result);
+    };
+    child.once("exit", onExit);
+    timer = setTimeout(() => finish(null), timeoutMs);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish({ code: child.exitCode, signal: child.signalCode });
+    }
+  });
+}
+
+async function waitUntil(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return predicate();
 }
 
 function writeFakeDriverSpec(temp, { childSource, steps, bootMs = 250 }) {
@@ -182,27 +206,31 @@ test("unready fake TUI that exits before submit cannot pass on PTY writes alone"
   }
 });
 
-test("missing gateway acknowledgement reaches a bounded nonzero driver timeout", () => {
+test("missing gateway acknowledgement reaches a bounded nonzero driver timeout", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-tui-ack-timeout-test-"));
   let fakePid;
   try {
     const { pidFile, specPath } = writeFakeDriverSpec(temp, {
-      childSource: "setInterval(() => {}, 1000);",
+      childSource: 'process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); setInterval(() => {}, 1000);',
       steps: [
         { type: "synthetic prompt with no gateway", enter: true, after_enter_ms: 10 },
         { wait_log: { file: path.join(temp, "gateway.jsonl"), regex: "rpc-dispatched", baseline: 0, min_extra: 1, timeout_ms: 100 } },
       ],
     });
+    const startedAt = Date.now();
     const result = spawnSync("python3", [driver, specPath], { encoding: "utf8", timeout: 10000 });
+    const elapsedMs = Date.now() - startedAt;
     fakePid = Number(fs.readFileSync(pidFile, "utf8"));
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, "no acknowledgement within deadline must fail");
+    assert.ok(elapsedMs < 5000, `gateway timeout cleanup must remain bounded, elapsed ${elapsedMs}ms`);
     assert.match(result.stderr, /wait_log .*nao alcancou/u);
     assert.equal(evaluate([], { driverExitCode: result.status, driverOutput: result.stdout }).ok, false);
     assert.equal(isAlive(fakePid), false, "timeout cleanup reaped the child");
   } finally {
     if (Number.isInteger(fakePid) && fakePid > 1 && isAlive(fakePid)) {
-      try { process.kill(fakePid, "SIGTERM"); } catch { /* already reaped */ }
+      try { process.kill(fakePid, "SIGKILL"); } catch { /* fixture child already exited */ }
+      await waitUntil(() => !isAlive(fakePid), 1500);
     }
     fs.rmSync(temp, { recursive: true, force: true });
   }
@@ -226,14 +254,59 @@ test("driver cleans its PTY child when parent terminates it during a bounded wai
     assert.ok(fs.existsSync(pidFile), "fake child started");
     fakePid = Number(fs.readFileSync(pidFile, "utf8"));
     driverChild.kill("SIGTERM");
-    const [code] = await once(driverChild, "exit");
-    assert.equal(code, 130, "driver handles parent termination after cleaning its child");
+    const exit = await waitForExitWithin(driverChild, 5000);
+    assert.ok(exit, "driver exits within its parent-cancellation deadline");
+    assert.equal(exit.code, 130, "driver handles parent termination after cleaning its child");
     assert.equal(isAlive(fakePid), false, "PTY child is reaped and does not outlive failed E2E");
   } finally {
-    if (driverChild && driverChild.exitCode === null && driverChild.signalCode === null) driverChild.kill("SIGKILL");
+    if (driverChild && driverChild.exitCode === null && driverChild.signalCode === null) {
+      driverChild.kill("SIGKILL");
+      await waitForExitWithin(driverChild, 1000);
+    }
     if (Number.isInteger(fakePid) && fakePid > 1 && isAlive(fakePid)) {
-      try { process.kill(fakePid, "SIGTERM"); } catch { /* already reaped */ }
+      try { process.kill(fakePid, "SIGKILL"); } catch { /* fixture child already exited */ }
+      await waitUntil(() => !isAlive(fakePid), 1500);
     }
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
+
+for (const signalName of ["SIGTERM", "SIGINT"]) {
+  test(`driver reaps a silent PTY child that ignores SIGTERM after parent ${signalName}`, async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opjev-tui-resistant-child-test-"));
+    let driverChild;
+    let fakePid;
+    let repeatSignalTimer;
+    try {
+      const { pidFile, specPath } = writeFakeDriverSpec(temp, {
+        childSource: 'process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); setInterval(() => {}, 1000);',
+        steps: [{ type: "resistant child test bytes", enter: true }, { sleep_ms: 10000 }],
+        bootMs: 100,
+      });
+      driverChild = spawn("python3", [driver, specPath], { stdio: "ignore" });
+      assert.equal(await waitUntil(() => fs.existsSync(pidFile), 5000), true, "silent fake TUI child started");
+      fakePid = Number(fs.readFileSync(pidFile, "utf8"));
+      driverChild.kill(signalName);
+      repeatSignalTimer = setTimeout(() => {
+        if (driverChild.exitCode === null && driverChild.signalCode === null) driverChild.kill(signalName);
+      }, 100);
+
+      const exit = await waitForExitWithin(driverChild, 2500);
+      clearTimeout(repeatSignalTimer);
+      assert.ok(exit, `driver must finish bounded cleanup after ${signalName}`);
+      assert.equal(exit.code, 130, `driver should report cancellation after ${signalName}`);
+      assert.equal(isAlive(fakePid), false, "resistant PTY child must be killed and reaped by the driver");
+    } finally {
+      clearTimeout(repeatSignalTimer);
+      if (driverChild && driverChild.exitCode === null && driverChild.signalCode === null) {
+        driverChild.kill("SIGKILL");
+        await waitForExitWithin(driverChild, 1000);
+      }
+      if (Number.isInteger(fakePid) && fakePid > 1 && isAlive(fakePid)) {
+        try { process.kill(fakePid, "SIGKILL"); } catch { /* fixture child already exited */ }
+        await waitUntil(() => !isAlive(fakePid), 1500);
+      }
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}
