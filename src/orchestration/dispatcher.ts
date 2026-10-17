@@ -856,7 +856,11 @@ function lastSessionMessageID(messages: unknown): string | undefined {
   return entries.length ? sessionMessageID(entries[entries.length - 1].value) : undefined;
 }
 
-function metadataMatchesProviderSession(metadata: unknown, identity: ProviderSessionIdentity): { matches: boolean; roundMatched: boolean } {
+function metadataMatchesProviderSession(
+  metadata: unknown,
+  identity: ProviderSessionIdentity,
+  options: { allowEarlierRound?: boolean } = {},
+): { matches: boolean; roundMatched: boolean } {
   if (metadata === undefined || metadata === null) return { matches: true, roundMatched: false };
   if (typeof metadata !== "object") return { matches: false, roundMatched: false };
 
@@ -865,14 +869,19 @@ function metadataMatchesProviderSession(metadata: unknown, identity: ProviderSes
     return { matches: false, roundMatched: false };
   }
   const round = ownDataField(metadata, "jev-round");
-  if (round.present && (!round.readable || typeof round.value !== "number" || round.value !== identity.round)) {
-    return { matches: false, roundMatched: false };
+  if (round.present) {
+    if (!round.readable || typeof round.value !== "number" || !Number.isInteger(round.value) || round.value < 1) {
+      return { matches: false, roundMatched: false };
+    }
+    if (round.value !== identity.round && !(options.allowEarlierRound && round.value < identity.round)) {
+      return { matches: false, roundMatched: false };
+    }
   }
   const role = ownDataField(metadata, "jev-role");
   if (role.present && (!role.readable || typeof role.value !== "string" || role.value !== identity.role)) {
     return { matches: false, roundMatched: false };
   }
-  return { matches: true, roundMatched: round.present };
+  return { matches: true, roundMatched: round.present && round.readable && round.value === identity.round };
 }
 
 function providerErrorHttpStatus(error: unknown): number | undefined {
@@ -919,7 +928,9 @@ function projectProviderSessionError(
   identity: ProviderSessionIdentity,
 ): EvidencePacket["deterministicChecks"][number] | undefined {
   if (!identity.runID || !identity.sessionID || !Number.isInteger(identity.round) || identity.round < 1) return undefined;
-  const sessionMetadata = metadataMatchesProviderSession(identity.sessionMetadata, identity);
+  const sessionMetadata = metadataMatchesProviderSession(identity.sessionMetadata, identity, {
+    allowEarlierRound: identity.reusedSession === true,
+  });
   if (!sessionMetadata.matches) return undefined;
 
   const entries = boundedSessionMessages(messages);

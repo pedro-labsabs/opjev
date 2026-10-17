@@ -5342,21 +5342,43 @@ describe("structured provider session errors reach Jev as bounded facts", () => 
   });
 
   it("does not re-project a prior-round error from a repair-same worker session", async () => {
+    const sessionMetadata = {
+      "jev-run-id": "test-run-1",
+      "jev-round": 1,
+      "jev-role": "worker",
+    };
     const priorError = structuredProviderErrorMessage({
       type: "provider.invalid-request",
       status: 404,
+    }, {
+      id: "round-one-error",
+      metadata: sessionMetadata,
     });
     const contextCalls = [];
     const captured = await captureProviderJudgement({
       workerSessionIDs: ["reused-worker-session"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", metadata: sessionMetadata },
+      ],
       runtime: {
         context: async ({ sessionID }) => {
           contextCalls.push(sessionID);
           return contextCalls.length === 1
-            ? [{ ...priorError, id: "round-one-error" }]
+            ? [priorError]
             : [
-                { ...priorError, id: "round-one-error" },
-                { id: "round-two-result", type: "assistant", model: { providerID: "opencode", id: "big-pickle" }, content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }] },
+                priorError,
+                {
+                  id: "round-two-result",
+                  type: "assistant",
+                  metadata: {
+                    "jev-run-id": "test-run-1",
+                    "jev-round": 2,
+                    "jev-role": "worker",
+                  },
+                  model: { providerID: "opencode", id: "big-pickle" },
+                  content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }],
+                },
               ];
         },
       },
@@ -5374,6 +5396,118 @@ describe("structured provider session errors reach Jev as bounded facts", () => 
     assert.equal(captured.result.round, 2);
     assert.equal(captured.result.rounds.length, 2);
   });
+
+  for (const hasMessageCursor of [true, false]) {
+    it(`projects a new round-2 provider error from repair-same with immutable round-1 session metadata (${hasMessageCursor ? "cursor" : "round metadata"})`, async () => {
+      const sessionMetadata = {
+        "jev-run-id": "test-run-1",
+        "jev-round": 1,
+        "jev-role": "worker",
+      };
+      const roundOneError = structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 404,
+      }, {
+        id: hasMessageCursor ? "round-one-error" : undefined,
+        metadata: sessionMetadata,
+      });
+      const roundTwoError = structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 503,
+      }, {
+        id: "round-two-error",
+        metadata: {
+          "jev-run-id": "test-run-1",
+          "jev-round": 2,
+          "jev-role": "worker",
+        },
+      });
+      const contextCalls = [];
+      const captured = await captureProviderJudgement({
+        workerSessionIDs: ["reused-worker-session"],
+        viewsByRound: [
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        ],
+        runtime: {
+          context: async ({ sessionID }) => {
+            contextCalls.push(sessionID);
+            return contextCalls.length === 1 ? [roundOneError] : [roundOneError, roundTwoError];
+          },
+        },
+      }, {
+        runContract: contract({ maxRounds: 2 }),
+        answer: (_state, attempt) => attempt === 1 ? repairAnswers() : stopAnswers(),
+      });
+
+      assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+      assert.deepEqual(contextCalls, ["reused-worker-session", "reused-worker-session"]);
+      assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 1, "repair-same reuses the original worker session");
+      const check = projectedProviderCheck(captured.judgementStates[1], "worker");
+      assert.deepEqual(check, {
+        name: "worker-provider-error",
+        status: "unknown",
+        summary: "provider.invalid-request httpStatus=503",
+      }, "the current-round error reaches Jev despite stale session creation metadata");
+      const roundTwoEvidence = captured.t.persistCalls
+        .filter((event) => event.kind === "evidence-ready")
+        .at(-1)?.state?.evidence;
+      assert.ok(roundTwoEvidence, "round-2 EvidencePacket is persisted");
+      assert.deepEqual(roundTwoEvidence.deterministicChecks.find((item) => item.name === "worker-provider-error"), check);
+      assert.equal(captured.result.phase, "stopped", "the failed worker remains rejected by the existing kernel gate");
+      assert.equal(captured.result.round, 2);
+      assert.equal(captured.result.rounds.length, 2);
+    });
+  }
+
+  for (const [field, value] of [
+    ["jev-run-id", "another-run"],
+    ["jev-role", "critic"],
+    ["jev-round", 3],
+  ]) {
+    it(`rejects reused session metadata with mismatched ${field} despite a valid round-2 error`, async () => {
+      const sessionMetadata = {
+        "jev-run-id": "test-run-1",
+        "jev-round": 1,
+        "jev-role": "worker",
+        [field]: value,
+      };
+      const message = (round, id) => structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 503,
+      }, {
+        id,
+        metadata: {
+          "jev-run-id": "test-run-1",
+          "jev-round": round,
+          "jev-role": "worker",
+        },
+      });
+      const roundOneError = message(1, "round-one-error");
+      const roundTwoError = message(2, "round-two-error");
+      let contextCall = 0;
+      const captured = await captureProviderJudgement({
+        workerSessionIDs: ["reused-worker-session"],
+        viewsByRound: [
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        ],
+        runtime: {
+          context: async () => {
+            contextCall += 1;
+            return contextCall === 1 ? [roundOneError] : [roundOneError, roundTwoError];
+          },
+        },
+      }, {
+        runContract: contract({ maxRounds: 2 }),
+        answer: (_state, attempt) => attempt === 1 ? repairAnswers() : stopAnswers(),
+      });
+
+      assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+      assert.equal(projectedProviderCheck(captured.judgementStates[1], "worker"), undefined);
+      assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 1);
+    });
+  }
 
   it("sends the sanitized projection through the real Jev HTTP adapter with a synthetic response", async () => {
     const canary = "ISSUE55_JEV_BODY_CANARY";
