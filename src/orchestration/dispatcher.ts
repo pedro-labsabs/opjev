@@ -794,6 +794,182 @@ interface ExecuteScheduleInput {
   timeouts: { worker: number; critic: number; orchestrator: number };
 }
 
+const MAX_PROVIDER_SESSION_MESSAGES = 128;
+const STRUCTURED_PROVIDER_ERROR_TYPE = "provider.invalid-request";
+
+interface OwnDataField {
+  present: boolean;
+  readable: boolean;
+  value: unknown;
+}
+
+interface ProviderSessionIdentity {
+  runID: string;
+  round: number;
+  sessionID: string;
+  role: "worker" | "critic";
+  sessionMetadata?: unknown;
+  previousMessageID?: string;
+  reusedSession?: boolean;
+}
+
+function ownDataField(target: unknown, key: string): OwnDataField {
+  if (!target || typeof target !== "object") return { present: false, readable: true, value: undefined };
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (!descriptor) return { present: false, readable: true, value: undefined };
+    if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+      return { present: true, readable: false, value: undefined };
+    }
+    return { present: true, readable: true, value: descriptor.value };
+  } catch {
+    return { present: true, readable: false, value: undefined };
+  }
+}
+
+function boundedSessionMessages(messages: unknown): Array<{ index: number; value: unknown }> {
+  try {
+    if (!Array.isArray(messages)) return [];
+  } catch {
+    return [];
+  }
+  const length = ownDataField(messages, "length");
+  if (!length.readable || typeof length.value !== "number" || !Number.isInteger(length.value) || length.value < 0) return [];
+  const start = Math.max(0, length.value - MAX_PROVIDER_SESSION_MESSAGES);
+  const entries: Array<{ index: number; value: unknown }> = [];
+  for (let index = start; index < length.value; index += 1) {
+    const entry = ownDataField(messages, String(index));
+    if (entry.present && entry.readable) entries.push({ index, value: entry.value });
+  }
+  return entries;
+}
+
+function sessionMessageID(message: unknown): string | undefined {
+  const id = ownDataField(message, "id");
+  return id.readable && typeof id.value === "string" && id.value.length > 0 && id.value.length <= 200
+    ? id.value
+    : undefined;
+}
+
+function lastSessionMessageID(messages: unknown): string | undefined {
+  const entries = boundedSessionMessages(messages);
+  return entries.length ? sessionMessageID(entries[entries.length - 1].value) : undefined;
+}
+
+function metadataMatchesProviderSession(metadata: unknown, identity: ProviderSessionIdentity): { matches: boolean; roundMatched: boolean } {
+  if (metadata === undefined || metadata === null) return { matches: true, roundMatched: false };
+  if (typeof metadata !== "object") return { matches: false, roundMatched: false };
+
+  const runID = ownDataField(metadata, "jev-run-id");
+  if (runID.present && (!runID.readable || typeof runID.value !== "string" || runID.value !== identity.runID)) {
+    return { matches: false, roundMatched: false };
+  }
+  const round = ownDataField(metadata, "jev-round");
+  if (round.present && (!round.readable || typeof round.value !== "number" || round.value !== identity.round)) {
+    return { matches: false, roundMatched: false };
+  }
+  const role = ownDataField(metadata, "jev-role");
+  if (role.present && (!role.readable || typeof role.value !== "string" || role.value !== identity.role)) {
+    return { matches: false, roundMatched: false };
+  }
+  return { matches: true, roundMatched: round.present };
+}
+
+function providerErrorHttpStatus(error: unknown): number | undefined {
+  let malformed = false;
+  let foundStatus = false;
+  let status: number | undefined;
+  const addStatus = (field: OwnDataField) => {
+    if (!field.present) return;
+    if (!field.readable) {
+      malformed = true;
+      return;
+    }
+    if (field.value === undefined || field.value === null) return;
+    if (typeof field.value !== "number" || !Number.isInteger(field.value) || field.value < 400 || field.value > 599) {
+      malformed = true;
+      return;
+    }
+    if (foundStatus && status !== field.value) malformed = true;
+    status = field.value;
+    foundStatus = true;
+  };
+
+  addStatus(ownDataField(error, "status"));
+  addStatus(ownDataField(error, "statusCode"));
+  const response = ownDataField(error, "response");
+  if (response.present) {
+    if (!response.readable) malformed = true;
+    else if (response.value !== undefined && response.value !== null) {
+      if (typeof response.value !== "object") malformed = true;
+      else addStatus(ownDataField(response.value, "status"));
+    }
+  }
+  return !malformed && foundStatus ? status : undefined;
+}
+
+/**
+ * Project only a canonical provider error from the exact role/session context
+ * into the existing bounded deterministicChecks contract. No message, code,
+ * response body, or arbitrary error field is read or serialized. For a reused
+ * repair session, only messages after the previous round's cursor are eligible.
+ */
+function projectProviderSessionError(
+  messages: unknown,
+  identity: ProviderSessionIdentity,
+): EvidencePacket["deterministicChecks"][number] | undefined {
+  if (!identity.runID || !identity.sessionID || !Number.isInteger(identity.round) || identity.round < 1) return undefined;
+  const sessionMetadata = metadataMatchesProviderSession(identity.sessionMetadata, identity);
+  if (!sessionMetadata.matches) return undefined;
+
+  const entries = boundedSessionMessages(messages);
+  let previousIndex = -1;
+  if (identity.reusedSession && identity.previousMessageID) {
+    previousIndex = entries.findIndex(({ value }) => sessionMessageID(value) === identity.previousMessageID);
+  }
+
+  let foundError = false;
+  let statusAgreement = true;
+  let observedStatus: number | undefined;
+  for (const { index, value: message } of entries) {
+    const messageType = ownDataField(message, "type");
+    if (!messageType.readable || messageType.value !== "assistant") continue;
+
+    const messageSession = ownDataField(message, "sessionID");
+    if (messageSession.present && (!messageSession.readable || typeof messageSession.value !== "string" || messageSession.value !== identity.sessionID)) continue;
+    const messageRun = ownDataField(message, "runID");
+    if (messageRun.present && (!messageRun.readable || typeof messageRun.value !== "string" || messageRun.value !== identity.runID)) continue;
+    const messageRound = ownDataField(message, "round");
+    if (messageRound.present && (!messageRound.readable || typeof messageRound.value !== "number" || messageRound.value !== identity.round)) continue;
+    const messageMetadata = ownDataField(message, "metadata");
+    if (messageMetadata.present && !messageMetadata.readable) continue;
+    const metadata = metadataMatchesProviderSession(messageMetadata.value, identity);
+    if (!metadata.matches) continue;
+
+    if (identity.reusedSession) {
+      if (previousIndex >= 0 ? index <= previousIndex : !metadata.roundMatched) continue;
+    }
+
+    const error = ownDataField(message, "error");
+    if (!error.present || !error.readable || !error.value || typeof error.value !== "object") continue;
+    const errorType = ownDataField(error.value, "type");
+    if (!errorType.readable || errorType.value !== STRUCTURED_PROVIDER_ERROR_TYPE) continue;
+
+    const status = providerErrorHttpStatus(error.value);
+    if (!foundError) observedStatus = status;
+    else if (observedStatus === undefined || status === undefined || observedStatus !== status) statusAgreement = false;
+    foundError = true;
+  }
+
+  if (!foundError) return undefined;
+  const httpStatus = statusAgreement && observedStatus !== undefined ? observedStatus : undefined;
+  return {
+    name: `${identity.role}-provider-error`,
+    status: "unknown",
+    summary: `provider.invalid-request httpStatus=${httpStatus === undefined ? "unknown" : httpStatus}`,
+  };
+}
+
 /**
  * Loop multi-round compartilhado (modos initial e human-resume). Roda pipeline
  * integral por rodada, aplica as transicoes do kernel e persiste checkpoints.
@@ -813,6 +989,7 @@ async function executeSchedule(
 
   const rounds: RoundProjection[] = [];
   const usedWorkerSessions = new Set<string>(input.seededSessions ?? []);
+  const workerMessageCursors = new Map<string, string>();
 
   // Executa a rodada atual. mode=initial cria a primeira sessao; repair-same
   // reutiliza EXATAMENTE a sessionID preservada pelo kernel; fresh-same cria
@@ -977,6 +1154,7 @@ async function executeSchedule(
       }
       usedWorkerSessions.add(workerSessionID);
     }
+    const previousWorkerMessageID = mode === "repair-same" ? workerMessageCursors.get(workerSessionID) : undefined;
 
     // 4. EXECUTION_STARTED + prompt (initial ou correction) + wait/get/context
     let view: WorkerSessionView;
@@ -1141,6 +1319,19 @@ async function executeSchedule(
     }
 
     // 5. EXECUTION_FINISHED + evidence deterministica BASE (worker)
+    const workerProviderCheck = projectProviderSessionError(messages, {
+      runID: contract.runID,
+      round: state.round,
+      sessionID: workerSessionID,
+      role: "worker",
+      sessionMetadata: view.metadata,
+      previousMessageID: previousWorkerMessageID,
+      reusedSession: mode === "repair-same",
+    });
+    const currentWorkerMessageID = lastSessionMessageID(messages);
+    if (currentWorkerMessageID) workerMessageCursors.set(workerSessionID, currentWorkerMessageID);
+    else workerMessageCursors.delete(workerSessionID);
+
     const finalText = extractFinalAssistantText(messages);
     const fallbackOutcome: ExecutionOutcome = finalText.trim() ? "succeeded" : "failed";
     const outcome: ExecutionOutcome = view.outcome ?? fallbackOutcome;
@@ -1280,6 +1471,7 @@ async function executeSchedule(
       deterministicChecks: [
         { name: "worker-session-outcome", status: outcome === "succeeded" ? "pass" : "fail" },
         { name: "worker-final-response", status: finalText.trim() ? "pass" : "fail" },
+        ...(workerProviderCheck ? [workerProviderCheck] : []),
       ],
       criticFindings: [],
       resultSummary: finalText.trim() ? finalText.slice(0, 500) : "[worker sem resposta final]",
@@ -1297,6 +1489,7 @@ async function executeSchedule(
       summary: "critic not executed",
     };
     let criticFindings: CriticFinding[] = [];
+    let criticProviderCheck: EvidencePacket["deterministicChecks"][number] | undefined;
     // Identidade inicial do critic acompanha o worker REAL da rodada
     // (agent/model ja resolvidos do runtime ou fallback canonico), nunca a
     // selection inicial stale.
@@ -1385,6 +1578,13 @@ async function executeSchedule(
       const criticTokens = observedTokenCounts(cView.usage ?? cView.metadata?.usage ?? cView.metadata?.tokens);
       if (criticTokens) await observeResource(deps, { at: now(), kind: "token-usage", usageStatus: "terminal", runID: contract.runID, sessionID: createdSessionID, model: cView.model?.trim() || model, agent: cView.agent?.trim() || agent, role: "critic", round: state.round, tokens: criticTokens });
       const cMessages = await deps.critic.context({ sessionID: createdSessionID });
+      criticProviderCheck = projectProviderSessionError(cMessages, {
+        runID: contract.runID,
+        round: state.round,
+        sessionID: createdSessionID,
+        role: "critic",
+        sessionMetadata: cView.metadata,
+      });
       const ownOutcome = cView.outcome;
       observeCriticTiming("session-read", createdSessionID);
       const ownFailed = ownOutcome === "failed" || ownOutcome === "interrupted";
@@ -1434,7 +1634,7 @@ async function executeSchedule(
 
     const evidence: EvidencePacket = {
       ...baseEvidence,
-      deterministicChecks: [...baseEvidence.deterministicChecks, criticCheck],
+      deterministicChecks: [...baseEvidence.deterministicChecks, criticCheck, ...(criticProviderCheck ? [criticProviderCheck] : [])],
       criticFindings,
     };
 
