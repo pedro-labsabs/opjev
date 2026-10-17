@@ -5123,3 +5123,461 @@ describe("tool orchestrate_once: E2E agent catalog (primary valido / subagent ma
     }
   });
 });
+
+function structuredProviderErrorMessage(error, extra = {}) {
+  return {
+    id: "synthetic-assistant-message",
+    type: "assistant",
+    agent: "build",
+    model: { providerID: "opencode", id: "big-pickle" },
+    content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }],
+    error,
+    ...extra,
+  };
+}
+
+async function captureProviderJudgement(overrides = {}, options = {}) {
+  const judgementStates = [];
+  const observations = [];
+  const answer = options.answer ?? acceptAnswers();
+  const t = fakeDeps({
+    ...overrides,
+    decisions: {
+      ...overrides.decisions,
+      judgeRound: async ({ state }) => {
+        judgementStates.push(structuredClone(state));
+        return typeof answer === "function" ? answer(state, judgementStates.length) : answer;
+      },
+    },
+  });
+  const result = await runOrchestrationOnce(options.runContract ?? contract({ maxRounds: 1 }), {
+    runtime: t.runtime,
+    critic: t.critic,
+    decisions: t.decisions,
+    observeResource: (event) => observations.push(event),
+    persist: t.persist,
+  });
+  return { result, t, judgementStates, observations };
+}
+
+function projectedProviderCheck(state, role) {
+  return state.deterministicChecks.find((check) => check.name === `${role}-provider-error`);
+}
+
+describe("structured provider session errors reach Jev as bounded facts", () => {
+  it("projects a worker provider.invalid-request with its explicit HTTP status", async () => {
+    const captured = await captureProviderJudgement({
+      view: { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+      messages: [structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 404,
+        message: "Endpoint is unavailable",
+      })],
+    }, { answer: stopAnswers() });
+    const check = projectedProviderCheck(captured.judgementStates[0], "worker");
+
+    assert.ok(check, "structured worker error reaches judgeRound");
+    assert.equal(check.status, "unknown", "provider evidence does not become a kernel hard-failure gate");
+    assert.equal(check.summary, "provider.invalid-request httpStatus=404");
+    assert.equal(captured.judgementStates[0].round, 1);
+    const packet = captured.t.persistCalls.find((event) => event.kind === "evidence-ready")?.state?.evidence;
+    assert.ok(packet, "bounded EvidencePacket persisted before judgment");
+    assert.deepEqual(packet.deterministicChecks.find((item) => item.name === "worker-provider-error"), check);
+    assert.ok(captured.judgementStates[0].deterministicChecks.some((item) => item.name === "worker-session-outcome" && item.status === "fail"));
+    assert.equal(captured.result.phase, "stopped", "failed worker is never accepted by the kernel");
+  });
+
+  it("projects the same structured classification from the critic session", async () => {
+    const captured = await captureProviderJudgement({
+      criticView: { agent: "build", model: "opencode/big-pickle", outcome: "failed" },
+      criticMessages: [structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 404,
+        message: "Endpoint is unavailable",
+      }, {
+        content: [{ type: "text", text: JSON.stringify({ findings: [] }) }],
+      })],
+    }, { answer: stopAnswers() });
+    const check = projectedProviderCheck(captured.judgementStates[0], "critic");
+
+    assert.ok(check, "structured critic error reaches judgeRound despite failed critic outcome");
+    assert.equal(check.status, "unknown");
+    assert.equal(check.summary, "provider.invalid-request httpStatus=404");
+    const packet = captured.t.persistCalls.find((event) => event.kind === "evidence-ready")?.state?.evidence;
+    assert.ok(packet, "critic provider fact is in the persisted EvidencePacket");
+    assert.deepEqual(packet.deterministicChecks.find((item) => item.name === "critic-provider-error"), check);
+    assert.ok(captured.judgementStates[0].deterministicChecks.some((item) => item.name === "critic-session-outcome" && item.status === "fail"));
+    assert.equal(captured.result.phase, "stopped", "critic failure remains governed by the existing kernel gate");
+  });
+
+  it("does not invent an HTTP status when status fields are missing, malformed, or contradictory", async () => {
+    const errors = [
+      { type: "provider.invalid-request", message: "Endpoint is unavailable" },
+      { type: "provider.invalid-request", status: "404", message: "Endpoint is unavailable" },
+      { type: "provider.invalid-request", status: 399, message: "Endpoint is unavailable" },
+      { type: "provider.invalid-request", status: 404, statusCode: 500, message: "Endpoint is unavailable" },
+      { type: "provider.invalid-request", status: 404, response: { status: 503 }, message: "Endpoint is unavailable" },
+    ];
+    for (const error of errors) {
+      const captured = await captureProviderJudgement({ messages: [structuredProviderErrorMessage(error)] });
+      const check = projectedProviderCheck(captured.judgementStates[0], "worker");
+      assert.ok(check, "known structured provider type remains observable");
+      assert.equal(check.summary, "provider.invalid-request httpStatus=unknown");
+      assert.doesNotMatch(check.summary, /404|503|399/);
+    }
+  });
+
+  it("does not mix session, run, round, or role provenance from another message", async () => {
+    const mismatched = [
+      structuredProviderErrorMessage({ type: "provider.invalid-request", status: 404 }, {
+        sessionID: "previous-worker-session",
+      }),
+      structuredProviderErrorMessage({ type: "provider.invalid-request", status: 404 }, {
+        metadata: { "jev-run-id": "another-run", "jev-round": 1, "jev-role": "worker" },
+      }),
+      structuredProviderErrorMessage({ type: "provider.invalid-request", status: 404 }, {
+        metadata: { "jev-run-id": "test-run-1", "jev-round": 2, "jev-role": "worker" },
+      }),
+      structuredProviderErrorMessage({ type: "provider.invalid-request", status: 404 }, {
+        metadata: { "jev-run-id": "test-run-1", "jev-round": 1, "jev-role": "critic" },
+      }),
+    ];
+    const captured = await captureProviderJudgement({ messages: mismatched });
+
+    assert.equal(projectedProviderCheck(captured.judgementStates[0], "worker"), undefined);
+  });
+
+  it("does not interpret error.code as an HTTP status", async () => {
+    const captured = await captureProviderJudgement({
+      messages: [structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        code: 404,
+        message: "ambiguous upstream text says HTTP 404",
+      })],
+    });
+    const check = projectedProviderCheck(captured.judgementStates[0], "worker");
+
+    assert.ok(check);
+    assert.equal(check.summary, "provider.invalid-request httpStatus=unknown");
+  });
+
+  it("never exposes error messages or invokes arbitrary message/code/status accessors", async () => {
+    const canary = "ISSUE55_PRIVATE_CANARY_DO_NOT_SERIALIZE";
+    const reads = { message: 0, code: 0, status: 0 };
+    const error = { type: "provider.invalid-request" };
+    Object.defineProperties(error, {
+      status: { enumerable: true, get() { reads.status += 1; return 404; } },
+      message: { enumerable: true, get() { reads.message += 1; return canary; } },
+      code: { enumerable: true, get() { reads.code += 1; return 404; } },
+    });
+    const captured = await captureProviderJudgement({
+      messages: [structuredProviderErrorMessage(error, { body: canary })],
+    });
+    const check = projectedProviderCheck(captured.judgementStates[0], "worker");
+    const publicEvidence = JSON.stringify({
+      evidence: captured.result.evidence,
+      result: captured.result,
+      judgement: captured.judgementStates,
+      observations: captured.observations,
+      persisted: captured.t.persistCalls,
+    });
+
+    assert.ok(check);
+    assert.equal(check.summary, "provider.invalid-request httpStatus=unknown");
+    assert.deepEqual(reads, { message: 0, code: 0, status: 0 });
+    assert.equal(publicEvidence.includes(canary), false);
+    assert.equal(publicEvidence.includes("Endpoint is unavailable"), false);
+  });
+
+  it("ignores unknown structured types and fields as evidence or recovery authority", async () => {
+    const privateType = "provider.private-unrecognized-recovery-value";
+    const captured = await captureProviderJudgement({
+      messages: [structuredProviderErrorMessage({
+        type: privateType,
+        status: 404,
+        code: "switch-model",
+        message: "untrusted diagnostic",
+        nextAction: "fresh-same",
+      })],
+    });
+
+    assert.equal(projectedProviderCheck(captured.judgementStates[0], "worker"), undefined);
+    assert.equal(JSON.stringify(captured.judgementStates).includes(privateType), false);
+    assert.equal(captured.result.phase, "completed", "only the explicit Jev answer may accept");
+    assert.equal(captured.result.round, 1);
+    assert.equal(captured.t.selectModelCalls.length, 0);
+    assert.equal(captured.t.selectAgentCalls.length, 0);
+  });
+
+  it("honors Jev fresh-same only as an explicit kernel action within maxRounds", async () => {
+    const contextCalls = [];
+    const captured = await captureProviderJudgement({
+      workerSessionIDs: ["worker-round-1", "worker-round-2"],
+      criticSessionIDs: ["critic-round-1", "critic-round-2"],
+      runtime: {
+        context: async ({ sessionID }) => {
+          contextCalls.push(sessionID);
+          return sessionID === "worker-round-1"
+            ? [structuredProviderErrorMessage({ type: "provider.invalid-request", status: 404 })]
+            : [{ type: "assistant", model: { providerID: "opencode", id: "big-pickle" }, content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }] }];
+        },
+      },
+    }, {
+      runContract: contract({ maxRounds: 2 }),
+      answer: () => freshAnswers(),
+    });
+
+    assert.equal(captured.judgementStates.length, 2);
+    assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+    assert.ok(projectedProviderCheck(captured.judgementStates[0], "worker"));
+    assert.equal(projectedProviderCheck(captured.judgementStates[1], "worker"), undefined);
+    assert.deepEqual(contextCalls, ["worker-round-1", "worker-round-2"]);
+    assert.equal(captured.result.phase, "awaiting-human", "round 3 is blocked by maxRounds after the explicit second fresh-same");
+    assert.equal(captured.result.round, 2);
+    assert.equal(captured.result.rounds.length, 2);
+    assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 2);
+    assert.equal(captured.t.effects.filter((effect) => effect === "critic-create").length, 2);
+    assert.equal(captured.t.selectModelCalls.length, 0);
+    assert.equal(captured.t.selectAgentCalls.length, 0);
+  });
+
+  it("does not re-project a prior-round error from a repair-same worker session", async () => {
+    const sessionMetadata = {
+      "jev-run-id": "test-run-1",
+      "jev-round": 1,
+      "jev-role": "worker",
+    };
+    const priorError = structuredProviderErrorMessage({
+      type: "provider.invalid-request",
+      status: 404,
+    }, {
+      id: "round-one-error",
+      metadata: sessionMetadata,
+    });
+    const contextCalls = [];
+    const captured = await captureProviderJudgement({
+      workerSessionIDs: ["reused-worker-session"],
+      viewsByRound: [
+        { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        { agent: "build", model: "opencode/big-pickle", outcome: "succeeded", metadata: sessionMetadata },
+      ],
+      runtime: {
+        context: async ({ sessionID }) => {
+          contextCalls.push(sessionID);
+          return contextCalls.length === 1
+            ? [priorError]
+            : [
+                priorError,
+                {
+                  id: "round-two-result",
+                  type: "assistant",
+                  metadata: {
+                    "jev-run-id": "test-run-1",
+                    "jev-round": 2,
+                    "jev-role": "worker",
+                  },
+                  model: { providerID: "opencode", id: "big-pickle" },
+                  content: [{ type: "text", text: "ORCHESTRATION_WORKER_OK" }],
+                },
+              ];
+        },
+      },
+    }, {
+      runContract: contract({ maxRounds: 2 }),
+      answer: (_state, attempt) => attempt === 1 ? repairAnswers() : acceptAnswers(),
+    });
+
+    assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+    assert.ok(projectedProviderCheck(captured.judgementStates[0], "worker"));
+    assert.equal(projectedProviderCheck(captured.judgementStates[1], "worker"), undefined);
+    assert.deepEqual(contextCalls, ["reused-worker-session", "reused-worker-session"]);
+    assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 1, "repair-same reuses the worker session");
+    assert.equal(captured.result.phase, "completed");
+    assert.equal(captured.result.round, 2);
+    assert.equal(captured.result.rounds.length, 2);
+  });
+
+  for (const hasMessageCursor of [true, false]) {
+    it(`projects a new round-2 provider error from repair-same with immutable round-1 session metadata (${hasMessageCursor ? "cursor" : "round metadata"})`, async () => {
+      const sessionMetadata = {
+        "jev-run-id": "test-run-1",
+        "jev-round": 1,
+        "jev-role": "worker",
+      };
+      const roundOneError = structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 404,
+      }, {
+        id: hasMessageCursor ? "round-one-error" : undefined,
+        metadata: sessionMetadata,
+      });
+      const roundTwoError = structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 503,
+      }, {
+        id: "round-two-error",
+        metadata: {
+          "jev-run-id": "test-run-1",
+          "jev-round": 2,
+          "jev-role": "worker",
+        },
+      });
+      const contextCalls = [];
+      const captured = await captureProviderJudgement({
+        workerSessionIDs: ["reused-worker-session"],
+        viewsByRound: [
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        ],
+        runtime: {
+          context: async ({ sessionID }) => {
+            contextCalls.push(sessionID);
+            return contextCalls.length === 1 ? [roundOneError] : [roundOneError, roundTwoError];
+          },
+        },
+      }, {
+        runContract: contract({ maxRounds: 2 }),
+        answer: (_state, attempt) => attempt === 1 ? repairAnswers() : stopAnswers(),
+      });
+
+      assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+      assert.deepEqual(contextCalls, ["reused-worker-session", "reused-worker-session"]);
+      assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 1, "repair-same reuses the original worker session");
+      const check = projectedProviderCheck(captured.judgementStates[1], "worker");
+      assert.deepEqual(check, {
+        name: "worker-provider-error",
+        status: "unknown",
+        summary: "provider.invalid-request httpStatus=503",
+      }, "the current-round error reaches Jev despite stale session creation metadata");
+      const roundTwoEvidence = captured.t.persistCalls
+        .filter((event) => event.kind === "evidence-ready")
+        .at(-1)?.state?.evidence;
+      assert.ok(roundTwoEvidence, "round-2 EvidencePacket is persisted");
+      assert.deepEqual(roundTwoEvidence.deterministicChecks.find((item) => item.name === "worker-provider-error"), check);
+      assert.equal(captured.result.phase, "stopped", "the failed worker remains rejected by the existing kernel gate");
+      assert.equal(captured.result.round, 2);
+      assert.equal(captured.result.rounds.length, 2);
+    });
+  }
+
+  for (const [field, value] of [
+    ["jev-run-id", "another-run"],
+    ["jev-role", "critic"],
+    ["jev-round", 3],
+  ]) {
+    it(`rejects reused session metadata with mismatched ${field} despite a valid round-2 error`, async () => {
+      const sessionMetadata = {
+        "jev-run-id": "test-run-1",
+        "jev-round": 1,
+        "jev-role": "worker",
+        [field]: value,
+      };
+      const message = (round, id) => structuredProviderErrorMessage({
+        type: "provider.invalid-request",
+        status: 503,
+      }, {
+        id,
+        metadata: {
+          "jev-run-id": "test-run-1",
+          "jev-round": round,
+          "jev-role": "worker",
+        },
+      });
+      const roundOneError = message(1, "round-one-error");
+      const roundTwoError = message(2, "round-two-error");
+      let contextCall = 0;
+      const captured = await captureProviderJudgement({
+        workerSessionIDs: ["reused-worker-session"],
+        viewsByRound: [
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+          { agent: "build", model: "opencode/big-pickle", outcome: "failed", metadata: sessionMetadata },
+        ],
+        runtime: {
+          context: async () => {
+            contextCall += 1;
+            return contextCall === 1 ? [roundOneError] : [roundOneError, roundTwoError];
+          },
+        },
+      }, {
+        runContract: contract({ maxRounds: 2 }),
+        answer: (_state, attempt) => attempt === 1 ? repairAnswers() : stopAnswers(),
+      });
+
+      assert.deepEqual(captured.judgementStates.map((state) => state.round), [1, 2]);
+      assert.equal(projectedProviderCheck(captured.judgementStates[1], "worker"), undefined);
+      assert.equal(captured.t.effects.filter((effect) => effect === "create").length, 1);
+    });
+  }
+
+  it("sends the sanitized projection through the real Jev HTTP adapter with a synthetic response", async () => {
+    const canary = "ISSUE55_JEV_BODY_CANARY";
+    const m = await bootCtx({
+      models: ALL_MODELS,
+      agents: ["build"],
+      storage: makeStorage({}),
+      options: PLUGIN_OPTS,
+      workerBehavior: {
+        outcome: "failed",
+        messages: [structuredProviderErrorMessage({
+          type: "provider.invalid-request",
+          status: 404,
+          message: canary,
+          response: { body: canary },
+        })],
+      },
+    });
+    const stub = stubFetch(async ({ body }) => {
+      if (body?.questions?.route) {
+        return okJev(routeAnswers({ route: "fast-coding", agent: "build", model: "opencode/big-pickle", confidence: 0.9 }));
+      }
+      return okJev(stopAnswers());
+    });
+    try {
+      const res = await m.tools.orchestrate_once.execute({
+        contract: {
+          runID: "issue-55-synthetic-jev-payload",
+          objective: "synthetic provider error projection",
+          scope: { include: [], exclude: [] },
+          constraints: [],
+          acceptanceCriteria: ["Jev sees safe provider facts"],
+          requiredEvidence: ["worker-session-outcome"],
+          maxRounds: 1,
+        },
+      });
+      const output = JSON.parse(res.content);
+      const judgementCall = stub.calls.find((call) => call.body?.questions?.done);
+      assert.ok(judgementCall, "real Jev adapter sends the round judgement request");
+      const safeCheck = judgementCall.body.state.deterministicChecks.find((item) => item.name === "worker-provider-error");
+      assert.deepEqual(safeCheck, {
+        name: "worker-provider-error",
+        status: "unknown",
+        summary: "provider.invalid-request httpStatus=404",
+      });
+      assert.equal(JSON.stringify(judgementCall.body.state).includes(canary), false);
+      assert.equal(JSON.stringify(judgementCall.body.state).includes("Endpoint is unavailable"), false);
+      assert.equal(output.phase, "stopped", "a failed worker is still rejected by the existing kernel gate");
+      assert.equal(stub.calls.filter((call) => call.body?.questions?.route).length, 1);
+      assert.equal(stub.calls.filter((call) => call.body?.questions?.done).length, 1);
+      assert.equal(m.workerCalls.create.filter((call) => call.metadata?.["jev-role"] === "worker").length, 1);
+      assert.equal(m.workerCalls.create.filter((call) => call.metadata?.["jev-role"] === "critic").length, 1);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("keeps thrown wait/RPC errors on the existing fail path, separate from session evidence", async () => {
+    const rpcError = Object.assign(new Error("RPC provider failure"), {
+      type: "provider.invalid-request",
+      status: 404,
+    });
+    const captured = await captureProviderJudgement({
+      runtime: { wait: async () => { throw rpcError; } },
+    });
+
+    assert.equal(captured.judgementStates.length, 0, "RPC wait exception is not reclassified as session evidence");
+    assert.equal(captured.result.phase, "failed");
+    assert.equal(captured.result.round, 1);
+    assert.equal(captured.t.selectModelCalls.length, 0);
+    assert.equal(captured.t.selectAgentCalls.length, 0);
+  });
+});
